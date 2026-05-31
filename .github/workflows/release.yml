@@ -1,16 +1,19 @@
 name: Release Build
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag or release version (for example v1.4.4)"
+        description: "Git tag or release version (for example v1.4.5)"
         required: true
-        default: "v1.4.4"
+        default: "v1.4.5"
       release_name:
         description: "Release title"
         required: true
-        default: "Zapret Hub 1.4.4"
+        default: "Zapret Hub 1.4.5 Fix"
       changelog:
         description: "Release changelog"
         required: false
@@ -29,7 +32,7 @@ jobs:
           Remove-Item .\dist_nuitka -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\.nuitka_staging -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\installer_payload -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\release_1.4.4 -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item .\release_1.4.5 -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -44,9 +47,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .[dev]
 
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build Nuitka x64
         shell: pwsh
-        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler zig
+        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler msvc
 
       - name: Upload x64 artifact
         uses: actions/upload-artifact@v6
@@ -67,7 +75,7 @@ jobs:
           Remove-Item .\dist_nuitka -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\.nuitka_staging -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\installer_payload -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\release_1.4.4 -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item .\release_1.4.5 -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -84,6 +92,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .[dev]
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
 
       - name: Build Nuitka arm64
         shell: pwsh
@@ -115,7 +128,7 @@ jobs:
           Remove-Item .\.nuitka_staging -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\.artifacts -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\installer_payload -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\release_1.4.4 -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item .\release_1.4.5 -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -129,6 +142,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .[dev]
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Download x64 artifact
         uses: actions/download-artifact@v5
@@ -149,8 +167,8 @@ jobs:
           --x64-source .\.artifacts\win_x64
           --arm64-source .\.artifacts\win_arm64
           --payload-dir .\installer_payload
-          --release-dir .\release_1.4.4
-          --version 1.4.4
+          --release-dir .\release_1.4.5
+          --version 1.4.5
 
       - name: Build universal installer
         shell: pwsh
@@ -158,17 +176,34 @@ jobs:
 
       - name: Place installer into release folder
         shell: pwsh
-        run: Copy-Item .\dist_installer\install_zaprethub_1.4.4_universal.exe .\release_1.4.4\ -Force
+        run: Copy-Item .\dist_installer\install_zaprethub_1.4.5_universal.exe .\release_1.4.5\ -Force
 
       - name: SignPath placeholder
         shell: pwsh
         run: .\scripts\signpath_stub.ps1 -InputPath ".\.artifacts\win_x64\zapret_hub.exe"
 
+      - name: Resolve release metadata
+        id: release_meta
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          if (-not $tag) {
+            $tag = "v1.4.5"
+          }
+          $version = $tag.TrimStart("v")
+          $name = "${{ inputs.release_name }}"
+          if (-not $name) {
+            $name = "Zapret Hub $version Fix"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "name=$name" >> $env:GITHUB_OUTPUT
+
       - name: Read release notes
         id: release_notes
         shell: pwsh
         run: |
-          $version = "${{ inputs.tag }}".TrimStart("v")
+          $version = "${{ steps.release_meta.outputs.version }}"
           $notesPath = ".\.github\release-notes\$version.md"
           if (Test-Path $notesPath) {
             $body = Get-Content $notesPath -Raw -Encoding UTF8
@@ -182,9 +217,9 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag }}
-          name: ${{ inputs.release_name }}
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          name: ${{ steps.release_meta.outputs.name }}
           body: ${{ steps.release_notes.outputs.body }}
           files: |
-            release_1.4.4/install_zaprethub_1.4.4_universal.exe
-            release_1.4.4/*portable*.zip
+            release_1.4.5/install_zaprethub_1.4.5_universal.exe
+            release_1.4.5/*portable*.zip

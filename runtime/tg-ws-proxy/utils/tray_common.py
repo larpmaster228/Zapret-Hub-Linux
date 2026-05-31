@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import psutil
 
-from proxy import __version__, get_link_host, parse_dc_ip_list, proxy_config
+from proxy import __version__, get_link_host, parse_dc_ip_list, proxy_config, coerce_domain_list
 from proxy.tg_ws_proxy import _run
 from utils.default_config import default_tray_config
 
@@ -271,8 +271,8 @@ def apply_proxy_config(cfg: dict) -> bool:
     pc.buffer_size = max(4, cfg.get("buf_kb", DEFAULT_CONFIG["buf_kb"])) * 1024
     pc.pool_size = max(0, cfg.get("pool_size", DEFAULT_CONFIG["pool_size"]))
     pc.fallback_cfproxy = cfg.get("cfproxy", DEFAULT_CONFIG["cfproxy"])
-    pc.fallback_cfproxy_priority = cfg.get("cfproxy_priority", DEFAULT_CONFIG["cfproxy_priority"])
-    pc.cfproxy_user_domain = cfg.get("cfproxy_user_domain", DEFAULT_CONFIG["cfproxy_user_domain"])
+    pc.cfproxy_user_domains = coerce_domain_list(cfg.get("cfproxy_user_domain", DEFAULT_CONFIG["cfproxy_user_domain"]))
+    pc.cfproxy_worker_domains = coerce_domain_list(cfg.get("cfproxy_worker_domain", DEFAULT_CONFIG["cfproxy_worker_domain"]))
     return True
 
 

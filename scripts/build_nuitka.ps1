@@ -2,7 +2,7 @@ param(
     [string]$Python = ".\.venv\Scripts\python.exe",
     [string]$OutputDir = "dist_nuitka",
     [ValidateSet("zig", "msvc")]
-    [string]$Compiler = "zig"
+    [string]$Compiler = "msvc"
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,8 +59,8 @@ $nuitkaArgs = @(
   "--windows-icon-from-ico=ui_assets\icons\app_shell.ico",
   '--company-name=goshkow',
   '--product-name=Zapret Hub',
-  '--file-version=1.4.4.0',
-  '--product-version=1.4.4.0',
+  '--file-version=1.4.5.0',
+  '--product-version=1.4.5.0',
   '--file-description=Zapret Hub',
   '--copyright=goshkow',
   "--output-dir=$OutputDir",
