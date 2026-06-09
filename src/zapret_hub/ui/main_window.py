@@ -5258,8 +5258,8 @@ class MainWindow(QMainWindow):
             self._build_tinted_icon(
                 self._icons_dir / self._vpn_icon_name(),
                 self._themed_icon_color(self._vpn_icon_name()) or QColor("#f3f7ff"),
-                fill_ratio=0.82,
-                offset_x=-1.0,
+                fill_ratio=0.72,
+                offset_x=0.4,
                 offset_y=1.0,
             )
         )
@@ -5277,7 +5277,7 @@ class MainWindow(QMainWindow):
                 self._themed_icon_color("refresh.svg") or QColor("#f3f7ff"),
                 fill_ratio=0.82,
                 offset_x=-0.8,
-                offset_y=0.6,
+                offset_y=1.8,
             )
         )
         self.power_reconfigure_btn.setIconSize(QSize(15, 15))
@@ -10094,7 +10094,7 @@ class MainWindow(QMainWindow):
                 QColor(text),
                 fill_ratio=0.82,
                 offset_x=-0.8,
-                offset_y=0.6,
+                offset_y=1.8,
             )
         )
         button.setStyleSheet(
@@ -10140,8 +10140,8 @@ class MainWindow(QMainWindow):
             self._build_tinted_icon(
                 self._icons_dir / self._vpn_icon_name(),
                 QColor(text),
-                fill_ratio=0.82,
-                offset_x=-1.0,
+                fill_ratio=0.72,
+                offset_x=0.4,
                 offset_y=1.0,
             )
         )
