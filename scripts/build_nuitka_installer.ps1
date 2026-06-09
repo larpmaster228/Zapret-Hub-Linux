@@ -2,7 +2,7 @@ param(
     [string]$Python = ".\.venv\Scripts\python.exe",
     [string]$PayloadDir = "installer_payload",
     [string]$OutputDir = "dist_installer",
-    [string]$ReleaseDir = "release_1.4.5",
+    [string]$ReleaseDir = "release_2.0.0",
     [string]$X64Source = "",
     [string]$Arm64Source = "",
     [switch]$SkipPrepareRelease
@@ -44,12 +44,12 @@ if (-not $SkipPrepareRelease) {
   --windows-icon-from-ico=ui_assets\icons\app_shell.ico `
   --company-name="goshkow" `
   --product-name="Zapret Hub Installer" `
-  --file-version="1.4.5.0" `
-  --product-version="1.4.5.0" `
+  --file-version="2.0.0.0" `
+  --product-version="2.0.0.0" `
   --file-description="Zapret Hub Installer" `
   --copyright="goshkow" `
   --output-dir=$OutputDir `
-  --output-filename="install_zaprethub_1.4.5_universal.exe" `
+  --output-filename="install_zaprethub_2.0.0_universal.exe" `
   --include-data-dir=$PayloadDir=installer_payload `
   --include-data-dir=ui_assets=ui_assets `
   --nofollow-import-to=tkinter `

@@ -1,7 +1,7 @@
 param(
     [string]$Python = ".\.venv\Scripts\python.exe",
     [string]$OutputDir = "dist_nuitka",
-    [ValidateSet("zig", "msvc")]
+    [ValidateSet("zig", "msvc", "mingw")]
     [string]$Compiler = "msvc"
 )
 
@@ -49,6 +49,16 @@ foreach ($pattern in $excludeFilePatterns) {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
+# Runtime-конфигурация содержит пользовательскую подписку и создаётся заново при запуске.
+$vpnGeneratedConfig = Join-Path $runtimeStage "v2rayN\goshkow-vpn"
+if (Test-Path $vpnGeneratedConfig) {
+    Remove-Item $vpnGeneratedConfig -Recurse -Force
+}
+$vpnSubscriptionHint = Join-Path $runtimeStage "v2rayN\goshkow-vpn-subscription.txt"
+if (Test-Path $vpnSubscriptionHint) {
+    Remove-Item $vpnSubscriptionHint -Force
+}
+
 $nuitkaArgs = @(
   "-m", "nuitka",
   "--standalone",
@@ -59,8 +69,8 @@ $nuitkaArgs = @(
   "--windows-icon-from-ico=ui_assets\icons\app_shell.ico",
   '--company-name=goshkow',
   '--product-name=Zapret Hub',
-  '--file-version=1.4.5.0',
-  '--product-version=1.4.5.0',
+  '--file-version=2.0.0.0',
+  '--product-version=2.0.0.0',
   '--file-description=Zapret Hub',
   '--copyright=goshkow',
   "--output-dir=$OutputDir",
@@ -77,6 +87,8 @@ $nuitkaArgs = @(
 
 if ($Compiler -eq "zig") {
     $nuitkaArgs = @("-m", "nuitka", "--zig") + $nuitkaArgs[2..($nuitkaArgs.Length - 1)]
+} elseif ($Compiler -eq "mingw") {
+    $nuitkaArgs = @("-m", "nuitka", "--mingw64") + $nuitkaArgs[2..($nuitkaArgs.Length - 1)]
 } else {
     $nuitkaArgs = @("-m", "nuitka", "--msvc=latest") + $nuitkaArgs[2..($nuitkaArgs.Length - 1)]
 }

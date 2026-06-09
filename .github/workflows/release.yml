@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag or release version (for example v1.4.5)"
+        description: "Git tag or release version (for example v2.0.0)"
         required: true
-        default: "v1.4.5"
+        default: "v2.0.0"
       release_name:
         description: "Release title"
         required: true
-        default: "Zapret Hub 1.4.5 Fix"
+        default: "Zapret Hub 2.0.0"
       changelog:
         description: "Release changelog"
         required: false
@@ -32,7 +32,7 @@ jobs:
           Remove-Item .\dist_nuitka -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\.nuitka_staging -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\installer_payload -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\release_1.4.5 -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item .\release_* -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -75,7 +75,7 @@ jobs:
           Remove-Item .\dist_nuitka -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\.nuitka_staging -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\installer_payload -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\release_1.4.5 -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item .\release_* -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -128,7 +128,7 @@ jobs:
           Remove-Item .\.nuitka_staging -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\.artifacts -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item .\installer_payload -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item .\release_1.4.5 -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item .\release_* -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -160,15 +160,33 @@ jobs:
           name: nuitka-win-arm64
           path: .artifacts/win_arm64
 
+      - name: Resolve release metadata
+        id: release_meta
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          if (-not $tag) {
+            $tag = "v2.0.0"
+          }
+          $version = $tag.TrimStart("v")
+          $name = "${{ inputs.release_name }}"
+          if (-not $name) {
+            $name = "Zapret Hub $version"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "name=$name" >> $env:GITHUB_OUTPUT
+
       - name: Prepare release payloads
         shell: pwsh
-        run: >
-          python .\scripts\prepare_nuitka_release.py
-          --x64-source .\.artifacts\win_x64
-          --arm64-source .\.artifacts\win_arm64
-          --payload-dir .\installer_payload
-          --release-dir .\release_1.4.5
-          --version 1.4.5
+        run: |
+          $version = "${{ steps.release_meta.outputs.version }}"
+          python .\scripts\prepare_nuitka_release.py `
+            --x64-source .\.artifacts\win_x64 `
+            --arm64-source .\.artifacts\win_arm64 `
+            --payload-dir .\installer_payload `
+            --release-dir ".\release_$version" `
+            --version $version
 
       - name: Build universal installer
         shell: pwsh
@@ -176,28 +194,13 @@ jobs:
 
       - name: Place installer into release folder
         shell: pwsh
-        run: Copy-Item .\dist_installer\install_zaprethub_1.4.5_universal.exe .\release_1.4.5\ -Force
+        run: |
+          $version = "${{ steps.release_meta.outputs.version }}"
+          Copy-Item ".\dist_installer\install_zaprethub_${version}_universal.exe" ".\release_$version\" -Force
 
       - name: SignPath placeholder
         shell: pwsh
         run: .\scripts\signpath_stub.ps1 -InputPath ".\.artifacts\win_x64\zapret_hub.exe"
-
-      - name: Resolve release metadata
-        id: release_meta
-        shell: pwsh
-        run: |
-          $tag = "${{ inputs.tag || github.ref_name }}"
-          if (-not $tag) {
-            $tag = "v1.4.5"
-          }
-          $version = $tag.TrimStart("v")
-          $name = "${{ inputs.release_name }}"
-          if (-not $name) {
-            $name = "Zapret Hub $version Fix"
-          }
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "name=$name" >> $env:GITHUB_OUTPUT
 
       - name: Read release notes
         id: release_notes
@@ -221,5 +224,5 @@ jobs:
           name: ${{ steps.release_meta.outputs.name }}
           body: ${{ steps.release_notes.outputs.body }}
           files: |
-            release_1.4.5/install_zaprethub_1.4.5_universal.exe
-            release_1.4.5/*portable*.zip
+            release_${{ steps.release_meta.outputs.version }}/install_zaprethub_${{ steps.release_meta.outputs.version }}_universal.exe
+            release_${{ steps.release_meta.outputs.version }}/*portable*.zip

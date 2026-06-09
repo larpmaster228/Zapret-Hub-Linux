@@ -2,20 +2,29 @@
 
 import ctypes
 import json
+import math
 import os
 import platform
+import re
 import time
 import sys
 import threading
 import webbrowser
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
-from urllib.request import Request, urlopen
 
 from zapret_hub import __version__
-from zapret_hub.domain import ComponentDefinition, ComponentState, FileRecord
-from PySide6.QtCore import QCoreApplication, QEasingCurve, QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal, QPropertyAnimation, QParallelAnimationGroup, Property, QByteArray
-from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QFontMetrics, QIcon, QImage, QKeyEvent, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion, QTextCharFormat, QTextCursor, QTextDocument
+from zapret_hub.domain import ComponentDefinition, ComponentState, FileRecord, NotificationEntry
+from zapret_hub.services.service_catalog import (
+    FORTNITE_GENERAL_PRIORITY,
+    SERVICE_PRESETS,
+    ServicePreset,
+    prioritize_generals_for_services,
+)
+from PySide6.QtCore import QCoreApplication, QEasingCurve, QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal, QPropertyAnimation, QParallelAnimationGroup, Property, QByteArray
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeyEvent, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion, QTextCharFormat, QTextCursor, QTextDocument
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractScrollArea,
@@ -40,6 +49,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QSizePolicy,
     QScrollArea,
+    QStackedLayout,
     QStackedWidget,
     QSystemTrayIcon,
     QTextEdit,
@@ -55,6 +65,155 @@ from PySide6.QtWidgets import (
 
 from zapret_hub.bootstrap import ApplicationContext
 from zapret_hub.ui.theme import build_stylesheet, is_light_theme
+
+
+class WindowsTaskbarIntegration:
+    TBPF_NOPROGRESS = 0
+    TBPF_INDETERMINATE = 1
+    TBPF_NORMAL = 2
+    TBPF_ERROR = 4
+    TBPF_PAUSED = 8
+
+    FLASHW_STOP = 0
+    FLASHW_TRAY = 0x00000002
+    FLASHW_TIMERNOFG = 0x0000000C
+
+    def __init__(self) -> None:
+        self._available = platform.system().lower() == "windows"
+        self._taskbar: ctypes.c_void_p | None = None
+        if not self._available:
+            return
+        try:
+            self._init_taskbar()
+        except Exception:
+            self._available = False
+            self._taskbar = None
+
+    def _init_taskbar(self) -> None:
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+            def __init__(self, value: str) -> None:
+                import uuid
+
+                item = uuid.UUID(str(value).strip("{}"))
+                bytes_le = item.bytes_le
+                self.Data1 = int.from_bytes(bytes_le[0:4], "little")
+                self.Data2 = int.from_bytes(bytes_le[4:6], "little")
+                self.Data3 = int.from_bytes(bytes_le[6:8], "little")
+                self.Data4 = (ctypes.c_ubyte * 8).from_buffer_copy(bytes_le[8:16])
+
+        ole32 = ctypes.windll.ole32
+        ole32.CoInitialize(None)
+        clsid_taskbar = GUID("{56FDF344-FD6D-11D0-958A-006097C9A090}")
+        iid_taskbar = GUID("{602D4995-B13A-429B-A66E-1935E44F4317}")
+        taskbar = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(
+            ctypes.byref(clsid_taskbar),
+            None,
+            0x1,
+            ctypes.byref(iid_taskbar),
+            ctypes.byref(taskbar),
+        )
+        if hr != 0 or not taskbar.value:
+            raise OSError(f"ITaskbarList3 unavailable: HRESULT {hr}")
+        self._taskbar = taskbar
+        self._call_taskbar(3, ctypes.c_long)
+
+    def _call_taskbar(self, index: int, restype: object, *args: object) -> int:
+        if self._taskbar is None:
+            return -1
+        vtable = ctypes.cast(self._taskbar, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        argtypes = [ctypes.c_void_p]
+        for arg in args:
+            if isinstance(arg, int):
+                argtypes.append(ctypes.c_void_p if arg > 0xFFFFFFFF else ctypes.c_uint)
+            else:
+                argtypes.append(type(arg))
+        prototype = ctypes.WINFUNCTYPE(restype, *argtypes)
+        method = prototype(vtable[index])
+        return int(method(self._taskbar, *args))
+
+    def set_progress_state(self, hwnd: int, state: int) -> None:
+        if not self._available or not hwnd:
+            return
+        try:
+            prototype = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
+            vtable = ctypes.cast(self._taskbar, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents if self._taskbar else None
+            if vtable is None:
+                return
+            method = prototype(vtable[10])
+            method(self._taskbar, ctypes.c_void_p(hwnd), int(state))
+        except Exception:
+            self._available = False
+
+    def set_progress_value(self, hwnd: int, value: int, maximum: int = 100) -> None:
+        if not self._available or not hwnd:
+            return
+        try:
+            prototype = ctypes.WINFUNCTYPE(
+                ctypes.c_long,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_ulonglong,
+                ctypes.c_ulonglong,
+            )
+            vtable = ctypes.cast(self._taskbar, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents if self._taskbar else None
+            if vtable is None:
+                return
+            method = prototype(vtable[9])
+            method(self._taskbar, ctypes.c_void_p(hwnd), max(0, int(value)), max(1, int(maximum)))
+        except Exception:
+            self._available = False
+
+    def flash_attention(self, hwnd: int) -> None:
+        if not self._available or not hwnd:
+            return
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint),
+                ("hwnd", ctypes.c_void_p),
+                ("dwFlags", ctypes.c_uint),
+                ("uCount", ctypes.c_uint),
+                ("dwTimeout", ctypes.c_uint),
+            ]
+
+        try:
+            info = FLASHWINFO(
+                ctypes.sizeof(FLASHWINFO),
+                ctypes.c_void_p(hwnd),
+                self.FLASHW_TRAY | self.FLASHW_TIMERNOFG,
+                0,
+                0,
+            )
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        except Exception:
+            pass
+
+    def clear_flash(self, hwnd: int) -> None:
+        if not self._available or not hwnd:
+            return
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint),
+                ("hwnd", ctypes.c_void_p),
+                ("dwFlags", ctypes.c_uint),
+                ("uCount", ctypes.c_uint),
+                ("dwTimeout", ctypes.c_uint),
+            ]
+
+        try:
+            info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), ctypes.c_void_p(hwnd), self.FLASHW_STOP, 0, 0)
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        except Exception:
+            pass
 
 
 @dataclass(slots=True)
@@ -77,7 +236,7 @@ class StatusBadge:
 class _UiSignals(QObject):
     toggle_done = Signal()
     component_action_done = Signal(str)
-    general_test_progress = Signal(int, int, str)
+    general_test_progress = Signal(object)
     general_test_done = Signal(object)
     update_check_done = Signal(object, bool)
     update_prepare_done = Signal(object)
@@ -261,6 +420,9 @@ class AnimatedNavButton(QToolButton):
             painter.drawRoundedRect(rect, radius, radius)
 
         icon_size = max(20, round(26 * self._icon_scale))
+        requested_icon = self.iconSize()
+        if requested_icon.isValid():
+            icon_size = max(18, round(max(requested_icon.width(), requested_icon.height()) * self._icon_scale))
         pixmap = self.icon().pixmap(icon_size, icon_size)
         target = QRectF(
             (self.width() - icon_size) / 2.0 + self._icon_dx + base_icon_dx,
@@ -332,6 +494,521 @@ class ClickSelectComboBox(QComboBox):
                 return True
         return super().eventFilter(watched, event)
 
+
+class NotificationBellButton(QToolButton):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._has_unread = False
+
+    def set_unread(self, has_unread: bool) -> None:
+        if self._has_unread == bool(has_unread):
+            return
+        self._has_unread = bool(has_unread)
+        self.update()
+
+    def paintEvent(self, event: QEvent) -> None:
+        super().paintEvent(event)
+        if not self._has_unread:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#ef4444"))
+        size = 7
+        painter.drawEllipse(self.width() - 11, 5, size, size)
+
+
+class GitHubSidebarButton(QToolButton):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._hover_progress = 0.0
+        self._theme_name = "dark"
+        self._hover_anim: QPropertyAnimation | None = None
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+
+    def set_button_theme(self, theme: str) -> None:
+        self._theme_name = theme
+        self.update()
+
+    def enterEvent(self, event: QEvent) -> None:
+        self._animate_hover(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        self._animate_hover(0.0)
+        super().leaveEvent(event)
+
+    def _animate_hover(self, target: float) -> None:
+        if self._hover_anim is not None:
+            self._hover_anim.stop()
+        anim = QPropertyAnimation(self, b"hoverProgress", self)
+        anim.setDuration(170)
+        anim.setStartValue(self._hover_progress)
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._hover_anim = anim
+        anim.start()
+
+    def paintEvent(self, event: QEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        opacity = 0.30 + 0.40 * self._hover_progress
+        scale = 1.0 + 0.08 * self._hover_progress
+        icon_size = int(22 * scale)
+        pixmap = self.icon().pixmap(icon_size, icon_size)
+        target = QRectF(
+            (self.width() - icon_size) / 2.0,
+            (self.height() - icon_size) / 2.0,
+            icon_size,
+            icon_size,
+        )
+        if not pixmap.isNull():
+            tint = QColor("#1f2a3d" if is_light_theme(self._theme_name) else "#d7deea")
+            pixmap.setDevicePixelRatio(1.0)
+            tinted = QPixmap(pixmap.size())
+            tinted.fill(Qt.GlobalColor.transparent)
+            tinted.setDevicePixelRatio(1.0)
+            tint_painter = QPainter(tinted)
+            tint_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            tint_painter.drawPixmap(0, 0, pixmap)
+            tint_painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            tint_painter.fillRect(tinted.rect(), tint)
+            tint_painter.end()
+            pixmap = tinted
+        painter.setOpacity(opacity)
+        source = QRectF(0.0, 0.0, float(pixmap.width()), float(pixmap.height()))
+        painter.drawPixmap(target, pixmap, source)
+
+    def _get_hover_progress(self) -> float:
+        return self._hover_progress
+
+    def _set_hover_progress(self, value: float) -> None:
+        self._hover_progress = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    hoverProgress = Property(float, _get_hover_progress, _set_hover_progress)
+
+
+class ModCardFrame(QFrame):
+    clicked = Signal(str)
+
+    def __init__(self, mod_id: str, editable: bool, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._mod_id = mod_id
+        self._editable = editable
+        if editable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        super().mouseReleaseEvent(event)
+        if self._editable and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._mod_id)
+
+
+class ServiceCardFrame(QFrame):
+    toggled = Signal(str, bool)
+
+    def __init__(self, preset: ServicePreset, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.preset = preset
+        self._selected = False
+        self._theme = "dark"
+        self._icon_pixmap = QPixmap()
+        self._check_pixmap = QPixmap()
+        self._visual_scope = "main"
+        self._burst_progress = 0.0
+        self._press_progress = 0.0
+        self._burst_anim: QPropertyAnimation | None = None
+        self._press_anim: QPropertyAnimation | None = None
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(136)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(9)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(8)
+
+        self._icon_badge = QFrame()
+        self._icon_badge.setFixedSize(36, 36)
+        self._icon_badge.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        badge_layout = QVBoxLayout(self._icon_badge)
+        badge_layout.setContentsMargins(0, 0, 0, 0)
+        badge_layout.setSpacing(0)
+        self._icon_label = QLabel()
+        self._icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge_layout.addWidget(self._icon_label)
+        top.addWidget(self._icon_badge, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        top.addStretch(1)
+
+        self._selected_label = QLabel()
+        self._selected_label.setFixedSize(20, 20)
+        self._selected_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top.addWidget(self._selected_label, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
+        root.addLayout(top)
+
+        self._title_label = QLabel()
+        self._title_label.setWordWrap(True)
+        self._title_label.setProperty("class", "title")
+        self._title_label.setMaximumHeight(48)
+        root.addWidget(self._title_label)
+
+        self._desc_label = QLabel()
+        self._desc_label.setWordWrap(True)
+        self._desc_label.setProperty("class", "muted")
+        self._desc_label.setMaximumHeight(62)
+        root.addWidget(self._desc_label)
+
+        root.addStretch(1)
+
+    def set_card_width(self, width: int) -> None:
+        self.setFixedWidth(max(132, width))
+
+    def set_visual_scope(self, scope: str) -> None:
+        self._visual_scope = "onboarding" if scope == "onboarding" else "main"
+        self.setFixedHeight(156 if self._visual_scope == "onboarding" else 138)
+        root = self.layout()
+        if isinstance(root, QVBoxLayout):
+            if self._visual_scope == "onboarding":
+                root.setContentsMargins(17, 15, 17, 15)
+                root.setSpacing(8)
+            else:
+                root.setContentsMargins(14, 12, 14, 12)
+                root.setSpacing(9)
+        self._sync_style()
+        self.updateGeometry()
+        self.update()
+
+    def set_theme(self, theme: str) -> None:
+        self._theme = theme
+        self._sync_style()
+        self.update()
+
+    def set_icon_pixmap(self, pixmap: QPixmap) -> None:
+        self._icon_pixmap = pixmap
+        self._icon_label.setPixmap(self._compose_slot_pixmap(pixmap, self._icon_badge.size(), 1.0))
+
+    def set_check_pixmap(self, pixmap: QPixmap) -> None:
+        self._check_pixmap = pixmap
+        if self._selected:
+            self._selected_label.setPixmap(self._compose_slot_pixmap(pixmap, self._selected_label.size(), 0.56))
+
+    def set_selected(self, selected: bool) -> None:
+        if self._selected == bool(selected):
+            return
+        self._selected = bool(selected)
+        self._sync_style()
+        self.update()
+
+    def _compose_slot_pixmap(self, pixmap: QPixmap, slot_size: QSize, fill_ratio: float) -> QPixmap:
+        if pixmap.isNull() or not slot_size.isValid():
+            return pixmap
+        dpr = max(1.0, float(pixmap.devicePixelRatio()))
+        logical_width = float(slot_size.width())
+        logical_height = float(slot_size.height())
+        physical_width = max(1, int(round(logical_width * dpr)))
+        physical_height = max(1, int(round(logical_height * dpr)))
+        canvas = QPixmap(physical_width, physical_height)
+        canvas.fill(Qt.GlobalColor.transparent)
+        canvas.setDevicePixelRatio(dpr)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        if hasattr(QPainter.RenderHint, "LosslessImageRendering"):
+            painter.setRenderHint(QPainter.RenderHint.LosslessImageRendering, True)
+        source_size = pixmap.deviceIndependentSize() if hasattr(pixmap, "deviceIndependentSize") else QSizeF(
+            float(pixmap.width()) / max(1.0, float(pixmap.devicePixelRatio())),
+            float(pixmap.height()) / max(1.0, float(pixmap.devicePixelRatio())),
+        )
+        target_width = float(source_size.width())
+        target_height = float(source_size.height())
+        max_box = min(logical_width, logical_height) * max(0.1, min(1.0, float(fill_ratio)))
+        if target_width > 0.0 and target_height > 0.0:
+            scale = min(max_box / target_width, max_box / target_height, 1.0)
+            target_width *= scale
+            target_height *= scale
+        painter.drawPixmap(
+            QRectF((logical_width - target_width) / 2.0, (logical_height - target_height) / 2.0, target_width, target_height),
+            pixmap,
+            QRectF(0, 0, pixmap.width(), pixmap.height()),
+        )
+        painter.end()
+        return canvas
+
+    def set_texts(self, title: str, description: str) -> None:
+        self._title_label.setText(title)
+        self._desc_label.setText(description)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._play_select_feedback()
+            self.toggled.emit(self.preset.id, not self._selected)
+
+    def paintEvent(self, event: QEvent) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        shrink = 1.8 * self._press_progress
+        glow_pad = 6.0 if self._visual_scope == "onboarding" else 0.0
+        rect = QRectF(self.rect()).adjusted(0.5 + glow_pad + shrink, 0.5 + glow_pad + shrink, -0.5 - glow_pad - shrink, -0.5 - glow_pad - shrink)
+        card_radius = 12.0
+        accent = QColor(self.preset.accent)
+        light = is_light_theme(self._theme)
+        base_fill = QColor("#ffffff") if light else QColor("#141922" if self._theme == "night" else "#171b20")
+        if self._theme == "oled":
+            base_fill = QColor("#111418")
+        fill = QColor(base_fill)
+        border = QColor("#d9e3f1" if light else "#252d38")
+        if self._selected and self._visual_scope == "onboarding":
+            fill = QColor(base_fill.lighter(102 if light else 106))
+            border = QColor(accent)
+            border.setAlpha(112 if light else 96)
+        elif self._selected:
+            fill = QColor(base_fill.lighter(102 if light else 106))
+            border = QColor(accent)
+            border.setAlpha(112 if light else 96)
+        if self._selected and self._visual_scope == "onboarding":
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            glow_spread = 4.0
+            outer_radius = card_radius + glow_spread * 1.35
+            outer_glow_rect = rect.adjusted(-glow_spread, -glow_spread, glow_spread, glow_spread)
+            glow = QRadialGradient(
+                rect.center(),
+                max(outer_glow_rect.width(), outer_glow_rect.height()) * 0.86,
+            )
+            glow_color = QColor(accent)
+            glow_color.setAlpha(36 if light else 48)
+            glow.setColorAt(0.0, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), max(12, glow_color.alpha() // 3)))
+            glow.setColorAt(0.50, glow_color)
+            glow.setColorAt(1.0, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), 0))
+            painter.setBrush(glow)
+            painter.drawRoundedRect(outer_glow_rect, outer_radius, outer_radius)
+            painter.restore()
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(rect, card_radius, card_radius)
+
+        glow = QRadialGradient(rect.left() + 40, rect.top() + 30, max(rect.width(), rect.height()) * 0.72)
+        glow_color = QColor(accent)
+        glow_color.setAlpha(18 if self._selected else 0)
+        glow.setColorAt(0.0, glow_color)
+        glow.setColorAt(1.0, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(glow)
+        painter.drawRoundedRect(rect, card_radius, card_radius)
+        if self._burst_progress > 0.0:
+            self._paint_burst(painter, accent)
+
+    def _paint_burst(self, painter: QPainter, accent: QColor) -> None:
+        progress = max(0.0, min(1.0, self._burst_progress))
+        opacity = int(145 * (1.0 - progress))
+        if opacity <= 0:
+            return
+        origin = QPointF(30.0, 28.0)
+        try:
+            icon_center = self._icon_badge.mapTo(self, self._icon_badge.rect().center())
+            origin = QPointF(float(icon_center.x()), float(icon_center.y()))
+        except Exception:
+            pass
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        for index in range(7):
+            angle = (-140 + index * 46) * math.pi / 180.0
+            distance = 8.0 + 28.0 * progress
+            radius = 2.8 - 1.1 * progress + (0.35 if index % 2 else 0.0)
+            color = QColor(accent)
+            color.setAlpha(max(0, opacity - index * 6))
+            point = QPointF(
+                origin.x() + math.cos(angle) * distance,
+                origin.y() + math.sin(angle) * distance,
+            )
+            painter.setBrush(color)
+            painter.drawEllipse(point, max(1.1, radius), max(1.1, radius))
+        painter.restore()
+
+    def _sync_style(self) -> None:
+        accent = QColor(self.preset.accent)
+        selected = bool(self._selected)
+        text_color = "#142033" if is_light_theme(self._theme) else ("#f2f6ff" if selected else "#d2d9e5")
+        muted_color = "#5f6f86" if is_light_theme(self._theme) else ("#c0ccdc" if selected else "#8d99aa")
+        if self._selected:
+            muted_color = "#334154" if is_light_theme(self._theme) else "#d5def0"
+        title_size = 15 if self._visual_scope == "onboarding" else 15
+        desc_size = 13 if self._visual_scope == "onboarding" else 13
+        self._title_label.setStyleSheet(f"color: {text_color}; background: transparent; font-size: {title_size}px; font-weight: 700;")
+        self._desc_label.setStyleSheet(f"color: {muted_color}; background: transparent; font-size: {desc_size}px;")
+        if is_light_theme(self._theme):
+            badge_fill = QColor(0, 0, 0, 0)
+        else:
+            badge_fill = QColor(0, 0, 0, 0)
+        self._icon_badge.setStyleSheet(
+            "QFrame {"
+            f"background: {badge_fill.name(QColor.NameFormat.HexArgb)};"
+            "border: none;"
+            "border-radius: 0px;"
+            "}"
+        )
+        if self._selected:
+            self._selected_label.setText("")
+            if not self._check_pixmap.isNull():
+                self._selected_label.setPixmap(
+                    self._compose_slot_pixmap(self._check_pixmap, self._selected_label.size(), 0.56)
+                )
+            self._selected_label.setStyleSheet(
+                f"background: {accent.name(QColor.NameFormat.HexArgb)};"
+                "border-radius: 10px;"
+                "padding: 0px;"
+                "margin: 0px;"
+            )
+        else:
+            self._selected_label.setText("")
+            self._selected_label.setPixmap(QPixmap())
+            self._selected_label.setStyleSheet("background: transparent;")
+
+    def _play_select_feedback(self) -> None:
+        if self._press_anim is not None:
+            self._press_anim.stop()
+        press = QPropertyAnimation(self, b"pressProgress", self)
+        press.setDuration(170)
+        press.setStartValue(0.0)
+        press.setKeyValueAt(0.45, 1.0)
+        press.setEndValue(0.0)
+        press.setEasingCurve(QEasingCurve.Type.OutCubic)
+        press.start()
+        self._press_anim = press
+
+        if self._burst_anim is not None:
+            self._burst_anim.stop()
+        burst = QPropertyAnimation(self, b"burstProgress", self)
+        burst.setDuration(420)
+        burst.setStartValue(0.0)
+        burst.setEndValue(1.0)
+        burst.setEasingCurve(QEasingCurve.Type.OutCubic)
+        burst.start()
+        self._burst_anim = burst
+
+    def _get_burst_progress(self) -> float:
+        return self._burst_progress
+
+    def _set_burst_progress(self, value: float) -> None:
+        self._burst_progress = float(value)
+        self.update()
+
+    def _get_press_progress(self) -> float:
+        return self._press_progress
+
+    def _set_press_progress(self, value: float) -> None:
+        self._press_progress = float(value)
+        self.update()
+
+    burstProgress = Property(float, _get_burst_progress, _set_burst_progress)
+    pressProgress = Property(float, _get_press_progress, _set_press_progress)
+
+
+class ServiceGridPanel(QWidget):
+    def __init__(
+        self,
+        *,
+        base_columns: int,
+        min_card_width: int,
+        offset_pattern: tuple[int, ...],
+        horizontal_spacing: int = 14,
+        vertical_spacing: int = 10,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._base_columns = max(1, base_columns)
+        self._min_card_width = max(96, min_card_width)
+        self._offset_pattern = offset_pattern or (0,)
+        self._cards: list[ServiceCardFrame] = []
+        self._wrappers: dict[ServiceCardFrame, QWidget] = {}
+        self._last_columns = self._base_columns
+        self._last_minimum_height = 0
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(max(6, horizontal_spacing))
+        self._grid.setVerticalSpacing(max(0, vertical_spacing))
+
+    def set_cards(self, cards: list[ServiceCardFrame]) -> None:
+        self._cards = list(cards)
+        self._relayout_cards()
+
+    def resizeEvent(self, event: QEvent) -> None:
+        super().resizeEvent(event)
+        self._relayout_cards()
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self._min_card_width * min(self._base_columns, max(1, len(self._cards))), max(1, self._last_minimum_height))
+
+    def sizeHint(self) -> QSize:
+        columns = max(1, min(self._base_columns, max(1, len(self._cards))))
+        width = columns * self._min_card_width + (columns - 1) * self._grid.horizontalSpacing()
+        return QSize(width, max(1, self._last_minimum_height))
+
+    def _relayout_cards(self) -> None:
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        if not self._cards:
+            return
+        available = max(320, self.width() - self._grid.contentsMargins().left() - self._grid.contentsMargins().right())
+        columns = max(1, min(self._base_columns, available // self._min_card_width))
+        columns = min(columns, len(self._cards))
+        if columns <= 0:
+            columns = 1
+        self._last_columns = columns
+        cell_width = int((available - self._grid.horizontalSpacing() * max(0, columns - 1)) / columns)
+        for column in range(max(self._base_columns, columns)):
+            self._grid.setColumnStretch(column, 1 if column < columns else 0)
+        for index, card in enumerate(self._cards):
+            card.set_card_width(cell_width)
+            wrapper = self._wrappers.get(card)
+            if wrapper is None:
+                wrapper = QWidget(self)
+                wrapper.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+                wrapper.setStyleSheet("background: transparent; border: none;")
+                layout = QVBoxLayout(wrapper)
+                layout.setContentsMargins(0, 0, 0, 0)
+                layout.setSpacing(0)
+                layout.addWidget(card, 0, Qt.AlignmentFlag.AlignTop)
+                self._wrappers[card] = wrapper
+            offset = self._offset_pattern[index % len(self._offset_pattern)]
+            layout = wrapper.layout()
+            if isinstance(layout, QVBoxLayout):
+                layout.setContentsMargins(0, offset, 0, 0)
+            row = index // columns
+            col = index % columns
+            self._grid.addWidget(wrapper, row, col, Qt.AlignmentFlag.AlignTop)
+        rows = (len(self._cards) + columns - 1) // columns
+        card_height = max(
+            (max(card.height(), card.minimumHeight(), card.sizeHint().height()) for card in self._cards),
+            default=136,
+        )
+        max_offset = max((max(0, int(value)) for value in self._offset_pattern), default=0)
+        row_heights: list[int] = []
+        for row in range(rows):
+            row_offsets = [
+                max(0, int(self._offset_pattern[index % len(self._offset_pattern)]))
+                for index in range(row * columns, min(len(self._cards), (row + 1) * columns))
+            ]
+            row_heights.append(card_height + max(row_offsets, default=0))
+        self._last_minimum_height = sum(row_heights) + max(0, rows - 1) * self._grid.verticalSpacing()
+        self.setMinimumHeight(self._last_minimum_height)
+        self.updateGeometry()
+        self._grid.setRowStretch(rows, 1)
 
 class AnimatedPowerButton(QToolButton):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -581,11 +1258,19 @@ class PowerAuraWidget(QWidget):
         self._wave_base_radius = 74.0
         self._wave_travel_radius = 124.0
         self._idle_enabled = False
+        self._status_glow_enabled = False
+        self._status_glow_breath = 0.0
+        self._status_glow_phase = 0.0
+        self._status_glow_presence = 0.0
         self._idle_pulse_timer = QTimer(self)
         self._idle_pulse_timer.setInterval(1480)
         self._idle_pulse_timer.timeout.connect(self._play_idle_pulse)
+        self._status_glow_timer = QTimer(self)
+        self._status_glow_timer.setInterval(42)
+        self._status_glow_timer.timeout.connect(self._advance_status_glow_breath)
         self._wave_progress_anim: QPropertyAnimation | None = None
         self._wave_strength_anim: QPropertyAnimation | None = None
+        self._status_glow_presence_anim: QPropertyAnimation | None = None
 
     def set_power_theme(self, theme: str) -> None:
         self._theme_name = theme
@@ -605,6 +1290,43 @@ class PowerAuraWidget(QWidget):
                 self._play_idle_pulse()
         else:
             self._idle_pulse_timer.stop()
+
+    def set_status_glow_enabled(self, enabled: bool) -> None:
+        if self._status_glow_enabled == bool(enabled):
+            return
+        self._status_glow_enabled = bool(enabled)
+        if self._status_glow_enabled:
+            if not self._status_glow_timer.isActive():
+                self._status_glow_timer.start()
+        else:
+            if not self._status_glow_timer.isActive():
+                self._status_glow_timer.start()
+        if self._status_glow_presence_anim is not None:
+            self._status_glow_presence_anim.stop()
+        anim = QPropertyAnimation(self, b"statusGlowPresence", self)
+        anim.setDuration(360 if enabled else 520)
+        anim.setStartValue(self._status_glow_presence)
+        anim.setEndValue(1.0 if enabled else 0.0)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        if not enabled:
+            def _finish_off() -> None:
+                if not self._status_glow_enabled:
+                    self._status_glow_timer.stop()
+                    self._status_glow_breath = 0.0
+            anim.finished.connect(_finish_off)
+        self._status_glow_presence_anim = anim
+        anim.start()
+        self.update()
+
+    def _advance_status_glow_breath(self) -> None:
+        if not self._status_glow_enabled:
+            return
+        # Irregular "campfire" breathing: slow overall motion with small phase drift.
+        wobble = 0.5 + 0.5 * math.sin(self._status_glow_phase * 0.71 + 0.8)
+        self._status_glow_phase = (self._status_glow_phase + 0.026 + 0.018 * wobble) % (math.pi * 2.0)
+        wave = math.sin(self._status_glow_phase + 0.28 * math.sin(self._status_glow_phase * 1.9))
+        self._status_glow_breath = 0.5 + 0.5 * wave
+        self.update()
 
     def _play_idle_pulse(self) -> None:
         if not self._idle_enabled or self._wave_strength > 0.08:
@@ -640,7 +1362,7 @@ class PowerAuraWidget(QWidget):
         self._play_wave_internal(outward=outward, strength=0.48, duration=820, base_radius=74.0, travel_radius=118.0)
 
     def paintEvent(self, event: QEvent) -> None:
-        if self._wave_strength <= 0.001:
+        if self._wave_strength <= 0.001 and self._status_glow_presence <= 0.001:
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -649,6 +1371,25 @@ class PowerAuraWidget(QWidget):
         clip.addRoundedRect(QRectF(self.rect()).adjusted(2.0, 2.0, -2.0, -2.0), 18.0, 18.0)
         painter.setClipPath(clip)
         center = self._center_point if not self._center_point.isNull() else QRectF(self.rect()).center()
+        if self.width() <= 0 or self.height() <= 0 or center.x() <= 1.0 or center.y() <= 1.0:
+            return
+        if self._status_glow_presence > 0.001:
+            if self._theme_name == "oled":
+                aura_color = QColor(104, 118, 210, 70)
+            elif self._light_theme:
+                aura_color = QColor(19, 58, 142, 66)
+            else:
+                aura_color = QColor(100, 172, 255, 74)
+            breath = 0.36 + 0.64 * self._status_glow_breath
+            presence = max(0.0, min(1.0, self._status_glow_presence))
+            radius = 98.0 + 48.0 * breath
+            aura_color.setAlpha(int(aura_color.alpha() * presence * (0.44 + 0.56 * breath)))
+            aura = QRadialGradient(center, radius)
+            aura.setColorAt(0.0, aura_color)
+            aura.setColorAt(0.42, QColor(aura_color.red(), aura_color.green(), aura_color.blue(), max(12, aura_color.alpha() // 2)))
+            aura.setColorAt(1.0, QColor(aura_color.red(), aura_color.green(), aura_color.blue(), 0))
+            painter.setBrush(aura)
+            painter.drawEllipse(center, radius, radius)
         if self._theme_name == "oled":
             color = QColor(124, 134, 182, int(132 * self._wave_strength))
         elif self._light_theme:
@@ -682,6 +1423,15 @@ class PowerAuraWidget(QWidget):
 
     waveProgress = Property(float, _get_wave_progress, _set_wave_progress)
     waveStrength = Property(float, _get_wave_strength, _set_wave_strength)
+
+    def _get_status_glow_presence(self) -> float:
+        return self._status_glow_presence
+
+    def _set_status_glow_presence(self, value: float) -> None:
+        self._status_glow_presence = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    statusGlowPresence = Property(float, _get_status_glow_presence, _set_status_glow_presence)
 
 
 class FlowLayout(QLayout):
@@ -966,9 +1716,13 @@ class ScrollFadeOverlay(QWidget):
         self._scrollable = scrollable
         self._theme_name = "night"
         self._surface_override: QColor | None = None
+        self._onboarding_background_frame: QWidget | None = None
+        self._connected_onboarding_frame: QWidget | None = None
         self._top_visible = False
         self._bottom_visible = False
         self._fade_height = 18
+        self._paint_top = True
+        self._paint_bottom = True
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.hide()
         scrollable.viewport().installEventFilter(self)
@@ -984,6 +1738,33 @@ class ScrollFadeOverlay(QWidget):
     def set_surface_color(self, color: QColor | None) -> None:
         self._surface_override = QColor(color) if isinstance(color, QColor) else None
         self.update()
+
+    def set_onboarding_background_frame(self, frame: QWidget | None) -> None:
+        if self._connected_onboarding_frame is not None:
+            signal = getattr(self._connected_onboarding_frame, "glowChanged", None)
+            if signal is not None:
+                try:
+                    signal.disconnect(self.update)
+                except Exception:
+                    pass
+        self._connected_onboarding_frame = frame
+        self._onboarding_background_frame = frame
+        signal = getattr(frame, "glowChanged", None) if frame is not None else None
+        if signal is not None:
+            try:
+                signal.connect(self.update)
+            except Exception:
+                pass
+        self.update()
+
+    def set_fade_height(self, height: int) -> None:
+        self._fade_height = max(10, int(height))
+        self.update()
+
+    def set_edges(self, *, top: bool = True, bottom: bool = True) -> None:
+        self._paint_top = bool(top)
+        self._paint_bottom = bool(bottom)
+        self._sync_state()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self._scrollable.viewport() and event.type() in {QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.Paint}:
@@ -1016,7 +1797,7 @@ class ScrollFadeOverlay(QWidget):
         value = max(0, int(bar.value()))
         self._top_visible = value > 0
         self._bottom_visible = maximum > 0 and value < maximum
-        visible = self._top_visible or self._bottom_visible
+        visible = (self._top_visible and self._paint_top) or (self._bottom_visible and self._paint_bottom)
         self.setVisible(visible)
         if visible:
             self.raise_()
@@ -1025,21 +1806,99 @@ class ScrollFadeOverlay(QWidget):
     def paintEvent(self, event: QEvent) -> None:
         if not (self._top_visible or self._bottom_visible):
             return
+        if self._onboarding_background_frame is not None and self._paint_onboarding_background_fade():
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         color = self._surface_color()
         width = self.width()
         fade_height = min(self._fade_height, max(10, self.height() // 5))
-        if self._top_visible:
+        if self._top_visible and self._paint_top:
             top = QLinearGradient(0, 0, 0, fade_height)
             top.setColorAt(0.0, color)
             top.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 0))
             painter.fillRect(QRectF(0, -1, width, fade_height + 2), top)
-        if self._bottom_visible:
+        if self._bottom_visible and self._paint_bottom:
             bottom = QLinearGradient(0, self.height() - fade_height, 0, self.height())
             bottom.setColorAt(0.0, QColor(color.red(), color.green(), color.blue(), 0))
             bottom.setColorAt(1.0, color)
             painter.fillRect(QRectF(0, self.height() - fade_height - 1, width, fade_height + 2), bottom)
+
+    def _paint_onboarding_background_fade(self) -> bool:
+        frame = self._onboarding_background_frame
+        if frame is None or self.width() <= 0 or self.height() <= 0:
+            return False
+        background = getattr(frame, "_background_color", None)
+        if not isinstance(background, QColor) or background.alpha() <= 0:
+            return False
+
+        pixmap = QPixmap(self.size())
+        pixmap.fill(Qt.GlobalColor.transparent)
+        top_left = self.mapTo(frame, QPoint(0, 0))
+        frame_rect = QRectF(frame.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.translate(-top_left)
+        painter.fillRect(frame_rect, background)
+        light = background.lightnessF() > 0.6
+        glow_x = float(getattr(frame, "_glow_x", 0.5) or 0.5)
+        glow_y = float(getattr(frame, "_glow_y", 1.18) or 1.18)
+        glow = QRadialGradient(
+            frame_rect.left() + frame_rect.width() * glow_x,
+            frame_rect.top() + frame_rect.height() * glow_y,
+            max(frame_rect.width() * 0.96, frame_rect.height() * 1.2),
+        )
+        if light:
+            center = QColor(92, 140, 255, 30)
+            middle = QColor(92, 140, 255, 16)
+            far = QColor(92, 140, 255, 5)
+            edge = QColor(93, 139, 255, 0)
+        else:
+            center = QColor(76, 128, 235, 48)
+            middle = QColor(76, 128, 235, 25)
+            far = QColor(76, 128, 235, 7)
+            edge = QColor(88, 146, 255, 0)
+        glow.setColorAt(0.0, center)
+        glow.setColorAt(0.24, QColor(center.red(), center.green(), center.blue(), max(0, center.alpha() - 5)))
+        glow.setColorAt(0.48, middle)
+        glow.setColorAt(0.72, far)
+        glow.setColorAt(1.0, edge)
+        painter.fillRect(frame_rect, glow)
+        side = QLinearGradient(frame_rect.left(), 0, frame_rect.right(), 0)
+        side_color = QColor(70, 118, 210, 10 if not light else 8)
+        side.setColorAt(0.0, side_color)
+        side.setColorAt(0.34, QColor(side_color.red(), side_color.green(), side_color.blue(), 0))
+        side.setColorAt(0.66, QColor(side_color.red(), side_color.green(), side_color.blue(), 0))
+        side.setColorAt(1.0, side_color)
+        painter.fillRect(frame_rect, side)
+        painter.end()
+
+        mask = QPixmap(self.size())
+        mask.fill(Qt.GlobalColor.transparent)
+        fade_height = min(self._fade_height, max(10, self.height() // 3))
+        mask_painter = QPainter(mask)
+        if self._top_visible and self._paint_top:
+            top = QLinearGradient(0, 0, 0, fade_height)
+            top.setColorAt(0.0, QColor(255, 255, 255, 255))
+            top.setColorAt(1.0, QColor(255, 255, 255, 0))
+            mask_painter.fillRect(QRectF(0, 0, self.width(), fade_height), top)
+        if self._bottom_visible and self._paint_bottom:
+            bottom = QLinearGradient(0, self.height() - fade_height, 0, self.height())
+            bottom.setColorAt(0.0, QColor(255, 255, 255, 0))
+            bottom.setColorAt(1.0, QColor(255, 255, 255, 255))
+            mask_painter.fillRect(QRectF(0, self.height() - fade_height, self.width(), fade_height), bottom)
+        mask_painter.end()
+
+        clip = QPainter(pixmap)
+        clip.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+        clip.drawPixmap(0, 0, mask)
+        clip.end()
+
+        out = QPainter(self)
+        out.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        out.drawPixmap(0, 0, pixmap)
+        return True
 
 
 def _content_surface_color(theme: str) -> QColor:
@@ -1072,6 +1931,18 @@ def _files_inner_surface_css(theme: str) -> str:
     return _files_inner_surface_color(theme).name()
 
 
+def _dialog_surface_color(theme: str) -> QColor:
+    if theme == "light blue":
+        return QColor("#ffffff")
+    if theme == "light":
+        return QColor("#ffffff")
+    if theme == "oled":
+        return QColor("#101215")
+    if theme == "dark":
+        return QColor("#181b1f")
+    return QColor("#151f33")
+
+
 def _chrome_surface_color(theme: str) -> QColor:
     if theme == "dark":
         return QColor("#181a1d")
@@ -1084,12 +1955,51 @@ def _chrome_surface_color(theme: str) -> QColor:
     return QColor("#101726")
 
 
+def _load_ui_font_family(ui_assets_dir: Path) -> str:
+    font_path = ui_assets_dir / "fonts" / "JetBrainsSans[wght]-VF.ttf"
+    family = "JetBrains Sans"
+    if font_path.exists():
+        font_id = QFontDatabase.addApplicationFont(str(font_path))
+        families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+        if families:
+            family = str(families[0])
+    return family
+
+
 def _onboarding_text_color(theme: str) -> str:
     return "#16202f" if is_light_theme(theme) else "#f6f8fc"
 
 
 def _onboarding_muted_color(theme: str) -> str:
     return "#4b5d78" if is_light_theme(theme) else "#9db2d8"
+
+
+def _theme_display_name(theme: str, language: str = "en") -> str:
+    if language == "ru":
+        names = {
+            "night": "Ночная",
+            "dark": "Тёмно-серая",
+            "oled": "Тёмная",
+            "light": "Светлая",
+            "light blue": "Светло-синяя",
+        }
+    else:
+        names = {
+            "night": "Night",
+            "dark": "Dark Gray",
+            "oled": "Dark",
+            "light": "Light",
+            "light blue": "Light Blue",
+        }
+    return names.get(theme, theme.title())
+
+
+def _language_display_name(language: str, ui_language: str = "en") -> str:
+    if language == "ru":
+        return "Русский" if ui_language == "ru" else "Russian"
+    if language == "en":
+        return "English"
+    return language
 
 
 def _render_widget_snapshot(widget: QWidget) -> QPixmap:
@@ -1191,6 +2101,8 @@ class OnboardingPageWidget(QWidget):
         rect = QRectF(self.rect()).adjusted(0.0, 0.0, -1.0, -1.0)
         if rect.width() <= 0 or rect.height() <= 0:
             return
+        if self._background_color.alpha() <= 0:
+            return
         radius = 16.0
         path = QPainterPath()
         path.moveTo(rect.left(), rect.top())
@@ -1202,6 +2114,151 @@ class OnboardingPageWidget(QWidget):
         path.lineTo(rect.left(), rect.top())
         path.closeSubpath()
         painter.fillPath(path, self._background_color)
+        painter.save()
+        painter.setClipPath(path)
+        light = self._background_color.lightnessF() > 0.6
+        glow = QRadialGradient(
+            rect.center().x(),
+            rect.bottom() + rect.height() * 0.18,
+            max(rect.width() * 0.96, rect.height() * 1.2),
+        )
+        if light:
+            center = QColor(92, 140, 255, 30)
+            middle = QColor(92, 140, 255, 16)
+            far = QColor(92, 140, 255, 5)
+            edge = QColor(93, 139, 255, 0)
+        else:
+            center = QColor(76, 128, 235, 48)
+            middle = QColor(76, 128, 235, 25)
+            far = QColor(76, 128, 235, 7)
+            edge = QColor(88, 146, 255, 0)
+        glow.setColorAt(0.0, center)
+        glow.setColorAt(0.24, QColor(center.red(), center.green(), center.blue(), max(0, center.alpha() - 5)))
+        glow.setColorAt(0.48, middle)
+        glow.setColorAt(0.72, far)
+        glow.setColorAt(1.0, edge)
+        painter.fillRect(rect, glow)
+        side = QLinearGradient(rect.left(), 0, rect.right(), 0)
+        side_color = QColor(70, 118, 210, 10 if not light else 8)
+        side.setColorAt(0.0, side_color)
+        side.setColorAt(0.34, QColor(side_color.red(), side_color.green(), side_color.blue(), 0))
+        side.setColorAt(0.66, QColor(side_color.red(), side_color.green(), side_color.blue(), 0))
+        side.setColorAt(1.0, side_color)
+        painter.fillRect(rect, side)
+        painter.restore()
+
+
+class OnboardingFrame(QFrame):
+    glowChanged = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._background_color = QColor(0, 0, 0, 0)
+        self._onboarding_active = False
+        self._glow_x = 0.5
+        self._glow_y = 1.18
+        self._glow_target = (self._glow_x, self._glow_y)
+        self._glow_animation: QParallelAnimationGroup | None = None
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+    def set_onboarding_background(self, color: QColor, active: bool) -> None:
+        self._background_color = QColor(color)
+        self._onboarding_active = bool(active)
+        self.update()
+
+    def set_glow_position(self, x: float, y: float, *, animated: bool = True) -> None:
+        x = max(-0.35, min(1.35, float(x)))
+        y = max(-0.35, min(1.45, float(y)))
+        if abs(self._glow_target[0] - x) < 0.001 and abs(self._glow_target[1] - y) < 0.001:
+            return
+        self._glow_target = (x, y)
+        if self._glow_animation is not None:
+            self._glow_animation.stop()
+            self._glow_animation.deleteLater()
+            self._glow_animation = None
+        if not animated:
+            self._glow_x = x
+            self._glow_y = y
+            self.update()
+            self.glowChanged.emit()
+            return
+        group = QParallelAnimationGroup(self)
+        for prop, start, end in ((b"glowX", self._glow_x, x), (b"glowY", self._glow_y, y)):
+            anim = QPropertyAnimation(self, prop, group)
+            anim.setDuration(720)
+            anim.setStartValue(start)
+            anim.setEndValue(end)
+            anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            group.addAnimation(anim)
+        group.finished.connect(lambda: setattr(self, "_glow_animation", None))
+        self._glow_animation = group
+        group.start()
+
+    def _get_glow_x(self) -> float:
+        return self._glow_x
+
+    def _set_glow_x(self, value: float) -> None:
+        self._glow_x = float(value)
+        self.update()
+        self.glowChanged.emit()
+
+    def _get_glow_y(self) -> float:
+        return self._glow_y
+
+    def _set_glow_y(self, value: float) -> None:
+        self._glow_y = float(value)
+        self.update()
+        self.glowChanged.emit()
+
+    glowX = Property(float, _get_glow_x, _set_glow_x)
+    glowY = Property(float, _get_glow_y, _set_glow_y)
+
+    def paintEvent(self, event: QEvent) -> None:
+        if not self._onboarding_active:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        path = QPainterPath()
+        path.addRoundedRect(rect, 16, 16)
+        painter.fillPath(path, self._background_color)
+        painter.save()
+        painter.setClipPath(path)
+        light = self._background_color.lightnessF() > 0.6
+        glow = QRadialGradient(
+            rect.left() + rect.width() * self._glow_x,
+            rect.top() + rect.height() * self._glow_y,
+            max(rect.width() * 0.96, rect.height() * 1.2),
+        )
+        if light:
+            center = QColor(92, 140, 255, 30)
+            middle = QColor(92, 140, 255, 16)
+            far = QColor(92, 140, 255, 5)
+        else:
+            center = QColor(76, 128, 235, 48)
+            middle = QColor(76, 128, 235, 25)
+            far = QColor(76, 128, 235, 7)
+        glow.setColorAt(0.0, center)
+        glow.setColorAt(0.24, QColor(center.red(), center.green(), center.blue(), max(0, center.alpha() - 5)))
+        glow.setColorAt(0.48, middle)
+        glow.setColorAt(0.72, far)
+        glow.setColorAt(1.0, QColor(88, 146, 255, 0))
+        painter.fillRect(rect, glow)
+        side = QLinearGradient(rect.left(), 0, rect.right(), 0)
+        side_color = QColor(70, 118, 210, 10 if not light else 8)
+        side.setColorAt(0.0, side_color)
+        side.setColorAt(0.34, QColor(side_color.red(), side_color.green(), side_color.blue(), 0))
+        side.setColorAt(0.66, QColor(side_color.red(), side_color.green(), side_color.blue(), 0))
+        side.setColorAt(1.0, side_color)
+        painter.fillRect(rect, side)
+        painter.restore()
+        border = QColor("#24304a" if not light else "#d2ddeb")
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect, 16, 16)
 
 
 class RoundedProgressBar(QProgressBar):
@@ -1261,6 +2318,177 @@ class RoundedProgressBar(QProgressBar):
         painter.restore()
 
 
+class OnboardingServiceProgressButton(QPushButton):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._theme_name = "night"
+        self._count = 0
+        self._required = 3
+        self._fill_progress = 0.0
+        self._morph_progress = 0.0
+        self._hover_progress = 0.0
+        self._target_fill_progress = 0.0
+        self._target_morph_progress = 0.0
+        self._fill_anim: QPropertyAnimation | None = None
+        self._morph_anim: QPropertyAnimation | None = None
+        self._hover_anim: QPropertyAnimation | None = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setFlat(True)
+        self.setFixedSize(224, 44)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def set_theme(self, theme: str) -> None:
+        self._theme_name = theme
+        self.update()
+
+    def set_selection_state(self, count: int, required: int, *, text: str) -> None:
+        next_count = max(0, int(count))
+        next_required = max(1, int(required))
+        ready = next_count >= next_required
+        self.setCursor(Qt.CursorShape.PointingHandCursor if ready else Qt.CursorShape.ArrowCursor)
+        target_fill = max(0.0, min(1.0, next_count / next_required))
+        target_morph = 1.0 if ready else 0.0
+        if (
+            self._count == next_count
+            and self._required == next_required
+            and self.text() == text
+            and abs(self._target_fill_progress - target_fill) < 0.0005
+            and abs(self._target_morph_progress - target_morph) < 0.0005
+        ):
+            return
+        self._count = next_count
+        self._required = next_required
+        if self.text() != text:
+            self.setText(text)
+        self._target_fill_progress = target_fill
+        self._target_morph_progress = target_morph
+        self._animate_to(b"fillProgress", self._fill_progress, target_fill, 220)
+        self._animate_to(b"morphProgress", self._morph_progress, target_morph, 260)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._count < self._required:
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def enterEvent(self, event: QEvent) -> None:
+        self._animate_to(b"hoverProgress", self._hover_progress, 1.0 if self._count >= self._required else 0.0, 160)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        self._animate_to(b"hoverProgress", self._hover_progress, 0.0, 180)
+        super().leaveEvent(event)
+
+    def paintEvent(self, event: QEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        light = is_light_theme(self._theme_name)
+        morph = max(0.0, min(1.0, self._morph_progress))
+        fill_progress = max(0.0, min(1.0, self._fill_progress))
+
+        width = 150.0 + (196.0 - 150.0) * morph
+        height = 26.0 + (34.0 - 26.0) * morph
+        rect = QRectF((self.width() - width) / 2.0, (self.height() - height) / 2.0, width, height)
+        radius = height / 2.0
+
+        shadow = QColor(17, 24, 39, 70 if not light else 30)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(shadow)
+        painter.drawRoundedRect(rect.translated(0, 5), radius, radius)
+
+        track = QColor("#e5edf8" if light else "#202838")
+        border = QColor("#c9d6eb" if light else "#33415a")
+        painter.setBrush(track)
+        painter.setPen(QPen(border, 1))
+        painter.drawRoundedRect(rect, radius, radius)
+
+        if fill_progress > 0.0:
+            fill_rect = QRectF(rect.left(), rect.top(), rect.width() * fill_progress, rect.height())
+            track_path = QPainterPath()
+            track_path.addRoundedRect(rect, radius, radius)
+            gradient = QLinearGradient(fill_rect.left(), fill_rect.top(), fill_rect.right(), fill_rect.bottom())
+            gradient.setColorAt(0.0, QColor("#4f73d9" if light else "#5f8cff"))
+            gradient.setColorAt(1.0, QColor("#2f65d8" if light else "#55d7ff"))
+            painter.save()
+            painter.setClipPath(track_path)
+            painter.fillRect(fill_rect, gradient)
+            painter.restore()
+
+        if self._hover_progress > 0.0 and self._count >= self._required:
+            hover = QColor("#ffffff")
+            hover.setAlpha(int(34 * self._hover_progress))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(hover)
+            painter.drawRoundedRect(rect, radius, radius)
+
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSizeF(9.4 + 0.8 * morph)
+        painter.setFont(font)
+        progress_text = f"{min(self._count, self._required)} / {self._required}"
+        continue_text = self.text()
+        progress_opacity = max(0.0, min(1.0, 1.0 - (morph - 0.52) / 0.24))
+        continue_opacity = max(0.0, min(1.0, (morph - 0.68) / 0.26))
+        progress_color = QColor("#ffffff") if fill_progress > 0.45 else QColor("#667389" if light else "#b4bfd0")
+        continue_color = QColor("#ffffff")
+        if progress_opacity > 0.0:
+            painter.save()
+            painter.setOpacity(progress_opacity)
+            painter.setPen(progress_color)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, progress_text)
+            painter.restore()
+        if continue_opacity > 0.0:
+            painter.save()
+            painter.setOpacity(continue_opacity)
+            painter.setPen(continue_color)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, continue_text)
+            painter.restore()
+
+    def _animate_to(self, name: bytes, start: float, end: float, duration: int) -> None:
+        attr = "_fill_anim" if name == b"fillProgress" else "_morph_anim" if name == b"morphProgress" else "_hover_anim"
+        current = getattr(self, attr, None)
+        if isinstance(current, QPropertyAnimation):
+            current.stop()
+        if abs(float(start) - float(end)) < 0.0005:
+            setter = self._set_fill_progress if name == b"fillProgress" else self._set_morph_progress if name == b"morphProgress" else self._set_hover_progress
+            setter(float(end))
+            setattr(self, attr, None)
+            return
+        animation = QPropertyAnimation(self, name, self)
+        animation.setDuration(duration)
+        animation.setStartValue(start)
+        animation.setEndValue(end)
+        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        animation.start()
+        setattr(self, attr, animation)
+
+    def _get_fill_progress(self) -> float:
+        return self._fill_progress
+
+    def _set_fill_progress(self, value: float) -> None:
+        self._fill_progress = float(value)
+        self.update()
+
+    def _get_morph_progress(self) -> float:
+        return self._morph_progress
+
+    def _set_morph_progress(self, value: float) -> None:
+        self._morph_progress = float(value)
+        self.update()
+
+    def _get_hover_progress(self) -> float:
+        return self._hover_progress
+
+    def _set_hover_progress(self, value: float) -> None:
+        self._hover_progress = float(value)
+        self.update()
+
+    fillProgress = Property(float, _get_fill_progress, _set_fill_progress)
+    morphProgress = Property(float, _get_morph_progress, _set_morph_progress)
+    hoverProgress = Property(float, _get_hover_progress, _set_hover_progress)
+
+
 class EmojiBadgeButton(QToolButton):
     def __init__(self, emoji: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1297,12 +2525,13 @@ class EmojiBadgeButton(QToolButton):
 
 
 class SmoothScrollController(QObject):
-    def __init__(self, scrollable: QAbstractScrollArea) -> None:
+    def __init__(self, scrollable: QAbstractScrollArea, *, duration: int = 170, angle_divisor: float = 2.0) -> None:
         super().__init__(scrollable)
         self._scrollable = scrollable
+        self._angle_divisor = max(1.0, float(angle_divisor))
         self._target_value = scrollable.verticalScrollBar().value()
         self._animation = QPropertyAnimation(scrollable.verticalScrollBar(), b"value", self)
-        self._animation.setDuration(170)
+        self._animation.setDuration(max(80, int(duration)))
         self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         scrollable.viewport().installEventFilter(self)
 
@@ -1313,7 +2542,7 @@ class SmoothScrollController(QObject):
             if hasattr(wheel, "pixelDelta") and wheel.pixelDelta().y() != 0:  # type: ignore[attr-defined]
                 delta = int(wheel.pixelDelta().y())  # type: ignore[attr-defined]
             elif hasattr(wheel, "angleDelta"):
-                delta = int(wheel.angleDelta().y() / 2)  # type: ignore[attr-defined]
+                delta = int(wheel.angleDelta().y() / self._angle_divisor)  # type: ignore[attr-defined]
             if delta != 0:
                 bar = self._scrollable.verticalScrollBar()
                 self._target_value = max(bar.minimum(), min(bar.maximum(), self._target_value - delta))
@@ -1533,16 +2762,22 @@ class SettingsDialog(AppDialog):
     def __init__(self, parent: QWidget, context: ApplicationContext) -> None:
         self.context = context
         self._smooth_scroll_helpers: list[SmoothScrollController] = []
+        self._scroll_fade_overlays: list[ScrollFadeOverlay] = []
+        self._settings_scroll: QScrollArea | None = None
+        self._settings_section_frames: dict[str, QFrame] = {}
+        self._pending_scroll_section = ""
         super().__init__(parent, context, self._t("Настройки", "Settings"))
         self.setMinimumWidth(520)
         self.resize(600, 980)
         layout = self.body_layout
 
         self.theme_combo = ClickSelectComboBox()
+        ui_language = self.context.settings.get().language
         for theme_id in ("night", "dark", "oled", "light", "light blue"):
-            self.theme_combo.addItem(theme_id, theme_id)
+            self.theme_combo.addItem(_theme_display_name(theme_id, ui_language), theme_id)
         self.language_combo = ClickSelectComboBox()
-        self.language_combo.addItems(["ru", "en"])
+        for language_id in ("ru", "en"):
+            self.language_combo.addItem(_language_display_name(language_id, ui_language), language_id)
         self.tg_host_input = QLineEdit()
         self.tg_port_input = QLineEdit()
         self.tg_secret_input = QLineEdit()
@@ -1558,20 +2793,41 @@ class SettingsDialog(AppDialog):
         self.tg_fake_tls_input = QLineEdit()
         self.tg_buf_input = QLineEdit()
         self.tg_pool_input = QLineEdit()
+        self.zapret_udp_exclude_input = QLineEdit()
         self.ipset_mode_combo = ClickSelectComboBox()
         self.ipset_mode_combo.addItem("loaded", "loaded")
         self.ipset_mode_combo.addItem("none", "none")
         self.ipset_mode_combo.addItem("any", "any")
         self.game_mode_combo = ClickSelectComboBox()
-        self.game_mode_combo.addItem(self._t("как в конфиге", "from config"), "auto")
         self.game_mode_combo.addItem(self._t("выключен", "disabled"), "disabled")
-        self.game_mode_combo.addItem(self._t("tcp + udp", "tcp + udp"), "all")
+        self.game_mode_combo.addItem(self._t("tcp + udp", "tcp + udp"), "tcpudp")
         self.game_mode_combo.addItem(self._t("только tcp", "tcp only"), "tcp")
         self.game_mode_combo.addItem(self._t("только udp", "udp only"), "udp")
         self.autostart_checkbox = QCheckBox(self._t("Запускать вместе с Windows", "Run with Windows"))
         self.tray_checkbox = QCheckBox(self._t("Стартовать в трее", "Start in tray"))
         self.auto_components_checkbox = QCheckBox(self._t("Автозапуск компонентов", "Auto-run components"))
         self.check_updates_checkbox = QCheckBox(self._t("Проверять наличие обновлений", "Check for updates"))
+        self.vpn_subscription_input = QLineEdit()
+        self.vpn_subscription_input.setPlaceholderText("https://vpn.goshkow.ru/sub/...")
+        self.vpn_tun_checkbox = QCheckBox(self._t("Использовать TUN-режим", "Use TUN mode"))
+        self.vpn_routing_combo = ClickSelectComboBox()
+        self.vpn_routing_combo.addItem(self._t("Глобальная", "Global"), "global")
+        self.vpn_routing_combo.addItem(self._t("RU чёрный список", "RU blacklist"), "blacklist")
+        self.vpn_routing_combo.addItem(self._t("RU белый список", "RU whitelist"), "whitelist")
+        self.vpn_proxy_combo = ClickSelectComboBox()
+        self.vpn_proxy_combo.addItem(self._t("Очистить системный прокси", "Clear system proxy"), "clear")
+        self.vpn_proxy_combo.addItem(self._t("Установить системный прокси", "Set system proxy"), "set")
+        self.vpn_proxy_combo.addItem(self._t("Не менять системный прокси", "Do not change system proxy"), "unchanged")
+        self.vpn_proxy_combo.addItem(self._t("PAC-режим", "PAC mode"), "pac")
+        self.vpn_processes_input = QLineEdit()
+        self.vpn_processes_input.setPlaceholderText(
+            self._t(
+                "Например: qBittorrent.exe, Transmission.exe",
+                "For example: qBittorrent.exe, Transmission.exe",
+            )
+        )
+        self.vpn_refresh_btn = QPushButton(self._t("Обновить подписку", "Refresh subscription"))
+        self.vpn_refresh_btn.clicked.connect(self._refresh_vpn_subscription)
 
         scroll = QScrollArea()
         scroll.setObjectName("SettingsScroll")
@@ -1580,6 +2836,7 @@ class SettingsDialog(AppDialog):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setMinimumHeight(560)
         scroll.setMaximumHeight(760)
+        self._settings_scroll = scroll
         canvas = QWidget()
         canvas.setObjectName("SettingsCanvas")
         canvas_layout = QVBoxLayout(canvas)
@@ -1587,9 +2844,13 @@ class SettingsDialog(AppDialog):
         canvas_layout.setSpacing(10)
         scroll.setWidget(canvas)
         self._smooth_scroll_helpers.append(SmoothScrollController(scroll))
+        fade = ScrollFadeOverlay(scroll)
+        fade.set_theme(self.context.settings.get().theme)
+        fade.set_surface_color(_dialog_surface_color(self.context.settings.get().theme))
+        self._scroll_fade_overlays.append(fade)
         layout.addWidget(scroll, 1)
 
-        app_form = self._settings_section(canvas_layout, self._t("Приложение", "Application"))
+        app_form = self._settings_section(canvas_layout, self._t("Приложение", "Application"), "app")
         app_form.addRow(self._t("Тема", "Theme"), self.theme_combo)
         app_form.addRow(self._t("Язык", "Language"), self.language_combo)
         app_form.addRow("", self.autostart_checkbox)
@@ -1597,11 +2858,21 @@ class SettingsDialog(AppDialog):
         app_form.addRow("", self.auto_components_checkbox)
         app_form.addRow("", self.check_updates_checkbox)
 
-        zapret_form = self._settings_section(canvas_layout, "Zapret")
+        vpn_form = self._settings_section(canvas_layout, "goshkow vpn", "goshkow-vpn")
+        self.vpn_section_frame = vpn_form.parentWidget()
+        vpn_form.addRow(self._t("Ссылка подписки", "Subscription URL"), self.vpn_subscription_input)
+        vpn_form.addRow("", self.vpn_refresh_btn)
+        vpn_form.addRow("", self.vpn_tun_checkbox)
+        vpn_form.addRow(self._t("Маршрутизация", "Routing"), self.vpn_routing_combo)
+        vpn_form.addRow(self._t("Системный прокси", "System proxy"), self.vpn_proxy_combo)
+        vpn_form.addRow(self._t("Процессы", "Processes"), self.vpn_processes_input)
+
+        zapret_form = self._settings_section(canvas_layout, "Zapret", "zapret")
         zapret_form.addRow("IPSet mode", self.ipset_mode_combo)
         zapret_form.addRow(self._t("Gaming mode", "Gaming mode"), self.game_mode_combo)
+        zapret_form.addRow(self._t("Исключить UDP-порты", "Exclude UDP ports"), self.zapret_udp_exclude_input)
 
-        tg_form = self._settings_section(canvas_layout, "TG WS Proxy")
+        tg_form = self._settings_section(canvas_layout, "TG WS Proxy", "tg-ws-proxy")
         tg_form.addRow(self._t("Хост", "Host"), self.tg_host_input)
         tg_form.addRow(self._t("Порт", "Port"), self.tg_port_input)
         tg_form.addRow(self._t("Секрет", "Secret"), self.tg_secret_input)
@@ -1616,11 +2887,33 @@ class SettingsDialog(AppDialog):
 
         self.tg_media_mode_combo.currentIndexChanged.connect(self._apply_tg_media_preset)
 
+        restart_onboarding_btn = QPushButton(self._t("Настроить заново", "Configure again"))
+        restart_onboarding_btn.setObjectName("RestartOnboardingButton")
+        restart_onboarding_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        restart_onboarding_btn.setMinimumHeight(38)
+        restart_onboarding_btn.setStyleSheet(
+            "QPushButton#RestartOnboardingButton {"
+            "background: transparent;"
+            "border: 1px solid rgba(239, 68, 68, 95);"
+            "border-radius: 12px;"
+            "padding: 8px 14px;"
+            "color: rgba(248, 113, 113, 210);"
+            "font-weight: 650;"
+            "}"
+            "QPushButton#RestartOnboardingButton:hover {"
+            "background: rgba(239, 68, 68, 22);"
+            "border: 1px solid rgba(248, 113, 113, 145);"
+            "color: rgba(252, 165, 165, 235);"
+            "}"
+        )
+        restart_onboarding_btn.clicked.connect(self._restart_onboarding)
+        canvas_layout.addWidget(restart_onboarding_btn)
+
         credits = QLabel(
             self._t(
-                "Credits: original zapret bundle and tg-ws-proxy by Flowseal.\n"
-                "Original zapret ecosystem by bol-van.\n"
-                f"This app is a separate management UI.\nVersion: {__version__} | Author: goshkow",
+                "Благодарности: оригинальный набор zapret и tg-ws-proxy от Flowseal.\n"
+                "Оригинальная экосистема zapret от bol-van.\n"
+                f"Это приложение является отдельным интерфейсом управления.\nВерсия: {__version__} | Автор: goshkow",
                 "Credits: original zapret bundle and tg-ws-proxy by Flowseal.\n"
                 "Original zapret ecosystem by bol-van.\n"
                 f"This app is a separate management UI.\nVersion: {__version__} | Author: goshkow",
@@ -1642,9 +2935,12 @@ class SettingsDialog(AppDialog):
         layout.addLayout(buttons)
         self._load()
 
-    def _settings_section(self, parent_layout: QVBoxLayout, title: str) -> QFormLayout:
+    def _settings_section(self, parent_layout: QVBoxLayout, title: str, section_id: str = "") -> QFormLayout:
         frame = QFrame()
         frame.setProperty("class", "settingsSection")
+        if section_id:
+            frame.setObjectName(f"SettingsSection_{section_id.replace('-', '_')}")
+            self._settings_section_frames[section_id] = frame
         section_layout = QVBoxLayout(frame)
         section_layout.setContentsMargins(14, 12, 14, 14)
         section_layout.setSpacing(10)
@@ -1660,14 +2956,41 @@ class SettingsDialog(AppDialog):
         parent_layout.addWidget(frame)
         return form
 
+    def scroll_to_component_settings(self, component_id: str) -> None:
+        target = str(component_id or "").strip()
+        if target == "tg":
+            target = "tg-ws-proxy"
+        self._pending_scroll_section = target
+        QTimer.singleShot(0, self._scroll_to_pending_section)
+        QTimer.singleShot(140, self._scroll_to_pending_section)
+
+    def _scroll_to_pending_section(self) -> None:
+        target = self._pending_scroll_section
+        if not target or self._settings_scroll is None:
+            return
+        frame = self._settings_section_frames.get(target)
+        if frame is None or not frame.isVisible():
+            return
+        try:
+            self._settings_scroll.ensureWidgetVisible(frame, 18, 18)
+        except Exception:
+            pass
+
     def _t(self, ru: str, en: str) -> str:
         return ru if self.context.settings.get().language == "ru" else en
 
+    def _restart_onboarding(self) -> None:
+        parent = self.parent()
+        self.reject()
+        if parent is not None and hasattr(parent, "_restart_onboarding_from_settings"):
+            QTimer.singleShot(0, getattr(parent, "_restart_onboarding_from_settings"))
+
     def _load(self) -> None:
         settings = self.context.settings.get()
+        vpn_state = self.context.vpn.state()
         theme_index = self.theme_combo.findData(settings.theme)
         self.theme_combo.setCurrentIndex(theme_index if theme_index >= 0 else 0)
-        self.language_combo.setCurrentText(settings.language)
+        self._select_combo_value(self.language_combo, settings.language)
         self.tg_host_input.setText(settings.tg_proxy_host)
         self.tg_port_input.setText(str(settings.tg_proxy_port))
         self.tg_secret_input.setText(settings.tg_proxy_secret)
@@ -1683,10 +3006,74 @@ class SettingsDialog(AppDialog):
         self.ipset_mode_combo.setCurrentIndex(ipset_idx if ipset_idx >= 0 else 0)
         game_idx = self.game_mode_combo.findData(settings.zapret_game_filter_mode)
         self.game_mode_combo.setCurrentIndex(game_idx if game_idx >= 0 else 0)
+        self.zapret_udp_exclude_input.setText(settings.zapret_udp_exclude_ports)
         self.autostart_checkbox.setChecked(self.context.autostart.is_enabled())
         self.tray_checkbox.setChecked(settings.start_in_tray)
         self.auto_components_checkbox.setChecked(settings.auto_run_components)
         self.check_updates_checkbox.setChecked(settings.check_updates_on_start)
+        self.vpn_subscription_input.setText(
+            str(vpn_state.get("subscription_url", "") or settings.goshkow_vpn_subscription_url)
+        )
+        self.vpn_tun_checkbox.setChecked(bool(vpn_state.get("tun_enabled", settings.goshkow_vpn_tun_enabled)))
+        self._select_combo_value(
+            self.vpn_routing_combo,
+            str(vpn_state.get("routing_mode", settings.goshkow_vpn_routing_mode) or "global"),
+        )
+        self._select_combo_value(
+            self.vpn_proxy_combo,
+            str(vpn_state.get("system_proxy_mode", settings.goshkow_vpn_system_proxy_mode) or "pac"),
+        )
+        self.vpn_processes_input.setText(
+            str(vpn_state.get("processes", settings.goshkow_vpn_processes) or "")
+        )
+        if self.vpn_section_frame is not None:
+            self.vpn_section_frame.setVisible(str(vpn_state.get("subscription_state", "") or "") == "valid")
+
+    def load_from_payload(self, payload: dict[str, object]) -> None:
+        self._load()
+        theme_index = self.theme_combo.findData(str(payload.get("theme", self.context.settings.get().theme)))
+        self.theme_combo.setCurrentIndex(theme_index if theme_index >= 0 else self.theme_combo.currentIndex())
+        language = str(payload.get("language", self.context.settings.get().language))
+        if language:
+            self._select_combo_value(self.language_combo, language)
+        self.tg_host_input.setText(str(payload.get("tg_proxy_host", self.context.settings.get().tg_proxy_host)))
+        self.tg_port_input.setText(str(payload.get("tg_proxy_port", self.context.settings.get().tg_proxy_port)))
+        self.tg_secret_input.setText(str(payload.get("tg_proxy_secret", self.context.settings.get().tg_proxy_secret)))
+        tg_dc_ip = str(payload.get("tg_proxy_dc_ip", self.context.settings.get().tg_proxy_dc_ip))
+        self.tg_dc_ip_input.setPlainText(tg_dc_ip)
+        self.tg_cfproxy_checkbox.setChecked(bool(payload.get("tg_proxy_cfproxy_enabled", self.context.settings.get().tg_proxy_cfproxy_enabled)))
+        self.tg_cfproxy_priority_checkbox.setChecked(bool(payload.get("tg_proxy_cfproxy_priority", self.context.settings.get().tg_proxy_cfproxy_priority)))
+        self.tg_cfproxy_domain_input.setText(str(payload.get("tg_proxy_cfproxy_domain", self.context.settings.get().tg_proxy_cfproxy_domain)))
+        self.tg_fake_tls_input.setText(str(payload.get("tg_proxy_fake_tls_domain", self.context.settings.get().tg_proxy_fake_tls_domain)))
+        self.tg_buf_input.setText(str(payload.get("tg_proxy_buf_kb", self.context.settings.get().tg_proxy_buf_kb)))
+        self.tg_pool_input.setText(str(payload.get("tg_proxy_pool_size", self.context.settings.get().tg_proxy_pool_size)))
+        self._sync_tg_media_mode_from_dc_ip(tg_dc_ip)
+        ipset_idx = self.ipset_mode_combo.findData(str(payload.get("zapret_ipset_mode", self.context.settings.get().zapret_ipset_mode)))
+        self.ipset_mode_combo.setCurrentIndex(ipset_idx if ipset_idx >= 0 else self.ipset_mode_combo.currentIndex())
+        game_idx = self.game_mode_combo.findData(str(payload.get("zapret_game_filter_mode", self.context.settings.get().zapret_game_filter_mode)))
+        self.game_mode_combo.setCurrentIndex(game_idx if game_idx >= 0 else self.game_mode_combo.currentIndex())
+        self.zapret_udp_exclude_input.setText(str(payload.get("zapret_udp_exclude_ports", self.context.settings.get().zapret_udp_exclude_ports)))
+        self.autostart_checkbox.setChecked(bool(payload.get("autostart_windows", self.context.settings.get().autostart_windows)))
+        self.tray_checkbox.setChecked(bool(payload.get("start_in_tray", self.context.settings.get().start_in_tray)))
+        self.auto_components_checkbox.setChecked(bool(payload.get("auto_run_components", self.context.settings.get().auto_run_components)))
+        self.check_updates_checkbox.setChecked(bool(payload.get("check_updates_on_start", self.context.settings.get().check_updates_on_start)))
+        self.vpn_subscription_input.setText(
+            str(payload.get("goshkow_vpn_subscription_url", self.vpn_subscription_input.text()))
+        )
+        self.vpn_tun_checkbox.setChecked(
+            bool(payload.get("goshkow_vpn_tun_enabled", self.vpn_tun_checkbox.isChecked()))
+        )
+        self._select_combo_value(
+            self.vpn_routing_combo,
+            str(payload.get("goshkow_vpn_routing_mode", self.vpn_routing_combo.currentData() or "global")),
+        )
+        self._select_combo_value(
+            self.vpn_proxy_combo,
+            str(payload.get("goshkow_vpn_system_proxy_mode", self.vpn_proxy_combo.currentData() or "pac")),
+        )
+        self.vpn_processes_input.setText(
+            str(payload.get("goshkow_vpn_processes", self.vpn_processes_input.text()))
+        )
 
     def payload(self) -> dict[str, object]:
         try:
@@ -1704,7 +3091,7 @@ class SettingsDialog(AppDialog):
         return {
             "theme": self.theme_combo.currentData() or "night",
             "active_profile_id": self.context.settings.get().active_profile_id,
-            "language": self.language_combo.currentText(),
+            "language": self.language_combo.currentData() or self.context.settings.get().language,
             "mods_index_url": self.context.settings.get().mods_index_url,
             "tg_proxy_host": self.tg_host_input.text().strip() or "127.0.0.1",
             "tg_proxy_port": tg_port,
@@ -1718,11 +3105,28 @@ class SettingsDialog(AppDialog):
             "tg_proxy_pool_size": max(0, tg_pool_size),
             "zapret_ipset_mode": self.ipset_mode_combo.currentData() or "loaded",
             "zapret_game_filter_mode": self.game_mode_combo.currentData() or "disabled",
+            "zapret_udp_exclude_ports": self.zapret_udp_exclude_input.text().strip(),
             "autostart_windows": self.autostart_checkbox.isChecked(),
             "start_in_tray": self.tray_checkbox.isChecked(),
             "auto_run_components": self.auto_components_checkbox.isChecked(),
             "check_updates_on_start": self.check_updates_checkbox.isChecked(),
+            "goshkow_vpn_subscription_url": self.vpn_subscription_input.text().strip(),
+            "goshkow_vpn_tun_enabled": self.vpn_tun_checkbox.isChecked(),
+            "goshkow_vpn_routing_mode": self.vpn_routing_combo.currentData() or "global",
+            "goshkow_vpn_system_proxy_mode": self.vpn_proxy_combo.currentData() or "pac",
+            "goshkow_vpn_processes": self.vpn_processes_input.text().strip(),
         }
+
+    def _select_combo_value(self, combo: QComboBox, value: str) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _refresh_vpn_subscription(self) -> None:
+        parent = self.parent()
+        if parent is None or not hasattr(parent, "_refresh_goshkow_vpn_subscription_from_settings"):
+            return
+        getattr(parent, "_refresh_goshkow_vpn_subscription_from_settings")(self.vpn_subscription_input.text().strip())
 
     def _sync_tg_media_mode_from_dc_ip(self, value: str) -> None:
         normalized = "\n".join(line.strip() for line in str(value or "").splitlines() if line.strip())
@@ -1757,6 +3161,13 @@ class MainWindow(QMainWindow):
         startup_snapshot: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
+        base_font = QFont(_load_ui_font_family(context.paths.ui_assets_dir), 10)
+        base_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality)
+        base_font.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
+        app = QApplication.instance()
+        if app is not None:
+            app.setFont(base_font)
+        self.setFont(base_font)
         self.context = context
         self._launch_hidden = launch_hidden
         self._startup_show_onboarding = startup_show_onboarding
@@ -1766,10 +3177,13 @@ class MainWindow(QMainWindow):
         self._force_exit = False
         self._shutdown_started = False
         self._nav_buttons: list[QToolButton] = []
+        self._github_sidebar_btn: GitHubSidebarButton | None = None
         self._status_badges: dict[str, StatusBadge] = {}
         self._min_btn: QToolButton | None = None
         self._close_btn: QToolButton | None = None
         self._toggle_in_progress = False
+        self._vpn_mode_switch_in_progress = False
+        self._vpn_switch_power_transition = False
         self._loading_frame = 0
         self._loading_timer = QTimer(self)
         self._loading_timer.setInterval(220)
@@ -1790,6 +3204,8 @@ class MainWindow(QMainWindow):
         self._components_cards_root: QWidget | None = None
         self._components_cards_layout: QGridLayout | None = None
         self._components_scroll: QScrollArea | None = None
+        self._components_card_by_id: dict[str, QFrame] = {}
+        self._components_scroll_target_component_id = ""
         self._component_loading_buttons: dict[str, QPushButton] = {}
         self._component_loading_base_text: dict[str, str] = {}
         self._component_loading_frame = 0
@@ -1799,6 +3215,7 @@ class MainWindow(QMainWindow):
         self._general_test_dialog: AppDialog | None = None
         self._general_test_status_label: QLabel | None = None
         self._general_test_eta_label: QLabel | None = None
+        self._general_test_counter_label: QLabel | None = None
         self._general_test_progress_bar: QProgressBar | None = None
         self._general_test_started_at = 0.0
         self._general_test_current_index = 0
@@ -1819,21 +3236,76 @@ class MainWindow(QMainWindow):
         self._general_test_eta_timer.setInterval(1000)
         self._general_test_eta_timer.timeout.connect(self._update_general_test_eta)
         self._general_test_task_id: str | None = None
+        self._general_test_original_general = ""
         self._first_general_prompt: AppDialog | None = None
         self._onboarding_active = False
         self._onboarding_running = False
         self._onboarding_widget: QWidget | None = None
+        self._onboarding_stage_host: QWidget | None = None
+        self._onboarding_stage_layout: QStackedLayout | None = None
+        self._onboarding_intro_panel: QWidget | None = None
+        self._onboarding_intro_title_label: QLabel | None = None
+        self._onboarding_intro_desc_label: QLabel | None = None
         self._onboarding_actions_widget: QWidget | None = None
+        self._onboarding_services_stage_panel: QWidget | None = None
         self._onboarding_title_label: QLabel | None = None
         self._onboarding_desc_label: QLabel | None = None
+        self._onboarding_running_stage_panel: QWidget | None = None
+        self._onboarding_running_title_label: QLabel | None = None
+        self._onboarding_running_desc_label: QLabel | None = None
+        self._onboarding_result_stage_panel: QWidget | None = None
+        self._onboarding_result_title_label: QLabel | None = None
+        self._onboarding_result_desc_label: QLabel | None = None
         self._onboarding_primary_btn: QPushButton | None = None
         self._onboarding_secondary_btn: QPushButton | None = None
+        self._onboarding_service_action_btn: OnboardingServiceProgressButton | None = None
+        self._onboarding_result_actions_widget: QWidget | None = None
+        self._onboarding_result_primary_btn: QPushButton | None = None
         self._onboarding_progress_label: QLabel | None = None
+        self._onboarding_progress_counter_label: QLabel | None = None
         self._onboarding_progress_bar: QProgressBar | None = None
         self._onboarding_result_card: QFrame | None = None
         self._onboarding_result_label: QLabel | None = None
         self._onboarding_found_label: QLabel | None = None
         self._onboarding_wrap_widget: QWidget | None = None
+        self._onboarding_intro_transition_overlay: QLabel | None = None
+        self._onboarding_entry_overlay: QLabel | None = None
+        self._quick_onboarding_entry_pixmap: QPixmap | None = None
+        self._quick_onboarding_entry_pixmap_size = QSize()
+        self._onboarding_stage = "intro"
+        self._onboarding_quick_restart = False
+        self._onboarding_back_btn: QToolButton | None = None
+        self._onboarding_services_panel: QWidget | None = None
+        self._onboarding_services_title_label: QLabel | None = None
+        self._onboarding_services_hint_label: QLabel | None = None
+        self._onboarding_services_count_label: QLabel | None = None
+        self._onboarding_services_grid: ServiceGridPanel | None = None
+        self._onboarding_services_scroll: QScrollArea | None = None
+        self._onboarding_services_fade: ScrollFadeOverlay | None = None
+        self._onboarding_services_minimum = 3
+        self._onboarding_transition_busy = False
+        self._onboarding_transition_token = 0
+        self._onboarding_manual_restart = False
+        self._onboarding_services_prewarm_scheduled = False
+        self._onboarding_services_prewarm_done = False
+        self._onboarding_services_surface_ready = False
+        self._onboarding_services_prewarm_queue: list[tuple[str, str, int, bool] | tuple[str, int]] = []
+        self._onboarding_quick_prewarm_done = False
+        self._onboarding_prewarming = False
+        self._onboarding_glow_orbit_timer = QTimer(self)
+        self._onboarding_glow_orbit_timer.setInterval(16)
+        self._onboarding_glow_orbit_timer.timeout.connect(self._advance_onboarding_glow_orbit)
+        self._onboarding_glow_orbit_points: list[tuple[float, float]] = [(0.84, 0.16), (0.16, 0.16), (0.16, 0.86), (0.84, 0.86)]
+        self._onboarding_glow_orbit_index = 0
+        self._onboarding_glow_orbit_phase = -0.88
+        self._services_sync_timer = QTimer(self)
+        self._services_sync_timer.setSingleShot(True)
+        self._services_sync_timer.timeout.connect(self._flush_selected_services_backend_sync)
+        self._pending_selected_service_ids: list[str] | None = None
+        self._pending_selected_services_revision = 0
+        self._optimistic_selected_service_ids: list[str] | None = None
+        self._services_selection_revision = 0
+        self._services_selection_acked_revision = 0
         self._sidebar_widget: QWidget | None = None
         self._settings_diag_dialog: AppDialog | None = None
         self._settings_diag_status_label: QLabel | None = None
@@ -1841,15 +3313,30 @@ class MainWindow(QMainWindow):
         self._settings_diag_task_id: str | None = None
         self._settings_diag_cancelled = False
         self._loading_action = "connect"
+        self._notifications_btn: NotificationBellButton | None = None
+        self._notifications_popup: QWidget | None = None
+        self._notifications_popup_last_closed_at = 0.0
+        self._notified_component_errors: set[tuple[str, str]] = set()
+        self._windows_taskbar = WindowsTaskbarIntegration()
+        self._taskbar_progress_active = False
+        self._taskbar_important_attention = False
         self._tools_btn: QToolButton | None = None
         self._settings_btn: QToolButton | None = None
         self._dashboard_title_label: QLabel | None = None
+        self._services_title_label: QLabel | None = None
+        self._services_subtitle_label: QLabel | None = None
+        self._services_hint_label: QLabel | None = None
+        self._services_count_label: QLabel | None = None
+        self._services_grid: ServiceGridPanel | None = None
+        self._services_scroll: QScrollArea | None = None
         self._components_title_label: QLabel | None = None
         self._mods_title_label: QLabel | None = None
         self._mods_subtitle_label: QLabel | None = None
         self._mods_add_btn: QPushButton | None = None
         self.power_aura: PowerAuraWidget | None = None
         self.power_caption_text: QLabel | None = None
+        self.power_vpn_btn: QToolButton | None = None
+        self.power_reconfigure_btn: QToolButton | None = None
         self.power_caption_dots: QLabel | None = None
         self._power_caption_dots_opacity: QGraphicsOpacityEffect | None = None
         self._power_caption_dots_blur: QGraphicsBlurEffect | None = None
@@ -1862,6 +3349,7 @@ class MainWindow(QMainWindow):
         self._logs_loading_label: QLabel | None = None
         self._current_log_source = "all"
         self._pending_logs_payload: dict[str, object] | None = None
+        self._logs_force_scroll_bottom = True
         self._logs_live_timer = QTimer(self)
         self._logs_live_timer.setInterval(1000)
         self._logs_live_timer.timeout.connect(self._refresh_logs_live)
@@ -1897,7 +3385,7 @@ class MainWindow(QMainWindow):
         self._favorite_general_buttons: dict[str, QToolButton] = {}
         self._general_options_cache: list[dict[str, str]] | None = None
         self._general_options_refresh_in_progress = False
-        self._refresh_dirty_sections = {"dashboard", "components", "mods", "files", "logs", "tray"}
+        self._refresh_dirty_sections = {"dashboard", "services", "components", "mods", "files", "logs", "tray"}
         self._refresh_scheduled = False
         self._initial_refresh_pending = False
         self._merge_ensure_in_progress = False
@@ -1905,6 +3393,9 @@ class MainWindow(QMainWindow):
         self._page_payload_cache: dict[str, object] = {}
         self._settings_dialog: SettingsDialog | None = None
         self._settings_dialog_signature: tuple[str, str] | None = None
+        self._pending_settings_payload: dict[str, object] | None = None
+        self._settings_save_revision = 0
+        self._settings_save_acked_revision = 0
         self._loading_overlay_fade: QPropertyAnimation | None = None
         self._loading_overlay_context = ""
         self._current_file_values_cache: list[str] = []
@@ -1987,9 +3478,14 @@ class MainWindow(QMainWindow):
         self._active_emoji_popup: QWidget | None = None
 
         self._icons_dir = self.context.paths.ui_assets_dir / "icons"
+        self._service_icons_dir = self.context.paths.ui_assets_dir / "service_icons"
         self._icon_cache: dict[str, QIcon] = {}
+        self._service_icon_cache: dict[str, QPixmap] = {}
+        self._service_check_cache: dict[str, QPixmap] = {}
+        self._service_cards_by_id: dict[str, list[ServiceCardFrame]] = {}
         self._nav_items = [
             NavItem("home", "home.svg", self._t("Главная", "Dashboard")),
+            NavItem("services", "services.svg", self._t("Сервисы", "Services")),
             NavItem("components", "components.svg", self._t("Компоненты", "Components")),
             NavItem("mods", "mods.svg", self._t("Модификации", "Mods")),
             NavItem("files", "files.svg", self._t("Файлы", "Files")),
@@ -2008,9 +3504,18 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._attach_button_animations_recursive(self.centralWidget())
         self._setup_tray()
+        self._prepare_onboarding_services_stage()
+        QTimer.singleShot(0, self._prepare_onboarding_services_surface)
+        self._ensure_local_runtime_snapshot()
+        QTimer.singleShot(0, self.refresh_dashboard)
+        QTimer.singleShot(0, self._sync_power_aura_geometry)
+        QTimer.singleShot(0, self._prepare_onboarding_services_surface)
         if self._startup_show_onboarding:
             self._set_onboarding_visible(True)
         self._apply_theme()
+        if not self._launch_hidden and not self._startup_show_onboarding:
+            QTimer.singleShot(0, self._prewarm_quick_onboarding_surface)
+            QTimer.singleShot(650, self._cache_quick_onboarding_entry_snapshot)
         self._sync_window_icon()
         if self.context.backend is not None:
             self._connect_backend_signals(self.context.backend)
@@ -2032,11 +3537,14 @@ class MainWindow(QMainWindow):
         self.context.backend = backend
         self._backend_attached = True
         self._connect_backend_signals(backend)
+        self._ensure_local_runtime_snapshot()
+        self.refresh_dashboard()
+        self._sync_power_aura_geometry()
         if not self._startup_snapshot_ready:
             QTimer.singleShot(0, lambda: self._submit_backend_task("load_startup_snapshot", action_id="__startup_snapshot__"))
 
     def _themed_icon_color(self, filename: str) -> QColor | None:
-        if filename not in {"power.svg", "share.svg", "trash.svg", "search.svg", "refresh.svg", "external.svg"}:
+        if filename not in {"power.svg", "share.svg", "trash.svg", "search.svg", "refresh.svg", "external.svg", "vpn.svg", "vpn.png"}:
             return None
         theme = self.context.settings.get().theme
         if is_light_theme(theme):
@@ -2068,6 +3576,9 @@ class MainWindow(QMainWindow):
         self._icon_cache[cache_key] = icon
         return icon
 
+    def _vpn_icon_name(self) -> str:
+        return "vpn.png" if (self._icons_dir / "vpn.png").exists() else "vpn.svg"
+
     def _component_defs(self) -> dict[str, ComponentDefinition]:
         if self._component_defs_cache:
             return dict(self._component_defs_cache)
@@ -2081,6 +3592,7 @@ class MainWindow(QMainWindow):
             "components": payload.get("components", []),
             "states": payload.get("states", []),
             "general_options": payload.get("general_options", []),
+            "goshkow_vpn": payload.get("goshkow_vpn", {}),
         }
         if "index" in payload or "installed" in payload:
             self._page_payload_cache["mods"] = {
@@ -2092,14 +3604,123 @@ class MainWindow(QMainWindow):
     def _should_show_onboarding(self) -> bool:
         if self._launch_hidden:
             return False
-        if not self._onboarding_seen():
-            return bool(self._sorted_general_options())
-        settings = self.context.settings.get()
-        if settings.general_autotest_done:
+        return (not self._onboarding_seen()) and bool(self._sorted_general_options())
+
+    def _ensure_widget_opacity_ready(self, widget: QWidget | None) -> None:
+        if widget is None:
+            return
+        effect = getattr(widget, "_opacity_effect", None)
+        if not isinstance(effect, QGraphicsOpacityEffect):
+            effect = QGraphicsOpacityEffect(widget)
+            effect.setOpacity(1.0)
+            widget.setGraphicsEffect(effect)
+            widget._opacity_effect = effect  # type: ignore[attr-defined]
+
+    def _schedule_onboarding_services_prewarm(self) -> None:
+        if self._onboarding_services_prewarm_done or self._onboarding_services_prewarm_scheduled:
+            return
+        queue: list[tuple[str, str, int, bool] | tuple[str, int]] = []
+        for preset in SERVICE_PRESETS:
+            queue.append(("icon", preset.id, 34, False))
+            queue.append(("icon", preset.id, 34, True))
+        queue.append(("check", 10))
+        self._onboarding_services_prewarm_queue = queue
+        self._onboarding_services_prewarm_scheduled = True
+        QTimer.singleShot(0, self._run_onboarding_services_prewarm_batch)
+
+    def _prewarm_quick_onboarding_surface(self) -> None:
+        if self._onboarding_quick_prewarm_done or self._launch_hidden or self._startup_show_onboarding:
+            return
+        if self._onboarding_widget is None:
+            return
+        self._onboarding_quick_prewarm_done = True
+        previous_updates = self.updatesEnabled()
+        self._onboarding_prewarming = True
+        try:
+            self.setUpdatesEnabled(False)
+            self._onboarding_quick_restart = True
+            self._set_onboarding_visible(True)
+            self._jump_onboarding_to_services_stage(lightweight=True)
+            self._set_onboarding_visible(False)
+        finally:
+            self._onboarding_prewarming = False
+            self._onboarding_quick_restart = False
+            self.setUpdatesEnabled(previous_updates)
+
+    def _run_onboarding_services_prewarm_batch(self) -> None:
+        if not self._onboarding_services_prewarm_queue:
+            self._onboarding_services_prewarm_scheduled = False
+            self._onboarding_services_prewarm_done = True
+            return
+        batch_size = 2
+        processed = 0
+        preset_map = {preset.id: preset for preset in SERVICE_PRESETS}
+        while self._onboarding_services_prewarm_queue and processed < batch_size:
+            item = self._onboarding_services_prewarm_queue.pop(0)
+            kind = item[0]
+            if kind == "icon":
+                _, preset_id, size, selected = item
+                preset = preset_map.get(preset_id)
+                if preset is not None:
+                    self._service_icon_pixmap(preset, int(size), selected=bool(selected))
+            elif kind == "check":
+                _, size = item
+                self._service_check_pixmap(int(size))
+            processed += 1
+        QTimer.singleShot(8, self._run_onboarding_services_prewarm_batch)
+
+    def _prepare_onboarding_services_surface(self) -> bool:
+        """Готовит карточки сервисов до показа быстрого онбординга."""
+        if self._onboarding_services_grid is None or self._onboarding_services_panel is None:
             return False
-        return bool(self._sorted_general_options())
+        self._prepare_onboarding_services_stage()
+        self.refresh_services()
+        self._update_service_selection_summary()
+        for widget in (
+            self._onboarding_services_panel,
+            self._onboarding_services_scroll,
+            self._onboarding_services_grid,
+        ):
+            if widget is None:
+                continue
+            widget.ensurePolished()
+            layout = widget.layout()
+            if layout is not None:
+                try:
+                    layout.activate()
+                except Exception:
+                    pass
+            widget.updateGeometry()
+        self._relayout_onboarding_content()
+        self._onboarding_services_surface_ready = bool(getattr(self._onboarding_services_grid, "_cards", []))
+        return self._onboarding_services_surface_ready
+
+    def _prepare_onboarding_services_stage(self) -> None:
+        for widget in (
+            self._onboarding_intro_panel,
+            self._onboarding_services_stage_panel,
+            self._onboarding_running_stage_panel,
+            self._onboarding_result_stage_panel,
+        ):
+            self._ensure_widget_opacity_ready(widget)
+        if self._onboarding_services_panel is not None:
+            self._onboarding_services_panel.ensurePolished()
+        if self._onboarding_services_scroll is not None:
+            self._onboarding_services_scroll.ensurePolished()
+        if self._onboarding_services_grid is not None:
+            self._onboarding_services_grid.ensurePolished()
+        if self._onboarding_service_action_btn is not None:
+            self._onboarding_service_action_btn.set_theme(self.context.settings.get().theme)
+            self._onboarding_service_action_btn.set_selection_state(
+                len(self._selected_service_ids()),
+                self._onboarding_services_minimum,
+                text=self._t("Продолжить", "Continue"),
+            )
 
     def _onboarding_seen_marker_path(self) -> Path:
+        return self.context.paths.data_dir / ".services_onboarding_seen_v2"
+
+    def _legacy_onboarding_seen_marker_path(self) -> Path:
         return self.context.paths.data_dir / ".onboarding_seen"
 
     def _onboarding_seen(self) -> bool:
@@ -2108,16 +3729,180 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
+    def _legacy_onboarding_seen(self) -> bool:
+        try:
+            if self._legacy_onboarding_seen_marker_path().exists():
+                return True
+        except Exception:
+            pass
+        return False
+
     def _mark_onboarding_seen(self) -> None:
         try:
             self._onboarding_seen_marker_path().write_text("1\n", encoding="utf-8")
         except Exception:
             pass
+        self._onboarding_manual_restart = False
+
+    def _restart_onboarding_from_settings(self) -> None:
+        self._onboarding_manual_restart = True
+        self._set_onboarding_visible(True)
+        self._apply_onboarding_style()
+        self._relayout_onboarding_content()
+        QTimer.singleShot(0, lambda: self._sync_onboarding_back_button_visibility(force=True))
+
+    def _cache_quick_onboarding_entry_snapshot(self) -> None:
+        if self._launch_hidden or self._onboarding_active or self._onboarding_entry_overlay is not None:
+            return
+        if self.isMinimized() or not self.isVisible() or self.width() <= 0 or self.height() <= 0:
+            return
+        pixmap = self.grab()
+        if pixmap.isNull():
+            return
+        self._quick_onboarding_entry_pixmap = pixmap
+        self._quick_onboarding_entry_pixmap_size = QSize(self.size())
+
+    def _restart_onboarding_from_dashboard(self) -> None:
+        if (
+            self._onboarding_widget is None
+            or self._onboarding_transition_busy
+            or self._onboarding_entry_overlay is not None
+        ):
+            return
+        self._onboarding_manual_restart = True
+        self._onboarding_quick_restart = True
+        self._prepare_onboarding_services_surface()
+        overlay = QLabel(self)
+        overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        cached = self._quick_onboarding_entry_pixmap
+        if cached is not None and not cached.isNull() and self._quick_onboarding_entry_pixmap_size == self.size():
+            overlay.setPixmap(cached)
+        else:
+            overlay.setPixmap(self.grab())
+        overlay.setGeometry(self.rect())
+        overlay.show()
+        overlay.raise_()
+        self._onboarding_entry_overlay = overlay
+        QTimer.singleShot(0, lambda: self._prepare_quick_onboarding_entry(overlay))
+        QTimer.singleShot(0, lambda: self._sync_onboarding_back_button_visibility(force=True))
+
+    def _show_quick_onboarding_surface(self) -> None:
+        self._onboarding_active = True
+        self._onboarding_transition_busy = False
+        self._onboarding_transition_token += 1
+        self._clear_onboarding_intro_transition_overlay()
+        self._apply_onboarding_quick_chrome(self.context.settings.get().theme, True)
+        if self._onboarding_widget is not None:
+            self._onboarding_widget.setVisible(True)
+        if self._pages_shell is not None:
+            self._pages_shell.setVisible(False)
+        if self._page_transition_overlay is not None:
+            self._page_transition_overlay.hide()
+            self._page_transition_overlay.clear_transition()
+        self._page_transition_running = False
+        self._page_transition_started_at = 0.0
+        self._page_transition_target = self.pages.currentIndex() if hasattr(self, "pages") else -1
+        if self._content_surface_layout is not None:
+            self._content_surface_layout.setContentsMargins(0, 0, 0, 0)
+            self._content_surface_layout.setSpacing(0)
+        for widget in (self._sidebar_widget, self._tools_btn, self._notifications_btn, self._settings_btn):
+            if widget is not None:
+                widget.setVisible(False)
+        if self._onboarding_service_action_btn is not None:
+            self._position_onboarding_service_action()
+            self._onboarding_service_action_btn.raise_()
+        if self._onboarding_back_btn is not None:
+            self._onboarding_back_btn.move(18, 16)
+            self._onboarding_back_btn.raise_()
+
+    def _prepare_quick_onboarding_entry(self, overlay: QLabel) -> None:
+        if overlay is not self._onboarding_entry_overlay:
+            return
+        if not self._prepare_onboarding_services_surface():
+            QTimer.singleShot(16, lambda: self._prepare_quick_onboarding_entry(overlay))
+            return
+        self._show_quick_onboarding_surface()
+        if self._onboarding_stage == "services" and self._onboarding_services_stage_panel is not None:
+            self._onboarding_services_stage_panel.show()
+            self._finish_show_onboarding_services_stage()
+        else:
+            self._jump_onboarding_to_services_stage(lightweight=True)
+        self._prepare_onboarding_services_surface()
+        effect = QGraphicsOpacityEffect(overlay)
+        overlay.setGraphicsEffect(effect)
+        effect.setOpacity(1.0)
+        animation = QPropertyAnimation(effect, b"opacity", overlay)
+        animation.setDuration(280)
+        animation.setStartValue(1.0)
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        def _finish() -> None:
+            if overlay is self._onboarding_entry_overlay:
+                self._onboarding_entry_overlay = None
+            overlay.hide()
+            overlay.deleteLater()
+
+        animation.finished.connect(_finish)
+        overlay._onboarding_entry_animation = animation  # type: ignore[attr-defined]
+        animation.start()
+
+    def _cancel_quick_onboarding(self) -> None:
+        if not (self._onboarding_quick_restart or self._onboarding_manual_restart) or self._onboarding_running:
+            return
+        self._onboarding_quick_restart = False
+        self._onboarding_manual_restart = False
+        if self._onboarding_back_btn is not None:
+            self._onboarding_back_btn.hide()
+        self._fade_out_onboarding_to_app()
+
+    def _jump_onboarding_to_services_stage(self, *, lightweight: bool = False) -> None:
+        self._onboarding_transition_busy = False
+        self._onboarding_transition_token += 1
+        self._onboarding_stage = "services"
+        self._sync_onboarding_background_stage(animated=not lightweight)
+        self._prepare_onboarding_services_stage()
+        if self._onboarding_stage_layout is not None and self._onboarding_services_stage_panel is not None:
+            self._onboarding_stage_layout.setCurrentWidget(self._onboarding_services_stage_panel)
+        for panel in (
+            self._onboarding_intro_panel,
+            self._onboarding_running_stage_panel,
+            self._onboarding_result_stage_panel,
+        ):
+            if panel is not None:
+                panel.hide()
+        if self._onboarding_services_stage_panel is not None:
+            self._reset_widget_opacity(self._onboarding_services_stage_panel)
+            self._onboarding_services_stage_panel.show()
+        if self._onboarding_back_btn is not None:
+            show_back = self._onboarding_quick_restart or self._onboarding_manual_restart
+            self._onboarding_back_btn.setVisible(show_back)
+            if show_back:
+                self._onboarding_back_btn.raise_()
+        self._finish_show_onboarding_services_stage()
+        self._prepare_onboarding_services_surface()
+        if not lightweight:
+            self._apply_onboarding_style()
+            self._relayout_onboarding_content()
 
     def _component_states(self) -> dict[str, ComponentState]:
         if self._component_states_cache:
             return dict(self._component_states_cache)
         return {}
+
+    def _ensure_local_runtime_snapshot(self) -> None:
+        try:
+            if not self._component_defs_cache:
+                self._component_defs_cache = {item.id: item for item in self.context.processes.list_components()}
+        except Exception:
+            pass
+        try:
+            if not self._component_states_cache:
+                self._component_states_cache = {item.component_id: item for item in self.context.processes.list_states()}
+        except Exception:
+            pass
+        if self._component_defs_cache or self._component_states_cache:
+            self._startup_snapshot_ready = True
 
     def _prime_runtime_snapshot_cache(self) -> None:
         self._component_defs_cache = {}
@@ -2199,8 +3984,10 @@ class MainWindow(QMainWindow):
             self._sync_power_aura_geometry()
             self._sync_nav_highlight(animated=self._nav_highlight_initialized)
             if hasattr(self, "pages") and self.pages.currentIndex() == 1:
-                self._sync_component_card_layout()
+                self.refresh_services()
             elif hasattr(self, "pages") and self.pages.currentIndex() == 2:
+                self._sync_component_card_layout()
+            elif hasattr(self, "pages") and self.pages.currentIndex() == 3:
                 self._sync_mod_card_layout()
 
         QTimer.singleShot(0, _sync)
@@ -2216,7 +4003,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(250, _refresh_current)
                 return
             current_index = self.pages.currentIndex() if hasattr(self, "pages") else 0
-            section_map = {0: "dashboard", 1: "components", 2: "mods", 3: "files", 4: "logs"}
+            section_map = {0: "dashboard", 1: "services", 2: "components", 3: "mods", 4: "files", 5: "logs"}
             current = section_map.get(current_index, "dashboard")
             self._mark_dirty(current, "tray")
 
@@ -2224,7 +4011,7 @@ class MainWindow(QMainWindow):
             if not self._backend_attached:
                 QTimer.singleShot(300, _refresh_rest)
                 return
-            self._mark_dirty("dashboard", "components", "mods", "files", "logs", "tray")
+            self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
 
         QTimer.singleShot(900, _refresh_current)
         QTimer.singleShot(1800, _refresh_rest)
@@ -2305,10 +4092,12 @@ class MainWindow(QMainWindow):
         if index == 0:
             self._sync_power_aura_geometry()
         elif index == 1:
-            self._sync_component_card_layout()
+            self.refresh_services()
         elif index == 2:
-            self._sync_mod_card_layout()
+            self._sync_component_card_layout()
         elif index == 3:
+            self._sync_mod_card_layout()
+        elif index == 4:
             self._prepare_files_page_geometry()
 
     def _build_ui(self) -> None:
@@ -2318,7 +4107,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(0)
 
-        frame = QFrame()
+        frame = OnboardingFrame()
         frame.setObjectName("RootFrame")
         root_frame = QVBoxLayout(frame)
         root_frame.setContentsMargins(0, 0, 0, 0)
@@ -2376,12 +4165,15 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._reposition_loading_overlay()
         self._reposition_page_transition_overlay()
+        self._position_onboarding_service_action()
         self._apply_content_surface_mask()
         self._relayout_onboarding_content()
         self._sync_power_aura_geometry()
         if hasattr(self, "pages") and self.pages.currentIndex() == 1:
-            QTimer.singleShot(0, lambda: self._sync_component_card_layout())
+            QTimer.singleShot(0, self.refresh_services)
         elif hasattr(self, "pages") and self.pages.currentIndex() == 2:
+            QTimer.singleShot(0, lambda: self._sync_component_card_layout())
+        elif hasattr(self, "pages") and self.pages.currentIndex() == 3:
             QTimer.singleShot(0, self._sync_mod_card_layout)
         if self._file_mode_stack is not None:
             if self._file_mode_stack.currentIndex() == 0:
@@ -2390,19 +4182,63 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, self._sync_file_tag_canvas_geometry)
 
     def _relayout_onboarding_content(self) -> None:
-        if self._onboarding_wrap_widget is None:
+        if self._onboarding_widget is None:
             return
-        wrap_width = max(540, min(760, self._onboarding_wrap_widget.width() - 48))
+        page_width = max(1, self._onboarding_widget.width())
+        page_height = max(1, self._onboarding_widget.height())
+        content_width = max(620, min(930, page_width - 38))
+        if self._onboarding_intro_desc_label is not None:
+            intro_desc_width = max(420, min(720, content_width - 150))
+            self._onboarding_intro_desc_label.setFixedWidth(intro_desc_width)
+            intro_fm = self._onboarding_intro_desc_label.fontMetrics()
+            intro_rect = intro_fm.boundingRect(0, 0, intro_desc_width, 0, int(Qt.TextFlag.TextWordWrap), self._onboarding_intro_desc_label.text())
+            self._onboarding_intro_desc_label.setMinimumHeight(max(34, intro_rect.height() + 4))
         if self._onboarding_desc_label is not None:
-            self._onboarding_desc_label.setFixedWidth(wrap_width)
+            desc_width = max(420, min(720, content_width - 150))
+            self._onboarding_desc_label.setFixedWidth(desc_width)
             fm = self._onboarding_desc_label.fontMetrics()
-            rect = fm.boundingRect(0, 0, wrap_width, 0, int(Qt.TextFlag.TextWordWrap), self._onboarding_desc_label.text())
-            self._onboarding_desc_label.setMinimumHeight(max(70, rect.height() + 12))
+            rect = fm.boundingRect(0, 0, desc_width, 0, int(Qt.TextFlag.TextWordWrap), self._onboarding_desc_label.text())
+            self._onboarding_desc_label.setMinimumHeight(max(34, rect.height() + 4))
+        if self._onboarding_running_desc_label is not None:
+            running_desc_width = max(420, min(720, content_width - 150))
+            self._onboarding_running_desc_label.setFixedWidth(running_desc_width)
+            running_fm = self._onboarding_running_desc_label.fontMetrics()
+            running_rect = running_fm.boundingRect(0, 0, running_desc_width, 0, int(Qt.TextFlag.TextWordWrap), self._onboarding_running_desc_label.text())
+            self._onboarding_running_desc_label.setMinimumHeight(max(34, running_rect.height() + 4))
+        if self._onboarding_result_desc_label is not None:
+            result_desc_width = max(420, min(720, content_width - 150))
+            self._onboarding_result_desc_label.setFixedWidth(result_desc_width)
+            result_fm = self._onboarding_result_desc_label.fontMetrics()
+            result_rect = result_fm.boundingRect(0, 0, result_desc_width, 0, int(Qt.TextFlag.TextWordWrap), self._onboarding_result_desc_label.text())
+            self._onboarding_result_desc_label.setMinimumHeight(max(34, result_rect.height() + 4))
         if self._onboarding_result_card is not None:
-            self._onboarding_result_card.setFixedWidth(wrap_width)
+            self._onboarding_result_card.setFixedWidth(content_width)
+        if self._onboarding_result_actions_widget is not None:
+            self._onboarding_result_actions_widget.setFixedWidth(content_width)
         if self._onboarding_progress_bar is not None:
-            progress_width = max(360, min(560, wrap_width - 80))
+            progress_width = max(360, min(560, content_width - 80))
             self._onboarding_progress_bar.setFixedWidth(progress_width)
+        if self._onboarding_services_panel is not None:
+            scroll_height = max(268, min(356, page_height - 136))
+            self._onboarding_services_panel.setFixedSize(content_width, scroll_height)
+            if self._onboarding_services_scroll is not None:
+                self._onboarding_services_scroll.setFixedHeight(scroll_height)
+        if self._onboarding_back_btn is not None:
+            self._onboarding_back_btn.move(18, 16)
+            if self._onboarding_back_btn.isVisible():
+                self._onboarding_back_btn.raise_()
+        self._position_onboarding_service_action()
+
+    def _position_onboarding_service_action(self) -> None:
+        button = self._onboarding_service_action_btn
+        host = self._onboarding_services_stage_panel
+        if button is None or host is None:
+            return
+        x = max(0, int((host.width() - button.width()) / 2))
+        y = max(0, host.height() - button.height() - 18)
+        button.move(x, y)
+        if button.isVisible():
+            button.raise_()
 
     def _format_onboarding_general_line(self, text: str) -> str:
         if self._onboarding_found_label is None:
@@ -2477,8 +4313,19 @@ class MainWindow(QMainWindow):
 
         author = QLabel("by goshkow")
         author.setProperty("class", "muted")
+        author.setContentsMargins(0, 2, 0, 0)
         row.addWidget(author)
         row.addStretch(1)
+
+        notifications_btn = NotificationBellButton()
+        notifications_btn.setProperty("class", "action")
+        notifications_btn.setIcon(self._icon("bell.svg"))
+        notifications_btn.setIconSize(QSize(16, 16))
+        notifications_btn.setToolTip(self._t("Уведомления", "Notifications"))
+        notifications_btn.clicked.connect(self._toggle_notifications_popup)
+        self._notifications_btn = notifications_btn
+        row.addWidget(notifications_btn)
+        self._refresh_notifications_badge()
 
         tools_btn = QToolButton()
         tools_btn.setProperty("class", "action")
@@ -2521,6 +4368,312 @@ class MainWindow(QMainWindow):
         btn.setProperty("class", "window")
         btn.setProperty("role", role)
         return btn
+
+    def _window_hwnd(self) -> int:
+        try:
+            return int(self.winId())
+        except Exception:
+            return 0
+
+    def _set_windows_taskbar_progress(self, value: int, *, state: int | None = None) -> None:
+        hwnd = self._window_hwnd()
+        if not hwnd:
+            return
+        self._taskbar_progress_active = True
+        progress_state = WindowsTaskbarIntegration.TBPF_NORMAL if state is None else int(state)
+        value = max(0, min(100, int(value)))
+        self._windows_taskbar.set_progress_value(hwnd, value, 100)
+        self._windows_taskbar.set_progress_state(hwnd, progress_state)
+
+    def _clear_windows_taskbar_progress(self) -> None:
+        self._taskbar_progress_active = False
+        hwnd = self._window_hwnd()
+        if not hwnd:
+            return
+        if self._taskbar_important_attention:
+            self._windows_taskbar.set_progress_value(hwnd, 100, 100)
+            self._windows_taskbar.set_progress_state(hwnd, WindowsTaskbarIntegration.TBPF_PAUSED)
+        else:
+            self._windows_taskbar.set_progress_state(hwnd, WindowsTaskbarIntegration.TBPF_NOPROGRESS)
+
+    def _has_unread_important_notifications(self) -> bool:
+        try:
+            return any((not item.read) and str(item.level).lower() == "error" for item in self.context.notifications.list())
+        except Exception:
+            return False
+
+    def _refresh_windows_notification_attention(self) -> None:
+        important = self._has_unread_important_notifications()
+        self._taskbar_important_attention = important
+        hwnd = self._window_hwnd()
+        if not hwnd:
+            return
+        if important:
+            if not self._taskbar_progress_active:
+                self._windows_taskbar.set_progress_value(hwnd, 100, 100)
+                self._windows_taskbar.set_progress_state(hwnd, WindowsTaskbarIntegration.TBPF_PAUSED)
+            self._windows_taskbar.flash_attention(hwnd)
+        else:
+            self._windows_taskbar.clear_flash(hwnd)
+            if not self._taskbar_progress_active:
+                self._windows_taskbar.set_progress_state(hwnd, WindowsTaskbarIntegration.TBPF_NOPROGRESS)
+
+    def _request_windows_attention(self) -> None:
+        hwnd = self._window_hwnd()
+        if hwnd:
+            self._windows_taskbar.flash_attention(hwnd)
+
+    def _refresh_notifications_badge(self) -> None:
+        if self._notifications_btn is None:
+            return
+        try:
+            self._notifications_btn.set_unread(self.context.notifications.unread_count() > 0)
+        except Exception:
+            self._notifications_btn.set_unread(False)
+        self._refresh_windows_notification_attention()
+
+    def _add_notification(
+        self,
+        level: str,
+        title: str,
+        message: str,
+        *,
+        source: str = "app",
+        details: dict[str, object] | None = None,
+    ) -> None:
+        try:
+            self.context.notifications.add(level, title, message, source=source, details=details or {})
+        except Exception:
+            return
+        self._refresh_notifications_badge()
+        if str(level).lower() == "error":
+            self._request_windows_attention()
+
+    def _notify_component_errors_from_payload(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        raw_states = payload.get("states", [])
+        items = raw_states.values() if isinstance(raw_states, dict) else raw_states
+        if not isinstance(items, list) and not hasattr(items, "__iter__"):
+            return
+        for raw in items:
+            if isinstance(raw, ComponentState):
+                state = raw
+            elif isinstance(raw, dict):
+                try:
+                    state = ComponentState(**raw)
+                except Exception:
+                    continue
+            else:
+                continue
+            if state.status != "error" or not state.last_error:
+                continue
+            translated_error = self._translate_component_error(state.last_error)
+            signature = (state.component_id, state.last_error.strip())
+            if signature in self._notified_component_errors:
+                continue
+            self._notified_component_errors.add(signature)
+            self._add_notification(
+                "error",
+                self._t("Компонент не запустился", "Component failed to start"),
+                f"{self._component_display_name(state.component_id)}: {translated_error}",
+                source=state.component_id,
+                details={"dedupe_key": f"component-error:{state.component_id}:{state.last_error.strip()}"},
+            )
+
+    def _notify_telegram_proxy_status_from_payload(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        info = payload.get("telegram_proxy")
+        if not isinstance(info, dict) or not bool(info.get("missing")):
+            return
+        self._add_notification(
+            "warning",
+            self._t("Telegram Desktop не найден", "Telegram Desktop was not found"),
+            self._t(
+                "Telegram Desktop не найден на компьютере. Откройте раздел компонентов, скачайте Telegram Desktop и после установки нажмите «Подключить к Telegram».",
+                "Telegram Desktop was not found on this PC. Open Components, download Telegram Desktop, and after installation press 'Connect to Telegram'.",
+            ),
+            source="tg-ws-proxy",
+            details={"dedupe_key": "telegram-desktop-missing"},
+        )
+
+    def _notify_zapret_restart_from_payload(self, payload: object) -> None:
+        if not isinstance(payload, dict) or not bool(payload.get("zapret_restarted")):
+            return
+        self._add_notification(
+            "success",
+            self._t("Zapret перезапущен", "Zapret restarted"),
+            self._t(
+                "Zapret пересобран и запущен заново с вашими текущими настройками.",
+                "Zapret was rebuilt and started again with your current settings.",
+            ),
+            source="zapret",
+            details={"dedupe_key": "zapret-reconfigured-restarted"},
+        )
+
+    def _component_display_name(self, component_id: str) -> str:
+        return {"zapret": "Zapret", "tg-ws-proxy": "TG WS Proxy", "goshkow-vpn": "goshkow vpn"}.get(component_id, component_id)
+
+    def _translate_component_error(self, error: str) -> str:
+        text = str(error or "").strip()
+        lowered = text.lower()
+        if "windivert: error opening filter" in lowered and "parameter is incorrect" in lowered:
+            return self._t(
+                "WinDivert не смог открыть фильтр: один из параметров фильтра некорректен.",
+                "WinDivert could not open the filter: one of the filter parameters is invalid.",
+            )
+        if "winws did not start" in lowered:
+            return self._t(
+                "winws не запустился. Запустите приложение от имени администратора и проверьте исключения антивируса для WinDivert.",
+                "winws did not start. Run the app as Administrator and check antivirus exclusions for WinDivert.",
+            )
+        if "administrator rights are required" in lowered:
+            return self._t(
+                "Для winws/WinDivert нужны права администратора.",
+                "Administrator rights are required for winws/WinDivert.",
+            )
+        if "failed to parse winws command" in lowered:
+            return self._t(
+                "Не удалось разобрать команду winws из выбранной конфигурации.",
+                "Failed to parse the winws command from the selected configuration.",
+            )
+        if "no general script found" in lowered:
+            return self._t("Конфигурация Zapret не найдена.", "Zapret configuration was not found.")
+        return text
+
+    def _show_notifications_popup(self) -> None:
+        if self._notifications_btn is None:
+            return
+        if time.monotonic() - self._notifications_popup_last_closed_at < 0.18:
+            return
+        if self._notifications_popup is not None and self._notifications_popup.isVisible():
+            self._notifications_popup.close()
+            return
+
+        flags = Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint
+        popup = QWidget(self, flags)
+        popup.setObjectName("NotificationsWindow")
+        popup.setFixedSize(326, 248)
+        popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        popup.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        popup.setAutoFillBackground(False)
+        popup.setStyleSheet(self.styleSheet())
+
+        root_layout = QVBoxLayout(popup)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        panel = QFrame(popup)
+        panel.setObjectName("NotificationsPopup")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        root_layout.addWidget(panel)
+
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        title = QLabel(self._t("Уведомления", "Notifications"))
+        title.setProperty("class", "title")
+        layout.addWidget(title)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("NotificationsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        canvas = QWidget()
+        canvas.setObjectName("NotificationsCanvas")
+        canvas_layout = QVBoxLayout(canvas)
+        canvas_layout.setContentsMargins(0, 0, 0, 68)
+        canvas_layout.setSpacing(8)
+
+        entries = list(reversed(self.context.notifications.list()))
+        if not entries:
+            empty = QLabel(self._t("Пока всё тихо. Ошибок и важных событий нет.", "Quiet for now. No errors or important events."))
+            empty.setProperty("class", "muted")
+            empty.setWordWrap(True)
+            canvas_layout.addWidget(empty)
+        else:
+            for entry in entries:
+                canvas_layout.addWidget(self._build_notification_item(entry))
+        canvas_layout.addStretch(1)
+        scroll.setWidget(canvas)
+        theme = self.context.settings.get().theme
+        scroll.setStyleSheet(
+            "QScrollArea#NotificationsScroll, "
+            "QScrollArea#NotificationsScroll > QWidget#qt_scrollarea_viewport, "
+            "QWidget#NotificationsCanvas { background: transparent; border: none; }"
+        )
+        popup_fade = ScrollFadeOverlay(scroll)
+        popup_fade.set_surface_color(_dialog_surface_color(theme))
+        popup._scroll_fade_overlay = popup_fade  # type: ignore[attr-defined]
+        self._register_smooth_scroll(scroll)
+        layout.addWidget(scroll, 1)
+
+        self._notifications_popup = popup
+        popup.destroyed.connect(self._on_notifications_popup_destroyed)
+        pos = self._notifications_btn.mapToGlobal(QPoint(0, self._notifications_btn.height() + 8))
+        popup.move(pos.x() - popup.width() + self._notifications_btn.width(), pos.y())
+        popup.show()
+        _disable_native_window_rounding(popup)
+        try:
+            self.context.notifications.mark_all_read()
+        except Exception:
+            pass
+        self._refresh_notifications_badge()
+
+    def _toggle_notifications_popup(self) -> None:
+        if self._notifications_popup is not None and self._notifications_popup.isVisible():
+            self._notifications_popup.close()
+            return
+        self._show_notifications_popup()
+
+    def _on_notifications_popup_destroyed(self, *_args: object) -> None:
+        self._notifications_popup = None
+        self._notifications_popup_last_closed_at = time.monotonic()
+
+    def _build_notification_item(self, entry: NotificationEntry) -> QWidget:
+        card = QFrame()
+        card.setProperty("class", "notificationCard")
+        row = QHBoxLayout(card)
+        row.setContentsMargins(10, 9, 10, 9)
+        row.setSpacing(9)
+
+        dot = QLabel()
+        dot.setFixedSize(8, 8)
+        dot_color = {
+            "error": "#ef4444",
+            "warning": "#f59e0b",
+            "success": "#22c55e",
+            "info": "#60a5fa",
+        }.get(entry.level, "#60a5fa")
+        dot.setStyleSheet(f"background: {dot_color}; border-radius: 4px;")
+        row.addWidget(dot, 0, Qt.AlignmentFlag.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(4)
+        header = QLabel(entry.title)
+        header.setProperty("class", "title")
+        header.setWordWrap(True)
+        body = QLabel(entry.message or self._t("Без подробностей", "No details"))
+        body.setProperty("class", "muted")
+        body.setWordWrap(True)
+        meta = QLabel(self._format_notification_time(entry.created_at))
+        meta.setProperty("class", "muted")
+        text_col.addWidget(header)
+        text_col.addWidget(body)
+        text_col.addWidget(meta)
+        row.addLayout(text_col, 1)
+        return card
+
+    def _format_notification_time(self, value: str) -> str:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return dt.strftime("%d.%m %H:%M")
+        except Exception:
+            return str(value)[:16]
 
     def _build_tools_menu(self) -> QMenu:
         menu = QMenu(self)
@@ -2565,14 +4718,29 @@ class MainWindow(QMainWindow):
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
             btn.setIcon(self._icon(item.icon_file))
-            btn.setIconSize(QSize(26, 26))
+            icon_size = 26
+            if item.key in {"services", "mods"}:
+                icon_size = 28
+            elif item.key == "components":
+                icon_size = 24
+            btn.setIconSize(QSize(icon_size, icon_size))
             btn.setToolTip(item.tooltip)
             btn.clicked.connect(lambda _=False, index=idx: self._switch_page(index))
             self._attach_button_animations(btn)
             self._nav_buttons.append(btn)
-            col.addWidget(btn)
+            col.addWidget(btn, 0, Qt.AlignmentFlag.AlignHCenter)
 
         col.addStretch(1)
+        github_btn = GitHubSidebarButton()
+        github_btn.setIcon(self._icon("github.svg"))
+        github_btn.setIconSize(QSize(22, 22))
+        github_btn.set_button_theme(self.context.settings.get().theme)
+        github_btn.setToolTip(self._t("Открыть репозиторий", "Open repository"))
+        github_btn.setFixedSize(44, 44)
+        github_btn.setStyleSheet("QToolButton { background: transparent; border: none; }")
+        github_btn.clicked.connect(lambda: webbrowser.open("https://github.com/goshkow/Zapret-Hub/"))
+        self._github_sidebar_btn = github_btn
+        col.addWidget(github_btn, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
         if self._nav_buttons:
             self._nav_buttons[0].setChecked(True)
         QTimer.singleShot(0, lambda: self._sync_nav_highlight(animated=False))
@@ -2619,6 +4787,7 @@ class MainWindow(QMainWindow):
         self.pages.setAutoFillBackground(False)
         self.pages.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.pages.addWidget(self._build_dashboard_page())
+        self.pages.addWidget(self._build_services_page())
         self.pages.addWidget(self._build_components_page())
         self.pages.addWidget(self._build_mods_page())
         self.pages.addWidget(self._build_files_page())
@@ -2652,78 +4821,76 @@ class MainWindow(QMainWindow):
         page.setObjectName("OnboardingPage")
         page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         root = QVBoxLayout(page)
-        root.setContentsMargins(24, 24, 24, 24)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        back_btn = QToolButton(page)
+        back_btn.setObjectName("OnboardingBackButton")
+        back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        back_btn.setIcon(self._icon("arrow_left.svg"))
+        back_btn.setIconSize(QSize(17, 17))
+        back_btn.setFixedSize(32, 32)
+        back_btn.setToolTip(self._t("Назад", "Back"))
+        back_btn.clicked.connect(self._cancel_quick_onboarding)
+        back_btn.hide()
+        self._onboarding_back_btn = back_btn
+        self._sync_onboarding_back_button_style()
 
         wrap = QWidget()
         wrap.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        wrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._onboarding_wrap_widget = wrap
         wrap_layout = QVBoxLayout(wrap)
         wrap_layout.setContentsMargins(0, 0, 0, 0)
-        wrap_layout.setSpacing(16)
-        wrap_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        wrap_layout.setSpacing(0)
 
-        title = QLabel(self._t("Добро пожаловать", "Welcome"))
-        title.setProperty("class", "title")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._onboarding_title_label = title
-        wrap_layout.addWidget(title, 0, Qt.AlignmentFlag.AlignCenter)
+        stage_host = QWidget()
+        stage_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        stage_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._onboarding_stage_host = stage_host
+        stage_layout = QStackedLayout(stage_host)
+        stage_layout.setContentsMargins(0, 0, 0, 0)
+        stage_layout.setSpacing(0)
+        stage_layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
+        self._onboarding_stage_layout = stage_layout
+        wrap_layout.addWidget(stage_host, 1)
 
-        desc = QLabel(
+        intro_panel = QWidget(stage_host)
+        intro_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        intro_shell = QVBoxLayout(intro_panel)
+        intro_shell.setContentsMargins(0, 0, 0, 0)
+        intro_shell.setSpacing(0)
+        intro_shell.addStretch(1)
+        intro_center = QWidget(intro_panel)
+        intro_layout = QVBoxLayout(intro_center)
+        intro_layout.setContentsMargins(0, 0, 0, 0)
+        intro_layout.setSpacing(10)
+        intro_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        intro_shell.addWidget(intro_center, 0, Qt.AlignmentFlag.AlignHCenter)
+        intro_shell.addStretch(1)
+        self._onboarding_intro_panel = intro_panel
+        stage_layout.addWidget(intro_panel)
+
+        intro_title = QLabel(self._t("Добро пожаловать", "Welcome"))
+        intro_title.setProperty("class", "title")
+        intro_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._onboarding_intro_title_label = intro_title
+        intro_layout.addWidget(intro_title, 0, Qt.AlignmentFlag.AlignCenter)
+
+        intro_desc = QLabel(
             self._t(
                 "Добро пожаловать в Zapret Hub. Это приложение позволяет использовать Zapret и TG WS Proxy из единого интерфейса.\n\nХотите пройти первичную настройку и автоматически подобрать рабочую конфигурацию?",
                 "Welcome to Zapret Hub. This app lets you use Zapret and TG WS Proxy from one interface.\n\nWould you like to run initial setup and automatically find a working configuration?",
             )
         )
-        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        desc.setWordWrap(True)
-        desc.setMinimumWidth(520)
-        desc.setMaximumWidth(760)
-        desc.setMinimumHeight(0)
-        desc.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        self._onboarding_desc_label = desc
-        wrap_layout.addWidget(desc, 0, Qt.AlignmentFlag.AlignCenter)
-
-        result_card = QWidget()
-        result_card.setMinimumWidth(520)
-        result_card.setMaximumWidth(760)
-        result_layout = QVBoxLayout(result_card)
-        result_layout.setContentsMargins(0, 0, 0, 0)
-        result_layout.setSpacing(8)
-        result_body = QLabel(self._t("Найдена подходящая конфигурация.", "A suitable configuration has been found."))
-        result_body.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        result_body.setWordWrap(False)
-        result_body.setMinimumHeight(28)
-        result_general = QLabel("")
-        result_general.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        result_general.setWordWrap(False)
-        result_general.setMinimumHeight(28)
-        result_layout.addWidget(result_body)
-        result_layout.addWidget(result_general)
-        result_card.hide()
-        self._onboarding_result_card = result_card
-        self._onboarding_result_label = result_body
-        self._onboarding_found_label = result_general
-        wrap_layout.addWidget(result_card, 0, Qt.AlignmentFlag.AlignCenter)
-
-        progress_label = QLabel("")
-        progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        progress_label.setProperty("class", "muted")
-        progress_label.hide()
-        self._onboarding_progress_label = progress_label
-        wrap_layout.addWidget(progress_label, 0, Qt.AlignmentFlag.AlignCenter)
-
-        progress = RoundedProgressBar()
-        progress.setRange(0, 100)
-        progress.setValue(0)
-        progress.setMinimumWidth(360)
-        progress.setMaximumWidth(520)
-        progress.setMinimumHeight(12)
-        progress.setMaximumHeight(12)
-        progress.setTextVisible(False)
-        progress.hide()
-        self._onboarding_progress_bar = progress
-        wrap_layout.addWidget(progress, 0, Qt.AlignmentFlag.AlignCenter)
+        intro_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        intro_desc.setWordWrap(True)
+        intro_desc.setMinimumWidth(440)
+        intro_desc.setMaximumWidth(680)
+        intro_desc.setMinimumHeight(0)
+        intro_desc.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self._onboarding_intro_desc_label = intro_desc
+        intro_layout.addWidget(intro_desc, 0, Qt.AlignmentFlag.AlignCenter)
 
         actions = QWidget()
         actions_layout = QVBoxLayout(actions)
@@ -2733,7 +4900,7 @@ class MainWindow(QMainWindow):
         primary = QPushButton(self._t("Пройти первичную настройку", "Run initial setup"))
         primary.setMinimumWidth(320)
         primary.setMinimumHeight(44)
-        primary.clicked.connect(self._start_onboarding_flow)
+        primary.clicked.connect(self._handle_onboarding_primary_action)
         self._onboarding_primary_btn = primary
         actions_layout.addWidget(primary, 0, Qt.AlignmentFlag.AlignCenter)
 
@@ -2741,15 +4908,179 @@ class MainWindow(QMainWindow):
         secondary.setFlat(True)
         secondary.setCursor(Qt.CursorShape.PointingHandCursor)
         secondary.setStyleSheet("background: transparent; border: none; padding: 6px 10px; color: rgba(255,255,255,0.62);")
-        secondary.clicked.connect(self._skip_onboarding)
+        secondary.clicked.connect(self._handle_onboarding_secondary_action)
         self._onboarding_secondary_btn = secondary
         actions_layout.addWidget(secondary, 0, Qt.AlignmentFlag.AlignCenter)
+        secondary.hide()
         self._onboarding_actions_widget = actions
-        wrap_layout.addWidget(actions, 0, Qt.AlignmentFlag.AlignCenter)
+        intro_layout.addWidget(actions, 0, Qt.AlignmentFlag.AlignCenter)
 
-        root.addStretch(1)
-        root.addWidget(wrap, 0, Qt.AlignmentFlag.AlignCenter)
-        root.addStretch(1)
+        services_stage_panel = QWidget(stage_host)
+        services_stage_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        services_shell = QVBoxLayout(services_stage_panel)
+        services_shell.setContentsMargins(0, 0, 0, 0)
+        services_shell.setSpacing(0)
+        services_shell.addStretch(1)
+        services_center = QWidget(services_stage_panel)
+        services_layout = QVBoxLayout(services_center)
+        services_layout.setContentsMargins(0, 0, 0, 0)
+        services_layout.setSpacing(10)
+        services_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        services_shell.addWidget(services_center, 0, Qt.AlignmentFlag.AlignHCenter)
+        services_shell.addStretch(1)
+        services_stage_panel.hide()
+        self._onboarding_services_stage_panel = services_stage_panel
+        stage_layout.addWidget(services_stage_panel)
+
+        title = QLabel(self._t("Выберите сервисы", "Choose services"))
+        title.setProperty("class", "title")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._onboarding_title_label = title
+        services_layout.addWidget(title, 0, Qt.AlignmentFlag.AlignCenter)
+
+        desc = QLabel("")
+        desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        desc.setWordWrap(True)
+        desc.setMinimumWidth(440)
+        desc.setMaximumWidth(680)
+        desc.setMinimumHeight(0)
+        desc.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self._onboarding_desc_label = desc
+        services_layout.addWidget(desc, 0, Qt.AlignmentFlag.AlignCenter)
+
+        services_panel = self._build_onboarding_services_panel()
+        self._onboarding_services_panel = services_panel
+        services_layout.addWidget(services_panel, 0, Qt.AlignmentFlag.AlignCenter)
+
+        running_stage_panel = QWidget(stage_host)
+        running_stage_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        running_shell = QVBoxLayout(running_stage_panel)
+        running_shell.setContentsMargins(0, 0, 0, 0)
+        running_shell.setSpacing(0)
+        running_shell.addStretch(1)
+        running_center = QWidget(running_stage_panel)
+        running_layout = QVBoxLayout(running_center)
+        running_layout.setContentsMargins(0, 0, 0, 0)
+        running_layout.setSpacing(8)
+        running_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        running_shell.addWidget(running_center, 0, Qt.AlignmentFlag.AlignHCenter)
+        running_shell.addStretch(1)
+        running_stage_panel.hide()
+        self._onboarding_running_stage_panel = running_stage_panel
+        stage_layout.addWidget(running_stage_panel)
+
+        running_title = QLabel(self._t("Подбор конфигурации", "Selecting configuration"))
+        running_title.setProperty("class", "title")
+        running_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._onboarding_running_title_label = running_title
+        running_layout.addWidget(running_title, 0, Qt.AlignmentFlag.AlignCenter)
+
+        running_desc = QLabel("")
+        running_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        running_desc.setWordWrap(True)
+        running_desc.setMinimumWidth(440)
+        running_desc.setMaximumWidth(680)
+        running_desc.setMinimumHeight(0)
+        running_desc.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self._onboarding_running_desc_label = running_desc
+        running_layout.addWidget(running_desc, 0, Qt.AlignmentFlag.AlignCenter)
+
+        progress_label = QLabel("")
+        progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        progress_label.setProperty("class", "muted")
+        self._onboarding_progress_label = progress_label
+        running_layout.addWidget(progress_label, 0, Qt.AlignmentFlag.AlignCenter)
+
+        progress = RoundedProgressBar()
+        progress.setRange(0, 100)
+        progress.setValue(0)
+        progress.setMinimumWidth(360)
+        progress.setMaximumWidth(520)
+        progress.setMinimumHeight(12)
+        progress.setMaximumHeight(12)
+        progress.setTextVisible(False)
+        self._onboarding_progress_bar = progress
+        running_layout.addWidget(progress, 0, Qt.AlignmentFlag.AlignCenter)
+
+        progress_counter = QLabel("")
+        progress_counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        progress_counter.setProperty("class", "muted")
+        self._onboarding_progress_counter_label = progress_counter
+        running_layout.addWidget(progress_counter, 0, Qt.AlignmentFlag.AlignCenter)
+
+        result_stage_panel = QWidget(stage_host)
+        result_stage_panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        result_shell = QVBoxLayout(result_stage_panel)
+        result_shell.setContentsMargins(0, 0, 0, 0)
+        result_shell.setSpacing(0)
+        result_shell.addStretch(1)
+        result_center = QWidget(result_stage_panel)
+        result_layout = QVBoxLayout(result_center)
+        result_layout.setContentsMargins(0, 0, 0, 0)
+        result_layout.setSpacing(10)
+        result_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        result_shell.addWidget(result_center, 0, Qt.AlignmentFlag.AlignHCenter)
+        result_shell.addStretch(1)
+        result_stage_panel.hide()
+        self._onboarding_result_stage_panel = result_stage_panel
+        stage_layout.addWidget(result_stage_panel)
+
+        result_title = QLabel(self._t("Настройка завершена", "Setup complete"))
+        result_title.setProperty("class", "title")
+        result_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._onboarding_result_title_label = result_title
+        result_layout.addWidget(result_title, 0, Qt.AlignmentFlag.AlignCenter)
+
+        result_desc = QLabel("")
+        result_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        result_desc.setWordWrap(True)
+        result_desc.setMinimumWidth(440)
+        result_desc.setMaximumWidth(680)
+        result_desc.setMinimumHeight(0)
+        result_desc.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self._onboarding_result_desc_label = result_desc
+        result_layout.addWidget(result_desc, 0, Qt.AlignmentFlag.AlignCenter)
+
+        result_card = QWidget()
+        result_card.setMinimumWidth(520)
+        result_card.setMaximumWidth(838)
+        result_inner = QVBoxLayout(result_card)
+        result_inner.setContentsMargins(0, 0, 0, 0)
+        result_inner.setSpacing(8)
+        result_body = QLabel(self._t("Найдена подходящая конфигурация.", "A suitable configuration has been found."))
+        result_body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        result_body.setWordWrap(False)
+        result_body.setMinimumHeight(28)
+        result_general = QLabel("")
+        result_general.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        result_general.setWordWrap(False)
+        result_general.setMinimumHeight(28)
+        result_inner.addWidget(result_body)
+        result_inner.addWidget(result_general)
+        self._onboarding_result_card = result_card
+        self._onboarding_result_label = result_body
+        self._onboarding_found_label = result_general
+        result_layout.addWidget(result_card, 0, Qt.AlignmentFlag.AlignCenter)
+
+        result_actions = QWidget()
+        result_actions_layout = QVBoxLayout(result_actions)
+        result_actions_layout.setContentsMargins(0, 0, 0, 0)
+        result_actions_layout.setSpacing(12)
+        result_primary = QPushButton(self._t("Далее", "Next"))
+        result_primary.setMinimumWidth(320)
+        result_primary.setMinimumHeight(44)
+        result_primary.clicked.connect(self._handle_onboarding_primary_action)
+        result_actions_layout.addWidget(result_primary, 0, Qt.AlignmentFlag.AlignCenter)
+        self._onboarding_result_actions_widget = result_actions
+        self._onboarding_result_primary_btn = result_primary
+        result_layout.addWidget(result_actions, 0, Qt.AlignmentFlag.AlignCenter)
+
+        root.addWidget(wrap, 1)
+        service_action = OnboardingServiceProgressButton(services_stage_panel)
+        service_action.setText(self._t("Продолжить", "Continue"))
+        service_action.clicked.connect(self._handle_onboarding_primary_action)
+        service_action.hide()
+        self._onboarding_service_action_btn = service_action
         return page
 
     def _card(self) -> tuple[QFrame, QVBoxLayout]:
@@ -2812,6 +5143,7 @@ class MainWindow(QMainWindow):
         self.power_button.setIcon(self._icon("power.svg"))
         self.power_button.setIconSize(QSize(42, 42))
         self.power_button.setFixedSize(132, 132)
+        self.power_button.setEnabled(False)
         self.power_button.clicked.connect(self._toggle_master_runtime)
         self._attach_button_animations(self.power_button)
         self.power_button.set_power_theme(self.context.settings.get().theme)
@@ -2826,14 +5158,40 @@ class MainWindow(QMainWindow):
         self.power_caption.setFixedWidth(power_stage.width())
         caption_layout = QHBoxLayout(self.power_caption)
         caption_layout.setContentsMargins(0, 0, 0, 0)
-        caption_layout.setSpacing(0)
+        caption_layout.setSpacing(8)
+        self.power_vpn_btn = QToolButton(self.power_caption)
+        self.power_vpn_btn.setObjectName("PowerVpnButton")
+        self.power_vpn_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.power_vpn_btn.setIcon(self._icon(self._vpn_icon_name()))
+        self.power_vpn_btn.setIconSize(QSize(15, 15))
+        self.power_vpn_btn.setFixedSize(30, 30)
+        self.power_vpn_btn.setToolTip("goshkow vpn")
+        self.power_vpn_btn.clicked.connect(self._handle_power_vpn_button)
+        self._attach_button_animations(self.power_vpn_btn)
+        self.power_reconfigure_btn = QToolButton(self.power_caption)
+        self.power_reconfigure_btn.setObjectName("PowerReconfigureButton")
+        self.power_reconfigure_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.power_reconfigure_btn.setIcon(self._icon("rerun.svg"))
+        self.power_reconfigure_btn.setIconSize(QSize(15, 15))
+        self.power_reconfigure_btn.setFixedSize(30, 30)
+        self.power_reconfigure_btn.setToolTip(self._t("Подобрать настройки", "Find settings"))
+        self.power_reconfigure_btn.clicked.connect(self._restart_onboarding_from_dashboard)
+        self._attach_button_animations(self.power_reconfigure_btn)
+        self._sync_power_reconfigure_button_style()
         self.power_caption_text = QLabel("OFF")
         self.power_caption_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.power_caption_text.setProperty("class", "title")
+        self.power_caption_text.setObjectName("PowerStatusPill")
+        self.power_caption_text.setMinimumWidth(96)
+        self.power_caption_text.setFixedHeight(30)
         self.power_caption_dots = None
         self._power_caption_dots_blur = None
         self._power_caption_dots_opacity = None
-        caption_layout.addWidget(self.power_caption_text, 1, Qt.AlignmentFlag.AlignCenter)
+        caption_layout.addStretch(1)
+        caption_layout.addWidget(self.power_vpn_btn, 0, Qt.AlignmentFlag.AlignCenter)
+        caption_layout.addWidget(self.power_caption_text, 0, Qt.AlignmentFlag.AlignCenter)
+        caption_layout.addWidget(self.power_reconfigure_btn, 0, Qt.AlignmentFlag.AlignCenter)
+        caption_layout.addStretch(1)
         power_block_layout.addWidget(power_stage, 0, Qt.AlignmentFlag.AlignHCenter)
         power_block_layout.addWidget(self.power_caption, 0, Qt.AlignmentFlag.AlignHCenter)
         self._power_aura_host = top
@@ -2887,6 +5245,353 @@ class MainWindow(QMainWindow):
         self._status_badges[key] = StatusBadge(key, icon_name, title, text_label, icon_label, value)
         return card
 
+    def _build_services_page(self) -> QWidget:
+        page = QWidget()
+        page.setProperty("class", "pageRoot")
+        root = QVBoxLayout(page)
+        root.setContentsMargins(1, 0, 1, 0)
+        root.setSpacing(12)
+
+        hero, hero_layout = self._card()
+        hero_layout.setContentsMargins(16, 16, 16, 16)
+        hero_layout.setSpacing(10)
+
+        title = QLabel(self._t("Выберите сервисы", "Choose services"))
+        title.setProperty("class", "title")
+        self._services_title_label = title
+        hero_layout.addWidget(title)
+
+        subtitle = QLabel(
+            self._t(
+                "Выберите приложения, сайты и сервисы, которыми вы пользуетесь.",
+                "Choose the apps, sites, and services you actually use.",
+            )
+        )
+        subtitle.setProperty("class", "muted")
+        subtitle.setWordWrap(True)
+        self._services_subtitle_label = subtitle
+        hero_layout.addWidget(subtitle)
+
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 2, 0, 0)
+        meta_row.setSpacing(10)
+        count_label = QLabel()
+        count_label.setObjectName("ServicesCountChip")
+        count_label.setProperty("class", "modMeta")
+        self._services_count_label = count_label
+        meta_row.addWidget(count_label, 0, Qt.AlignmentFlag.AlignLeft)
+
+        hint = QLabel(
+            self._t(
+                "Приложение автоматически настраивает свою работу для обеспечения доступа к выбранным сервисам.",
+                "The app automatically adjusts its behavior to provide access to the selected services.",
+            )
+        )
+        hint.setProperty("class", "muted")
+        hint.setWordWrap(True)
+        self._services_hint_label = hint
+        meta_row.addWidget(hint, 1)
+        hero_layout.addLayout(meta_row)
+        root.addWidget(hero)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("ServicesScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        canvas = QWidget()
+        canvas.setObjectName("ServicesCanvas")
+        canvas.setProperty("class", "pageCanvas")
+        canvas_layout = QVBoxLayout(canvas)
+        canvas_layout.setContentsMargins(1, 0, 1, 14)
+        canvas_layout.setSpacing(0)
+        grid = ServiceGridPanel(base_columns=4, min_card_width=166, offset_pattern=(0,), horizontal_spacing=12, vertical_spacing=12)
+        grid.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        grid.set_cards(self._create_service_cards(scope="main"))
+        self._services_grid = grid
+        canvas_layout.addWidget(grid)
+        scroll.setWidget(canvas)
+        self._register_scroll_fade(scroll, surface_color=_content_surface_color(self.context.settings.get().theme))
+        self._register_smooth_scroll(scroll, duration=250, angle_divisor=3.0)
+        self._services_scroll = scroll
+        root.addWidget(scroll, 1)
+        return page
+
+    def _build_onboarding_services_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        panel.hide()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        count = QLabel("")
+        count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        count.setProperty("class", "muted")
+        count.hide()
+        self._onboarding_services_count_label = count
+
+        scroll = QScrollArea()
+        scroll.setObjectName("OnboardingServicesScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        scroll.setMinimumHeight(294)
+        scroll.setMaximumHeight(364)
+        canvas = QWidget()
+        canvas.setObjectName("OnboardingServicesCanvas")
+        canvas.setProperty("class", "pageCanvas")
+        canvas_layout = QVBoxLayout(canvas)
+        canvas_layout.setContentsMargins(0, 16, 0, 84)
+        canvas_layout.setSpacing(0)
+        grid = ServiceGridPanel(base_columns=5, min_card_width=150, offset_pattern=(10, 0, 10, 0, 10), horizontal_spacing=8, vertical_spacing=8)
+        grid.set_cards(self._create_service_cards(scope="onboarding"))
+        self._onboarding_services_grid = grid
+        canvas_layout.addWidget(grid)
+        scroll.setWidget(canvas)
+        fade = self._register_scroll_fade(scroll, surface_color=_chrome_surface_color(self.context.settings.get().theme))
+        fade.set_fade_height(58)
+        fade.set_edges(top=True, bottom=True)
+        self._onboarding_services_fade = fade
+        self._register_smooth_scroll(scroll, duration=260, angle_divisor=3.2)
+        self._onboarding_services_scroll = scroll
+        layout.addWidget(scroll, 1)
+        return panel
+
+    def _create_service_cards(self, *, scope: str) -> list[ServiceCardFrame]:
+        cards: list[ServiceCardFrame] = []
+        theme = self.context.settings.get().theme
+        selected = set(self._selected_service_ids())
+        for preset in SERVICE_PRESETS:
+            card = ServiceCardFrame(preset)
+            card.set_visual_scope(scope)
+            title, description = self._service_card_texts(preset)
+            is_selected = preset.id in selected
+            card.set_texts(title, description)
+            card.set_icon_pixmap(self._service_icon_pixmap(preset, 34, selected=is_selected))
+            card.set_check_pixmap(self._service_check_pixmap(10))
+            card.set_theme(theme)
+            card.set_selected(is_selected)
+            card.setProperty("serviceScope", scope)
+            card.toggled.connect(self._on_service_card_toggled)
+            cards.append(card)
+            self._service_cards_by_id.setdefault(preset.id, []).append(card)
+        return cards
+
+    def _service_card_texts(self, preset: ServicePreset) -> tuple[str, str]:
+        return self._t(preset.title_ru, preset.title_en), self._t(preset.description_ru, preset.description_en)
+
+    def _service_title_by_id(self, service_id: str) -> str:
+        preset = next((item for item in SERVICE_PRESETS if item.id == service_id), None)
+        if preset is None:
+            return service_id
+        return self._t(preset.title_ru, preset.title_en)
+
+    def _service_ids_from_failed_targets(self, failed_targets: list[object]) -> list[str]:
+        selected = self._selected_service_ids()
+        if not selected or not failed_targets:
+            return []
+        aliases = {
+            "telegram-desktop": ("telegram",),
+            "cloudflare": ("cloudflare", "1.1.1.1"),
+            "discord": ("discord",),
+            "youtube": ("youtube", "youtu", "googlevideo"),
+            "roblox": ("roblox", "rbx"),
+            "clouds": ("clouds", "cloudfront", "amazon", "aws", "bunny", "ovh", "fastly", "akamai"),
+            "tiktok": ("tiktok",),
+            "instagram": ("instagram",),
+            "epic-games": ("epic",),
+            "battle-net": ("battle", "blizzard"),
+            "fortnite": ("fortnite", "epic", "unreal", "launcher", "hcaptcha"),
+            "spotify": ("spotify",),
+            "reddit": ("reddit",),
+            "x-twitter": ("x ", "x/", "twitter"),
+            "github": ("github",),
+            "riot-games": ("riot",),
+            "league-of-legends": ("league", "lol"),
+            "figma": ("figma",),
+            "netflix": ("netflix",),
+            "facebook": ("facebook",),
+        }
+        failed_text = "\n".join(str(item).lower() for item in failed_targets)
+        result: list[str] = []
+        for service_id in selected:
+            if service_id == "telegram-desktop":
+                continue
+            tokens = aliases.get(service_id, (service_id.replace("-", " "),))
+            if any(token in failed_text for token in tokens):
+                result.append(service_id)
+        return result
+
+    def _service_icon_pixmap(self, preset: ServicePreset, size: int, *, selected: bool) -> QPixmap:
+        theme = self.context.settings.get().theme
+        tint = QColor(preset.accent) if selected else (QColor("#6f7a8c") if not is_light_theme(theme) else QColor("#7b8798"))
+        dpr = self._service_icon_device_ratio()
+        cache_key = f"{preset.icon_file}|{size}|{dpr:.2f}|{tint.name(QColor.NameFormat.HexArgb)}"
+        cached = self._service_icon_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            return cached
+        icon_path = self._service_icons_dir / preset.icon_file
+        pixmap = QPixmap()
+        physical_px = max(64, int(round(size * dpr)))
+        if icon_path.exists():
+            if icon_path.suffix.lower() == ".svg":
+                renderer = QSvgRenderer(str(icon_path))
+                if renderer.isValid():
+                    image = QImage(physical_px, physical_px, QImage.Format.Format_ARGB32_Premultiplied)
+                    image.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(image)
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                    renderer.render(painter, QRectF(0, 0, physical_px, physical_px))
+                    painter.end()
+                    image = self._trim_transparent_bounds(image, padding=max(2, physical_px // 10))
+                    pixmap = QPixmap.fromImage(image)
+                    pixmap.setDevicePixelRatio(dpr)
+            if pixmap.isNull():
+                image = QImage(str(icon_path))
+                if not image.isNull():
+                    image = self._trim_transparent_bounds(image, padding=max(2, physical_px // 10))
+                    scaled = image.scaled(
+                        physical_px,
+                        physical_px,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    pixmap = QPixmap.fromImage(scaled)
+                    pixmap.setDevicePixelRatio(dpr)
+                else:
+                    pixmap = QIcon(str(icon_path)).pixmap(QSize(physical_px, physical_px))
+                    if not pixmap.isNull() and pixmap.devicePixelRatio() < dpr:
+                        pixmap.setDevicePixelRatio(dpr)
+        if pixmap.isNull():
+            pixmap = self._fallback_service_icon_pixmap(preset, size)
+        if not pixmap.isNull():
+            source = QPixmap(physical_px, physical_px)
+            source.fill(Qt.GlobalColor.transparent)
+            source.setDevicePixelRatio(dpr)
+            source_painter = QPainter(source)
+            source_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            source_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            if hasattr(QPainter.RenderHint, "LosslessImageRendering"):
+                source_painter.setRenderHint(QPainter.RenderHint.LosslessImageRendering, True)
+            source_size = pixmap.deviceIndependentSize() if hasattr(pixmap, "deviceIndependentSize") else QSizeF(
+                float(pixmap.width()) / max(1.0, float(pixmap.devicePixelRatio())),
+                float(pixmap.height()) / max(1.0, float(pixmap.devicePixelRatio())),
+            )
+            target_width = float(source_size.width())
+            target_height = float(source_size.height())
+            max_box = float(size) * 0.84
+            if target_width > 0.0 and target_height > 0.0:
+                scale = min(max_box / target_width, max_box / target_height, 1.0)
+                target_width *= scale
+                target_height *= scale
+            source_painter.drawPixmap(
+                QRectF((size - target_width) / 2.0, (size - target_height) / 2.0, target_width, target_height),
+                pixmap,
+                QRectF(0, 0, pixmap.width(), pixmap.height()),
+            )
+            source_painter.end()
+            tinted = QPixmap(source.size())
+            tinted.fill(Qt.GlobalColor.transparent)
+            tinted.setDevicePixelRatio(dpr)
+            painter = QPainter(tinted)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            if hasattr(QPainter.RenderHint, "LosslessImageRendering"):
+                painter.setRenderHint(QPainter.RenderHint.LosslessImageRendering, True)
+            painter.drawPixmap(0, 0, source)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            painter.fillRect(tinted.rect(), tint)
+            painter.end()
+            pixmap = tinted
+        self._service_icon_cache[cache_key] = pixmap
+        return pixmap
+
+    def _service_check_pixmap(self, size: int) -> QPixmap:
+        theme = self.context.settings.get().theme
+        dpr = self._service_icon_device_ratio()
+        cache_key = f"{size}|{theme}|{dpr:.2f}"
+        cached = self._service_check_cache.get(cache_key)
+        if cached is not None and not cached.isNull():
+            return cached
+        icon_path = self._icons_dir / "service_check.svg"
+        pixmap = QPixmap()
+        if icon_path.exists():
+            renderer = QSvgRenderer(str(icon_path))
+            if renderer.isValid():
+                physical_px = max(48, int(round(size * dpr)))
+                image = QImage(physical_px, physical_px, QImage.Format.Format_ARGB32_Premultiplied)
+                image.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(image)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                if hasattr(QPainter.RenderHint, "LosslessImageRendering"):
+                    painter.setRenderHint(QPainter.RenderHint.LosslessImageRendering, True)
+                renderer.render(painter, QRectF(0, 0, physical_px, physical_px))
+                painter.end()
+                image = self._trim_transparent_bounds(image, padding=max(2, physical_px // 7))
+                pixmap = QPixmap.fromImage(image)
+                pixmap.setDevicePixelRatio(dpr)
+        self._service_check_cache[cache_key] = pixmap
+        return pixmap
+
+    def _service_icon_device_ratio(self) -> float:
+        screen = self.windowHandle().screen() if self.windowHandle() is not None else QApplication.primaryScreen()
+        if screen is None:
+            return 2.0
+        return max(2.0, min(4.0, float(screen.devicePixelRatio())))
+
+    def _trim_transparent_bounds(self, image: QImage, *, padding: int = 0) -> QImage:
+        if image.isNull():
+            return image
+        candidate = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+        width = candidate.width()
+        height = candidate.height()
+        left = width
+        top = height
+        right = -1
+        bottom = -1
+        for y in range(height):
+            for x in range(width):
+                if candidate.pixelColor(x, y).alpha() <= 6:
+                    continue
+                if x < left:
+                    left = x
+                if y < top:
+                    top = y
+                if x > right:
+                    right = x
+                if y > bottom:
+                    bottom = y
+        if right < left or bottom < top:
+            return candidate
+        pad = max(0, int(padding))
+        left = max(0, left - pad)
+        top = max(0, top - pad)
+        right = min(width - 1, right + pad)
+        bottom = min(height - 1, bottom + pad)
+        return candidate.copy(left, top, right - left + 1, bottom - top + 1)
+
+    def _fallback_service_icon_pixmap(self, preset: ServicePreset, size: int) -> QPixmap:
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(preset.accent))
+        painter.drawRoundedRect(QRectF(0, 0, size, size), max(6.0, size * 0.28), max(6.0, size * 0.28))
+        painter.setPen(QColor("#ffffff"))
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSizeF(max(8.0, size * 0.34))
+        painter.setFont(font)
+        painter.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, (preset.title_en or preset.title_ru or "?")[0].upper())
+        painter.end()
+        return pixmap
+
     def _build_components_page(self) -> QWidget:
         page = QWidget()
         page.setProperty("class", "pageRoot")
@@ -2936,6 +5641,7 @@ class MainWindow(QMainWindow):
 
         hero, hero_layout = self._card()
         hero.setProperty("class", "modHero")
+        hero_layout.setContentsMargins(14, 14, 14, 14)
 
         hero_top = QHBoxLayout()
         hero_top.setContentsMargins(0, 0, 0, 0)
@@ -2968,6 +5674,12 @@ class MainWindow(QMainWindow):
         import_btn.clicked.connect(self._import_mod_any)
         self._attach_button_animations(import_btn)
         self._mods_add_btn = import_btn
+        create_btn = QPushButton(self._t("Создать", "Create"))
+        create_btn.setProperty("class", "primary")
+        create_btn.setMinimumHeight(38)
+        create_btn.clicked.connect(self._create_mod_dialog)
+        self._attach_button_animations(create_btn)
+        hero_top.addWidget(create_btn)
         hero_top.addWidget(import_btn)
         hero_layout.addLayout(hero_top)
 
@@ -3383,13 +6095,7 @@ class MainWindow(QMainWindow):
         self._rebuild_logs_source_combo()
         top.addWidget(source_combo)
         top.addStretch(1)
-        refresh_btn = QPushButton(self._t("Обновить", "Refresh"))
-        refresh_btn.setMinimumHeight(36)
-        refresh_btn.setMinimumWidth(112)
-        refresh_btn.clicked.connect(self.refresh_logs)
-        self._attach_button_animations(refresh_btn)
-        self._logs_refresh_btn = refresh_btn
-        top.addWidget(refresh_btn)
+        self._logs_refresh_btn = None
         root.addLayout(top)
         self.logs_text = QTextEdit()
         self.logs_text.setReadOnly(True)
@@ -3471,6 +6177,8 @@ class MainWindow(QMainWindow):
         if self._window_fade_pending_action is not None:
             event.ignore()
             return
+        if self._general_test_running:
+            self._cancel_general_tests()
         if not self._force_exit:
             if self._should_minimize_to_tray():
                 event.ignore()
@@ -3542,7 +6250,7 @@ class MainWindow(QMainWindow):
         if self._window_opacity_animation is not None:
             self._window_opacity_animation.stop()
         self._window_fade_pending_action = None
-        self._skip_next_show_fade = False
+        self._skip_next_show_fade = True
         self._skip_next_show_focus = False
         self.setWindowOpacity(1.0)
         if self.isMinimized():
@@ -3558,14 +6266,14 @@ class MainWindow(QMainWindow):
             return
         self._toggle_master_runtime()
 
-    def start_enabled_components_async(self) -> None:
+    def start_enabled_components_async(self, *, autostart_only: bool = False) -> None:
         if self._toggle_in_progress:
             return
         self._loading_action = "connect"
         self._toggle_in_progress = True
         self._loading_timer.start()
         self._advance_loading_caption()
-        self._submit_backend_task("start_enabled_components")
+        self._submit_backend_task("start_enabled_components", {"autostart_only": autostart_only})
 
     def _tray_select_general(self, general_id: str) -> None:
         if not general_id:
@@ -3698,6 +6406,8 @@ class MainWindow(QMainWindow):
             return
         if isinstance(widget, AnimatedPowerButton):
             return
+        if isinstance(widget, OnboardingServiceProgressButton):
+            return
         if isinstance(widget, (QPushButton, QToolButton)):
             marker = widget.property("_interactionBound")
             if not marker:
@@ -3770,9 +6480,13 @@ class MainWindow(QMainWindow):
             for i, btn in enumerate(self._nav_buttons):
                 btn.setChecked(i == index)
             self._sync_nav_highlight(animated=True)
-            if current_index == 3 and index != 3:
+            if current_index == 4 and index != 4:
                 self._cancel_file_tag_render()
             if index == 1:
+                self.refresh_services()
+                if self._services_scroll is not None:
+                    QTimer.singleShot(0, lambda: self._services_scroll.verticalScrollBar().setValue(0))
+            elif index == 2:
                 try:
                     cached = self._page_payload_cache.get("components")
                     if isinstance(cached, dict):
@@ -3794,7 +6508,7 @@ class MainWindow(QMainWindow):
             elif index == 0:
                 self.refresh_dashboard()
                 self._sync_power_aura_geometry()
-            elif index == 2:
+            elif index == 3:
                 cached = self._page_payload_cache.get("mods")
                 if cached is not None:
                     self.refresh_mods(cached)
@@ -3802,7 +6516,7 @@ class MainWindow(QMainWindow):
                 else:
                     self._request_page_refresh("mods")
                 self._sync_mod_card_layout()
-            elif index == 3:
+            elif index == 4:
                 cached = self._page_payload_cache.get("files")
                 if isinstance(cached, dict):
                     self.refresh_files(cached)
@@ -3810,6 +6524,8 @@ class MainWindow(QMainWindow):
                     self._set_files_mode_loading(True)
                 self._prepare_files_page_geometry()
                 self._request_page_refresh("files")
+            if index == 5:
+                self._logs_force_scroll_bottom = True
             if index != self.pages.currentIndex():
                 self._prepare_page_geometry_for_index(index)
                 try:
@@ -3820,13 +6536,14 @@ class MainWindow(QMainWindow):
                     self.pages.setCurrentIndex(index)
                     if self._pages_shell is not None:
                         self._pages_shell.show()
-            self._set_logs_live_enabled(index == 4)
+            self._set_logs_live_enabled(index == 5)
             section_map = {
                 0: "dashboard",
-                1: "components",
-                2: "mods",
-                3: "files",
-                4: "logs",
+                1: "services",
+                2: "components",
+                3: "mods",
+                4: "files",
+                5: "logs",
             }
             section = section_map.get(index)
             if section:
@@ -3840,7 +6557,7 @@ class MainWindow(QMainWindow):
             for i, btn in enumerate(self._nav_buttons):
                 btn.setChecked(i == actual_index)
             self._sync_nav_highlight(animated=False)
-            self._set_logs_live_enabled(actual_index == 4)
+            self._set_logs_live_enabled(actual_index == 5)
 
     def _sync_nav_highlight(self, *, animated: bool) -> None:
         sidebar = self.findChild(SidebarPanel, "Sidebar")
@@ -3903,10 +6620,12 @@ class MainWindow(QMainWindow):
                 self.refresh_dashboard()
                 self._sync_power_aura_geometry()
             elif self.pages.currentIndex() == 1:
-                self._sync_component_card_layout()
+                self.refresh_services()
             elif self.pages.currentIndex() == 2:
-                self._sync_mod_card_layout()
+                self._sync_component_card_layout()
             elif self.pages.currentIndex() == 3:
+                self._sync_mod_card_layout()
+            elif self.pages.currentIndex() == 4:
                 self._prepare_files_page_geometry()
             self._page_transition_running = False
             self._page_transition_started_at = 0.0
@@ -3974,16 +6693,21 @@ class MainWindow(QMainWindow):
         animation.start()
 
 
-    def _open_settings_dialog(self) -> None:
+    def _open_settings_dialog(self, target_component_id: str = "") -> None:
         signature = (self.context.settings.get().theme, self.context.settings.get().language)
         if self._settings_dialog is None or self._settings_dialog_signature != signature:
             if self._settings_dialog is not None:
                 self._settings_dialog.deleteLater()
             self._settings_dialog = SettingsDialog(self, self.context)
-            self._settings_dialog_signature = signature
+        self._settings_dialog_signature = signature
         dialog = self._settings_dialog
-        dialog._load()
+        if self._pending_settings_payload is not None:
+            dialog.load_from_payload(self._pending_settings_payload)
+        else:
+            dialog._load()
         dialog.prepare_and_center()
+        if target_component_id:
+            dialog.scroll_to_component_settings(target_component_id)
         if dialog.exec():
             before = self.context.settings.get()
             payload = dialog.payload()
@@ -3992,8 +6716,118 @@ class MainWindow(QMainWindow):
                 self._settings_dialog_signature = None
             QTimer.singleShot(0, lambda p=payload, b=before: self._apply_settings_payload(b, p))
 
+    def _open_component_settings(self, component_id: str) -> None:
+        target = str(component_id or "").strip()
+        if target not in {"zapret", "tg-ws-proxy", "goshkow-vpn"}:
+            return
+        QTimer.singleShot(0, lambda t=target: self._open_settings_dialog(t))
+
+    def _refresh_goshkow_vpn_subscription_from_settings(self, url: str) -> None:
+        current_url = str(self.context.vpn.state().get("subscription_url", "") or "")
+        normalized = str(url or "").strip()
+        if normalized and normalized != current_url:
+            self._submit_backend_task(
+                "import_goshkow_vpn_subscription",
+                {"url": normalized},
+                action_id="__settings_vpn_refresh__",
+            )
+            return
+        self._submit_backend_task(
+            "refresh_goshkow_vpn_subscription",
+            action_id="__settings_vpn_refresh__",
+        )
+
     def _apply_settings_payload(self, before, payload: dict[str, object]) -> None:
-        self._submit_backend_task("apply_settings", payload, action_id="__settings__")
+        effective_payload = dict(payload)
+        if "fortnite" in {str(item) for item in list(self.context.settings.get().selected_service_ids or [])}:
+            effective_payload["zapret_ipset_mode"] = "any"
+            effective_payload["zapret_game_filter_mode"] = "tcpudp"
+        before_theme = str(getattr(before, "theme", self.context.settings.get().theme))
+        before_language = str(getattr(before, "language", self.context.settings.get().language))
+        next_theme = str(effective_payload.get("theme", before_theme))
+        next_language = str(effective_payload.get("language", before_language))
+        theme_changed = before_theme != next_theme
+        language_changed = before_language != next_language
+        self._settings_save_revision += 1
+        revision = self._settings_save_revision
+        self._pending_settings_payload = dict(effective_payload)
+        self.context.settings.update(**effective_payload)
+        if theme_changed:
+            self._apply_theme()
+        if language_changed:
+            self._retranslate_ui()
+        if theme_changed or language_changed:
+            self._schedule_full_locale_theme_refresh()
+        backend_payload = dict(effective_payload)
+        backend_payload["client_revision"] = revision
+        self._submit_backend_task("apply_settings", backend_payload, action_id="__settings__")
+
+    def _schedule_full_locale_theme_refresh(self) -> None:
+        QTimer.singleShot(0, self._refresh_ui_after_locale_theme_change)
+
+    def _refresh_ui_after_locale_theme_change(self) -> None:
+        previous_updates = self.updatesEnabled()
+        self.setUpdatesEnabled(False)
+        try:
+            if self._settings_dialog is not None:
+                self._settings_dialog.deleteLater()
+                self._settings_dialog = None
+            self._settings_dialog_signature = None
+            self._icon_cache.clear()
+            self._service_icon_cache.clear()
+            self._service_check_cache.clear()
+            self._page_payload_cache.clear()
+            self._cancel_page_transition()
+            self._apply_theme()
+            self._retranslate_ui()
+            self.refresh_dashboard()
+            self.refresh_services()
+            self.refresh_components()
+            self.refresh_mods()
+            self._request_page_refresh("files")
+            self._request_page_refresh("logs")
+            self._force_repolish_widget_tree()
+            self._refresh_current_page_after_theme_change()
+            self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
+        finally:
+            self.setUpdatesEnabled(previous_updates)
+            self.update()
+            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            QTimer.singleShot(0, self._force_repolish_widget_tree)
+
+    def _force_repolish_widget_tree(self) -> None:
+        for widget in [self, *self.findChildren(QWidget)]:
+            try:
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+                widget.update()
+            except Exception:
+                continue
+
+    def _refresh_current_page_after_theme_change(self) -> None:
+        if not hasattr(self, "pages"):
+            return
+        current_index = self.pages.currentIndex()
+        if current_index == 0:
+            self.refresh_dashboard()
+        elif current_index == 1:
+            self.refresh_services()
+        elif current_index == 2:
+            self.refresh_components()
+        elif current_index == 3:
+            self.refresh_mods()
+        elif current_index == 4:
+            self._request_page_refresh("files")
+        elif current_index == 5:
+            self._request_page_refresh("logs")
+
+    def _restore_optimistic_settings_if_needed(self) -> None:
+        if self._pending_settings_payload is None:
+            return
+        if self._settings_save_acked_revision >= self._settings_save_revision:
+            self._pending_settings_payload = None
+            return
+        self.context.settings.update(**self._pending_settings_payload)
 
     def _run_settings_diagnostics_popup(self) -> None:
         if self._settings_diag_task_id:
@@ -4048,14 +6882,43 @@ class MainWindow(QMainWindow):
         action = str(message.get("action", ""))
         action_id = self._backend_tasks.pop(task_id, action)
         payload = message.get("payload", {})
+        service_response_revision = 0
+        settings_response_revision = 0
+        if action == "set_selected_services" and isinstance(payload, dict):
+            try:
+                service_response_revision = int(payload.get("client_revision", 0) or 0)
+            except (TypeError, ValueError):
+                service_response_revision = 0
+            if service_response_revision and service_response_revision < self._services_selection_revision:
+                return
+        if action == "apply_settings" and isinstance(payload, dict):
+            try:
+                settings_response_revision = int(payload.get("client_revision", 0) or 0)
+            except (TypeError, ValueError):
+                settings_response_revision = 0
+            if settings_response_revision and settings_response_revision < self._settings_save_revision:
+                return
         self.context.settings.reload()
+        if action == "set_selected_services" and service_response_revision:
+            self._services_selection_acked_revision = max(self._services_selection_acked_revision, service_response_revision)
+        if action == "apply_settings" and settings_response_revision:
+            self._settings_save_acked_revision = max(self._settings_save_acked_revision, settings_response_revision)
+            if settings_response_revision >= self._settings_save_revision:
+                self._pending_settings_payload = None
+                self._settings_save_acked_revision = self._settings_save_revision
+        self._restore_optimistic_settings_if_needed()
+        self._restore_optimistic_service_selection_if_needed()
         self._update_runtime_snapshot_from_payload(payload)
         self._update_mods_cache_from_payload(payload)
         self._update_general_options_from_payload(payload)
+        if action in {"toggle_master_runtime", "start_enabled_components", "start_component", "select_general", "apply_settings", "load_startup_snapshot", "load_components_payload", "select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic"}:
+            self._notify_component_errors_from_payload(payload)
+        self._notify_telegram_proxy_status_from_payload(payload)
+        self._notify_zapret_restart_from_payload(payload)
         if action in {"update_zapret_runtime", "update_tg_ws_proxy_runtime"}:
             self._invalidate_general_options_cache()
             self._page_payload_cache.clear()
-        elif action in {"toggle_mod", "toggle_component_enabled", "move_mod", "set_mod_emoji", "install_mod", "remove_mod", "import_mod_from_github", "import_mod_from_paths", "import_mod_from_path", "rebuild_merge_runtime"}:
+        elif action in {"toggle_mod", "toggle_component_enabled", "move_mod", "set_mod_emoji", "install_mod", "remove_mod", "import_mod_from_github", "import_mod_from_paths", "import_mod_from_path", "rebuild_merge_runtime", "set_selected_services", "select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic"}:
             self._page_payload_cache.clear()
         if action == "load_startup_snapshot":
             self._startup_snapshot_ready = True
@@ -4063,12 +6926,13 @@ class MainWindow(QMainWindow):
                 "components": payload.get("components", []),
                 "states": payload.get("states", []),
                 "general_options": payload.get("general_options", []),
+                "goshkow_vpn": payload.get("goshkow_vpn", {}),
             }
             self._page_payload_cache["mods"] = {
                 "index": payload.get("index", []),
                 "installed": payload.get("installed", []),
             }
-            self._mark_dirty("dashboard", "components", "mods", "files", "tray")
+            self._mark_dirty("dashboard", "services", "components", "mods", "files", "tray")
             return
         if action == "apply_settings":
             if bool(payload.get("autostart_changed")):
@@ -4077,7 +6941,9 @@ class MainWindow(QMainWindow):
                 self._apply_theme()
             if bool(payload.get("language_changed")):
                 self._retranslate_ui()
-            self._mark_dirty("dashboard", "components", "mods", "files", "logs", "tray")
+            if bool(payload.get("theme_changed")) or bool(payload.get("language_changed")):
+                self._schedule_full_locale_theme_refresh()
+            self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
         if action in {"toggle_master_runtime", "start_enabled_components", "select_general"}:
             self._mark_dirty("dashboard", "components", "tray")
             self._ui_signals.toggle_done.emit()
@@ -4085,6 +6951,10 @@ class MainWindow(QMainWindow):
                 self._ui_signals.component_action_done.emit("__general__")
             return
         if action in {"start_component", "stop_component"}:
+            self._mark_dirty("dashboard", "components", "tray")
+            self._ui_signals.component_action_done.emit(action_id)
+            return
+        if action in {"select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic"}:
             self._mark_dirty("dashboard", "components", "tray")
             self._ui_signals.component_action_done.emit(action_id)
             return
@@ -4098,6 +6968,9 @@ class MainWindow(QMainWindow):
         if action == "toggle_component_autostart":
             self._mark_dirty("components")
             self._ui_signals.component_action_done.emit(action_id)
+            return
+        if action == "set_selected_services":
+            self._mark_dirty("dashboard", "services", "components", "files", "tray")
             return
         if action == "toggle_mod":
             self._mark_dirty("dashboard", "mods", "files", "logs", "tray")
@@ -4115,7 +6988,7 @@ class MainWindow(QMainWindow):
             files_payload = payload.get("files_payload") if isinstance(payload, dict) else None
             if isinstance(files_payload, dict):
                 self._page_payload_cache["files"] = files_payload
-                if self.pages.currentIndex() == 3:
+                if self.pages.currentIndex() == 4:
                     self.refresh_files(files_payload)
             self._mark_dirty("dashboard", "files", "logs", "tray")
             self._ui_signals.component_action_done.emit("__files_collection__")
@@ -4124,13 +6997,13 @@ class MainWindow(QMainWindow):
             files_payload = payload.get("files_payload") if isinstance(payload, dict) else None
             if isinstance(files_payload, dict):
                 self._page_payload_cache["files"] = files_payload
-                if self.pages.currentIndex() == 3:
+                if self.pages.currentIndex() == 4:
                     self.refresh_files(files_payload)
             return
         if action == "load_components_payload":
             if isinstance(payload, dict):
                 self._page_payload_cache["components"] = payload
-                if self.pages.currentIndex() == 1:
+                if self.pages.currentIndex() == 2:
                     self.refresh_components(payload)
             return
         if action == "write_file_text":
@@ -4159,8 +7032,11 @@ class MainWindow(QMainWindow):
                 self._show_info("Zapret", self._t("Уже установлена последняя версия Zapret.", "The latest Zapret version is already installed."))
             elif status == "updated":
                 self._show_info("Zapret", self._t("Zapret успешно обновлён.", "Zapret was updated successfully."))
+                self._add_notification("success", "Zapret", self._t("Zapret успешно обновлён.", "Zapret was updated successfully."), source="zapret")
             else:
-                self._show_error("Zapret", str(payload.get("error", self._t("Не удалось обновить Zapret.", "Failed to update Zapret."))))
+                message = str(payload.get("error", self._t("Не удалось обновить Zapret.", "Failed to update Zapret.")))
+                self._add_notification("error", "Zapret", message, source="zapret", details={"dedupe_key": f"update-error:zapret:{message}"})
+                self._show_error("Zapret", message)
             self._mark_dirty("dashboard", "components", "files", "logs")
             return
         if action == "update_tg_ws_proxy_runtime":
@@ -4170,8 +7046,11 @@ class MainWindow(QMainWindow):
                 self._show_info("TG WS Proxy", self._t("Уже установлена последняя версия TG WS Proxy.", "The latest TG WS Proxy version is already installed."))
             elif status == "updated":
                 self._show_info("TG WS Proxy", self._t("TG WS Proxy успешно обновлён.", "TG WS Proxy was updated successfully."))
+                self._add_notification("success", "TG WS Proxy", self._t("TG WS Proxy успешно обновлён.", "TG WS Proxy was updated successfully."), source="tg-ws-proxy")
             else:
-                self._show_error("TG WS Proxy", str(payload.get("error", self._t("Не удалось обновить TG WS Proxy.", "Failed to update TG WS Proxy."))))
+                message = str(payload.get("error", self._t("Не удалось обновить TG WS Proxy.", "Failed to update TG WS Proxy.")))
+                self._add_notification("error", "TG WS Proxy", message, source="tg-ws-proxy", details={"dedupe_key": f"update-error:tg-ws-proxy:{message}"})
+                self._show_error("TG WS Proxy", message)
             self._mark_dirty("dashboard", "components", "files", "logs")
             return
 
@@ -4180,23 +7059,37 @@ class MainWindow(QMainWindow):
         action = str(message.get("action", ""))
         action_id = self._backend_tasks.pop(task_id, action)
         error = str(message.get("error", self._t("Неизвестная ошибка.", "Unknown error.")))
+        if action == "load_startup_snapshot":
+            self.context.logging.log("error", "startup_snapshot_failed", error=error)
+            self._ensure_local_runtime_snapshot()
+            self._startup_snapshot_ready = True
+            self._mark_dirty("dashboard", "components", "tray")
+            return
         if action in {"toggle_master_runtime", "start_enabled_components", "select_general"}:
             self._ui_signals.toggle_done.emit()
             if action == "select_general":
                 self._ui_signals.component_action_done.emit("__general__")
         if action == "apply_settings":
             self._ui_signals.component_action_done.emit("__settings__")
-        if action in {"toggle_component_enabled", "toggle_component_autostart", "start_component", "stop_component"}:
+        if action in {"toggle_component_enabled", "toggle_component_autostart", "start_component", "stop_component", "toggle_goshkow_vpn_mode"}:
             self._ui_signals.component_action_done.emit(action_id)
         if action in {"run_general_diagnostics", "run_general_diagnostic_single"}:
+            if self._general_test_cancelled:
+                self._general_test_task_id = None
+                self._general_test_eta_timer.stop()
+                self._general_test_cancelled = False
+                self._clear_windows_taskbar_progress()
+                return
             self._general_test_running = False
             self._general_test_task_id = None
             self._general_test_eta_timer.stop()
+            self._clear_windows_taskbar_progress()
             if self._general_test_dialog is not None:
                 self._general_test_dialog.reject()
             self._general_test_dialog = None
             self._general_test_status_label = None
             self._general_test_eta_label = None
+            self._general_test_counter_label = None
             self._general_test_progress_bar = None
         if action == "run_settings_diagnostics":
             self._settings_diag_task_id = None
@@ -4207,6 +7100,13 @@ class MainWindow(QMainWindow):
             self._settings_diag_progress_bar = None
         if action in {"update_zapret_runtime", "update_tg_ws_proxy_runtime"}:
             self._close_component_update_dialog()
+        self._add_notification(
+            "error",
+            self._t("Ошибка операции", "Operation failed"),
+            error,
+            source=action or "backend",
+            details={"dedupe_key": f"backend-error:{action}:{error}"},
+        )
         self._show_error("Zapret Hub", error)
 
     def _show_settings_diagnostics_result(self, payload: object) -> None:
@@ -4267,15 +7167,23 @@ class MainWindow(QMainWindow):
         payload = message.get("payload", {})
         if action == "run_general_diagnostics" and isinstance(payload, dict):
             self._ui_signals.general_test_progress.emit(
-                int(payload.get("current", 0) or 0),
-                int(payload.get("total", 0) or 0),
-                str(payload.get("name", "") or ""),
+                {
+                    "target_current": int(payload.get("current", 0) or 0),
+                    "target_total": int(payload.get("total", 0) or 0),
+                    "target_name": str(payload.get("name", "") or ""),
+                    "config_index": max(1, self._general_test_next_option_index + 1),
+                    "config_total": max(1, self._general_test_total),
+                }
             )
         if action == "run_general_diagnostic_single" and isinstance(payload, dict):
             self._ui_signals.general_test_progress.emit(
-                int(payload.get("current", 0) or 0),
-                int(payload.get("total", 0) or 0),
-                str(payload.get("name", "") or ""),
+                {
+                    "target_current": int(payload.get("current", 0) or 0),
+                    "target_total": int(payload.get("total", 0) or 0),
+                    "target_name": str(payload.get("name", "") or ""),
+                    "config_index": max(1, self._general_test_next_option_index + 1),
+                    "config_total": max(1, self._general_test_total),
+                }
             )
         if action == "run_settings_diagnostics" and isinstance(payload, dict):
             if self._settings_diag_progress_bar is not None:
@@ -4294,6 +7202,8 @@ class MainWindow(QMainWindow):
     def _apply_theme(self) -> None:
         theme = self.context.settings.get().theme
         self._icon_cache.clear()
+        self._service_icon_cache.clear()
+        self._service_check_cache.clear()
         chevron = str((self._icons_dir / "chevron_down.svg").resolve())
         check = str((self._icons_dir / "check.svg").resolve())
         self.setStyleSheet(build_stylesheet(theme, chevron_icon=chevron, check_icon=check))
@@ -4308,10 +7218,17 @@ class MainWindow(QMainWindow):
         for btn in self._nav_buttons:
             if isinstance(btn, AnimatedNavButton):
                 btn.set_nav_theme(theme)
+        if self._github_sidebar_btn is not None:
+            self._github_sidebar_btn.setIcon(self._icon("github.svg"))
+            self._github_sidebar_btn.set_button_theme(theme)
         for overlay in self._scroll_fade_overlays:
             overlay.set_theme(theme)
             if getattr(overlay, "_scrollable", None) is getattr(self, "_file_tag_scroll", None):
                 overlay.set_surface_color(_files_inner_surface_color(theme))
+            elif getattr(overlay, "_scrollable", None) is getattr(self, "_services_scroll", None):
+                overlay.set_surface_color(_content_surface_color(theme))
+            elif getattr(overlay, "_scrollable", None) is getattr(self, "_onboarding_services_scroll", None):
+                overlay.set_surface_color(_chrome_surface_color(theme))
             overlay._sync_state()
         if self._file_tag_scroll is not None and self._file_tag_canvas is not None:
             tag_surface = _files_inner_surface_css(theme)
@@ -4321,10 +7238,23 @@ class MainWindow(QMainWindow):
             self._file_tag_canvas.setStyleSheet(f"background: {tag_surface}; border: none;")
         self._sync_nav_highlight(animated=False)
         self._apply_titlebar_icons(theme)
+        if self._notifications_btn is not None:
+            self._notifications_btn.setIcon(self._icon("bell.svg"))
+        if self._tools_btn is not None:
+            self._tools_btn.setIcon(self._icon("tool.svg"))
+        if self._settings_btn is not None:
+            self._settings_btn.setIcon(self._icon("settings.svg"))
+        if self.power_reconfigure_btn is not None:
+            self._sync_power_reconfigure_button_style()
+        if self.power_vpn_btn is not None:
+            self._sync_power_vpn_button_style()
+        self._sync_onboarding_back_button_style()
+        self._refresh_notifications_badge()
         self._apply_onboarding_style()
         self._apply_file_search_style()
         if self._file_search_toggle is not None:
             self._file_search_toggle.setIcon(self._icon("search.svg"))
+        self.refresh_services()
         if hasattr(self, "mods_cards_layout"):
             try:
                 self.refresh_mods()
@@ -4335,36 +7265,61 @@ class MainWindow(QMainWindow):
         if self._content_surface is None:
             return
         theme = self.context.settings.get().theme
-        if not self._onboarding_active:
-            self._content_surface.setStyleSheet("")
-        else:
-            color = _chrome_surface_color(theme).name()
-            self._content_surface.setStyleSheet(
-                "QFrame#ContentSurface {"
-                f"background: {color};"
-                "border: none;"
-                "border-top-left-radius: 18px;"
-                "border-top-right-radius: 0px;"
-                "border-bottom-left-radius: 16px;"
-                "border-bottom-right-radius: 16px;"
-                "}"
-            )
+        onboarding_active = bool(
+            self._onboarding_active
+            and self._onboarding_widget is not None
+        )
+        self._apply_onboarding_chrome(theme, onboarding_active)
         text_color = _onboarding_text_color(theme)
         muted_color = _onboarding_muted_color(theme)
         accent = "#6e8fff" if not is_light_theme(theme) else "#4f73d9"
         accent_hover = "#7d9bff" if not is_light_theme(theme) else "#5f83ea"
         chrome = _chrome_surface_color(theme).name()
-        if isinstance(self._onboarding_widget, OnboardingPageWidget):
-            self._onboarding_widget.set_background_color(QColor(chrome))
-            self._onboarding_widget.setStyleSheet("QWidget#OnboardingPage { border: none; }")
-        elif self._onboarding_widget is not None:
-            self._onboarding_widget.setStyleSheet(f"QWidget#OnboardingPage {{ background: {chrome}; border: none; }}")
         if self._onboarding_wrap_widget is not None:
             self._onboarding_wrap_widget.setStyleSheet("background: transparent;")
+        if self._onboarding_intro_title_label is not None:
+            self._onboarding_intro_title_label.setStyleSheet(
+                f"color: {text_color}; background: transparent; font-size: 28px; font-weight: 820;"
+            )
+        if self._onboarding_intro_desc_label is not None:
+            self._onboarding_intro_desc_label.setStyleSheet(f"color: {muted_color}; background: transparent; font-size: 10.5pt;")
         if self._onboarding_title_label is not None:
-            self._onboarding_title_label.setStyleSheet(f"color: {text_color}; background: transparent;")
+            title_size = 28 if self._onboarding_stage == "services" else 28
+            self._onboarding_title_label.setStyleSheet(
+                f"color: {text_color}; background: transparent; font-size: {title_size}px; font-weight: 820;"
+            )
         if self._onboarding_desc_label is not None:
-            self._onboarding_desc_label.setStyleSheet(f"color: {muted_color}; background: transparent;")
+            self._onboarding_desc_label.setStyleSheet(f"color: {muted_color}; background: transparent; font-size: 10.5pt;")
+        if self._onboarding_running_title_label is not None:
+            self._onboarding_running_title_label.setStyleSheet(
+                f"color: {text_color}; background: transparent; font-size: 28px; font-weight: 820;"
+            )
+        if self._onboarding_running_desc_label is not None:
+            self._onboarding_running_desc_label.setStyleSheet(f"color: {muted_color}; background: transparent; font-size: 10.5pt;")
+        if self._onboarding_result_title_label is not None:
+            self._onboarding_result_title_label.setStyleSheet(
+                f"color: {text_color}; background: transparent; font-size: 28px; font-weight: 820;"
+            )
+        if self._onboarding_result_desc_label is not None:
+            self._onboarding_result_desc_label.setStyleSheet(f"color: {muted_color}; background: transparent; font-size: 10.5pt;")
+        if self._onboarding_services_title_label is not None:
+            self._onboarding_services_title_label.setStyleSheet(f"color: {text_color}; background: transparent;")
+        if self._onboarding_services_hint_label is not None:
+            self._onboarding_services_hint_label.setStyleSheet(f"color: {muted_color}; background: transparent;")
+        if self._onboarding_services_scroll is not None:
+            self._onboarding_services_scroll.setStyleSheet(
+                "QScrollArea#OnboardingServicesScroll, "
+                "QScrollArea#OnboardingServicesScroll > QWidget#qt_scrollarea_viewport, "
+                "QWidget#OnboardingServicesCanvas { background: transparent; border: none; }"
+            )
+        if self._services_scroll is not None:
+            self._services_scroll.setStyleSheet(
+                "QScrollArea#ServicesScroll, "
+                "QScrollArea#ServicesScroll > QWidget#qt_scrollarea_viewport, "
+                "QWidget#ServicesCanvas { background: transparent; border: none; }"
+            )
+        if self._onboarding_service_action_btn is not None:
+            self._onboarding_service_action_btn.set_theme(theme)
         if self._onboarding_result_card is not None:
             self._onboarding_result_card.setStyleSheet(
                 "background: transparent; border: none;"
@@ -4375,9 +7330,11 @@ class MainWindow(QMainWindow):
             self._onboarding_found_label.setStyleSheet(f"color: {text_color}; background: transparent; border: none;")
         if self._onboarding_progress_label is not None:
             self._onboarding_progress_label.setStyleSheet(f"color: {muted_color}; background: transparent; border: none;")
+        if self._onboarding_progress_counter_label is not None:
+            self._onboarding_progress_counter_label.setStyleSheet(f"color: {muted_color}; background: transparent; border: none;")
         if isinstance(self._onboarding_progress_bar, RoundedProgressBar):
-            track = QColor(37, 47, 62, 102) if is_light_theme(theme) else QColor(166, 187, 222, 60)
-            border = QColor("#32435b") if is_light_theme(theme) else QColor("#2f4467")
+            track = QColor(231, 238, 249, 210) if is_light_theme(theme) else QColor(166, 187, 222, 60)
+            border = QColor("#c7d4ea") if is_light_theme(theme) else QColor("#2f4467")
             chunk_start = QColor("#4f73d9") if is_light_theme(theme) else QColor("#59c9ff")
             chunk_end = QColor("#7ea5ff") if is_light_theme(theme) else QColor("#46f4ff")
             self._onboarding_progress_bar.set_theme_colors(
@@ -4392,10 +7349,19 @@ class MainWindow(QMainWindow):
         if self._onboarding_primary_btn is not None:
             self._onboarding_primary_btn.setStyleSheet(
                 "QPushButton {"
-                f"background: transparent; border: 1px solid {accent}; border-radius: 12px; padding: 10px 18px; color: {text_color};"
+                f"background: transparent; border: 1px solid {accent}; border-radius: 14px; padding: 10px 22px; color: {text_color}; font-weight: 700;"
                 "}"
                 "QPushButton:hover {"
-                f"background: rgba(0, 0, 0, 0); border: 1px solid {accent_hover};"
+                f"background: rgba(101, 132, 255, 26); border: 1px solid {accent_hover};"
+                "}"
+            )
+        if self._onboarding_result_primary_btn is not None:
+            self._onboarding_result_primary_btn.setStyleSheet(
+                "QPushButton {"
+                f"background: transparent; border: 1px solid {accent}; border-radius: 14px; padding: 10px 22px; color: {text_color}; font-weight: 700;"
+                "}"
+                "QPushButton:hover {"
+                f"background: rgba(101, 132, 255, 26); border: 1px solid {accent_hover};"
                 "}"
             )
         if self._onboarding_secondary_btn is not None:
@@ -4403,6 +7369,59 @@ class MainWindow(QMainWindow):
             self._onboarding_secondary_btn.setStyleSheet(
                 f"background: transparent; border: none; padding: 6px 10px; color: {secondary_color};"
             )
+
+    def _apply_onboarding_chrome(self, theme: str, onboarding_active: bool) -> None:
+        if not onboarding_active:
+            self._content_surface.setStyleSheet("")
+            root_frame = self.findChild(OnboardingFrame, "RootFrame")
+            if root_frame is not None:
+                root_frame.set_onboarding_background(_chrome_surface_color(theme), False)
+            if self._onboarding_services_fade is not None:
+                self._onboarding_services_fade.set_onboarding_background_frame(None)
+            title_bar = self.findChild(QFrame, "TitleBar")
+            if title_bar is not None:
+                title_bar.setAutoFillBackground(False)
+                title_bar.setStyleSheet("")
+        else:
+            color = _chrome_surface_color(theme).name()
+            root_frame = self.findChild(OnboardingFrame, "RootFrame")
+            if root_frame is not None:
+                root_frame.set_onboarding_background(QColor(color), True)
+            if self._onboarding_services_fade is not None:
+                self._onboarding_services_fade.set_onboarding_background_frame(root_frame)
+            title_bar = self.findChild(QFrame, "TitleBar")
+            if title_bar is not None:
+                title_bar.setAutoFillBackground(False)
+                title_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                title_bar.setStyleSheet(
+                    "QFrame#TitleBar {"
+                    "background: transparent;"
+                    "border: none;"
+                    "border-top-left-radius: 16px;"
+                    "border-top-right-radius: 16px;"
+                    "}"
+                    "QFrame#TitleBar QLabel, QFrame#TitleBar QToolButton {"
+                    "background: transparent;"
+                    "}"
+                )
+            self._content_surface.setStyleSheet(
+                "QFrame#ContentSurface {"
+                "background: transparent;"
+                "border: none;"
+                "border-top-left-radius: 18px;"
+                "border-top-right-radius: 0px;"
+                "border-bottom-left-radius: 16px;"
+                "border-bottom-right-radius: 16px;"
+                "}"
+            )
+        chrome = _chrome_surface_color(theme).name()
+        if isinstance(self._onboarding_widget, OnboardingPageWidget):
+            self._onboarding_widget.set_background_color(QColor(0, 0, 0, 0) if onboarding_active else QColor(chrome))
+            if self._onboarding_widget.property("onboardingPageStyleReady") is not True:
+                self._onboarding_widget.setStyleSheet("QWidget#OnboardingPage { border: none; }")
+                self._onboarding_widget.setProperty("onboardingPageStyleReady", True)
+        elif self._onboarding_widget is not None:
+            self._onboarding_widget.setStyleSheet(f"QWidget#OnboardingPage {{ background: {chrome}; border: none; }}")
 
     def _register_scroll_fade(self, scrollable: QAbstractScrollArea, surface_color: QColor | None = None) -> ScrollFadeOverlay:
         overlay = ScrollFadeOverlay(scrollable)
@@ -4454,8 +7473,8 @@ class MainWindow(QMainWindow):
             "}"
         )
 
-    def _register_smooth_scroll(self, scrollable: QAbstractScrollArea) -> None:
-        self._smooth_scroll_helpers.append(SmoothScrollController(scrollable))
+    def _register_smooth_scroll(self, scrollable: QAbstractScrollArea, *, duration: int = 170, angle_divisor: float = 2.0) -> None:
+        self._smooth_scroll_helpers.append(SmoothScrollController(scrollable, duration=duration, angle_divisor=angle_divisor))
 
     def _apply_titlebar_icons(self, theme: str) -> None:
         if self._min_btn is None or self._close_btn is None:
@@ -4481,6 +7500,7 @@ class MainWindow(QMainWindow):
     def _retranslate_ui(self) -> None:
         nav_tooltips = [
             self._t("Главная", "Dashboard"),
+            self._t("Сервисы", "Services"),
             self._t("Компоненты", "Components"),
             self._t("Модификации", "Mods"),
             self._t("Файлы", "Files"),
@@ -4493,11 +7513,32 @@ class MainWindow(QMainWindow):
         if self._tools_btn is not None:
             self._tools_btn.setToolTip(self._t("Инструменты", "Tools"))
             self._tools_btn.setMenu(self._build_tools_menu())
+        if self._notifications_btn is not None:
+            self._notifications_btn.setToolTip(self._t("Уведомления", "Notifications"))
         if self._settings_btn is not None:
             self._settings_btn.setToolTip(self._t("Настройки", "Settings"))
-
+        if self.power_reconfigure_btn is not None:
+            self.power_reconfigure_btn.setToolTip(self._t("Подобрать настройки", "Find settings"))
+        if self._onboarding_back_btn is not None:
+            self._onboarding_back_btn.setToolTip(self._t("Назад", "Back"))
         if self._dashboard_title_label is not None:
             self._dashboard_title_label.setText(self._t("Быстрый доступ", "Quick Access"))
+        if self._services_title_label is not None:
+            self._services_title_label.setText(self._t("Выберите сервисы", "Choose services"))
+        if self._services_subtitle_label is not None:
+            self._services_subtitle_label.setText(
+                self._t(
+                    "Выберите приложения, сайты и сервисы, которыми вы пользуетесь.",
+                    "Choose the apps, sites, and services you actually use.",
+                )
+            )
+        if self._services_hint_label is not None:
+                self._services_hint_label.setText(
+                    self._t(
+                        "Приложение автоматически настраивает свою работу для обеспечения доступа к выбранным сервисам.",
+                        "The app automatically adjusts its behavior to provide access to the selected services.",
+                    )
+                )
         if self._components_title_label is not None:
             self._components_title_label.setText(self._t("Компоненты", "Components"))
         if self._mods_title_label is not None:
@@ -4579,9 +7620,12 @@ class MainWindow(QMainWindow):
             self._editor_title_label.setText(self._t("Редактор", "Editor"))
         if self._logs_title_label is not None:
             self._logs_title_label.setText(self._t("Логи", "Logs"))
+        if self._onboarding_stage == "intro":
+            self._reset_onboarding_intro_state()
+        elif self._onboarding_stage == "services":
+            self._show_onboarding_services_stage()
+        self.refresh_services()
         self._rebuild_logs_source_combo()
-        if self._logs_refresh_btn is not None:
-            self._logs_refresh_btn.setText(self._t("Обновить", "Refresh"))
 
         title_map = {
             "app": self._t("Приложение", "App"),
@@ -4785,15 +7829,28 @@ class MainWindow(QMainWindow):
             for index, item in enumerate(self._mods_installed_cache.values())
             if getattr(item, "enabled", False)
         }
+        def general_number(name: str) -> int:
+            lowered = str(name or "").lower()
+            match = re.search(r"alt\s*(\d+)", lowered)
+            if match:
+                return int(match.group(1))
+            if lowered == "general.bat":
+                return 0
+            return -1
+
         return sorted(
             options,
             key=lambda item: (
                 0 if item["id"] in favorites else 1,
-                2 if str(item.get("bundle_id", "")) == "base" else 1,
+                0 if str(item.get("bundle_id", "")) == "unified-general" else 2 if str(item.get("bundle_id", "")) == "base" else 1,
                 installed_order.get(str(item.get("bundle_id", "")), 9999),
+                -general_number(str(item.get("name", ""))),
                 (item.get("name") or "").lower(),
             ),
         )
+
+    def _general_options_for_current_service_tests(self, options: list[dict[str, str]]) -> list[dict[str, str]]:
+        return prioritize_generals_for_services(options, self._selected_service_ids())
 
     def _start_component_loading(self, component_id: str, button: QPushButton, base_text: str) -> None:
         self._component_loading_buttons[component_id] = button
@@ -5049,7 +8106,7 @@ class MainWindow(QMainWindow):
     def _prepare_files_page_geometry(self) -> None:
         if self._file_mode_stack is not None and self._file_mode_stack.layout() is not None:
             self._file_mode_stack.layout().activate()
-        page = self.pages.widget(3) if hasattr(self, "pages") else None
+        page = self.pages.widget(4) if hasattr(self, "pages") else None
         if isinstance(page, QWidget) and page.layout() is not None:
             page.layout().activate()
         self._sync_files_home_layout()
@@ -5387,7 +8444,7 @@ class MainWindow(QMainWindow):
         return item.data(Qt.ItemDataRole.UserRole)
 
     def _toggle_master_runtime(self) -> None:
-        if self._toggle_in_progress:
+        if self._toggle_in_progress or not self._startup_snapshot_ready:
             return
         self._sync_power_aura_geometry()
         states = self._component_states()
@@ -5424,7 +8481,7 @@ class MainWindow(QMainWindow):
     def _on_master_toggle_finished(self) -> None:
         self._loading_timer.stop()
         self._toggle_in_progress = False
-        self.power_button.setEnabled(True)
+        self.power_button.setEnabled(bool(self._startup_snapshot_ready))
         self._update_power_icon()
         self.refresh_all()
         if self._pending_info_message is not None:
@@ -5442,7 +8499,7 @@ class MainWindow(QMainWindow):
             self.power_caption_dots.setText("")
             self.power_caption_dots.hide()
         if self.power_caption_text is not None:
-            self.power_caption_text.setText(full_text)
+            self._set_power_status_pill(full_text, "loading")
         self._power_caption_base_text = base
         self._loading_frame += 1
         self.power_button.setProperty("state", "loading")
@@ -5450,6 +8507,7 @@ class MainWindow(QMainWindow):
             self.power_button.set_loading_state(True, animate=True)
         if self.power_aura is not None:
             self.power_aura.set_idle_pulse_enabled(False)
+            self.power_aura.set_status_glow_enabled(True)
         self._update_power_icon()
 
     def _start_selected_component(self) -> None:
@@ -5507,8 +8565,8 @@ class MainWindow(QMainWindow):
         chooser.setMinimumWidth(520)
         chooser_text = QLabel(
             self._t(
-                "Выберите удобный источник. Хаб сам вытащит только совместимые general-файлы, списки и нужные runtime-файлы.",
-                "Choose the source you want. The hub will keep only compatible general files, lists, and required runtime files.",
+                "Выберите удобный источник. Хаб сам вытащит только совместимые TXT, PS1 и BAT-файлы.",
+                "Choose the source you want. The hub will keep only compatible TXT, PS1, and BAT files.",
             )
         )
         chooser_text.setWordWrap(True)
@@ -5568,8 +8626,8 @@ class MainWindow(QMainWindow):
                 self,
                 self._t("Выберите файлы модификации", "Select modification files"),
                 filter=self._t(
-                    "Совместимые файлы (*.bat *.cmd *.txt *.json *.yaml *.yml *.zip);;Все файлы (*.*)",
-                    "Compatible files (*.bat *.cmd *.txt *.json *.yaml *.yml *.zip);;All files (*.*)",
+                    "Совместимые файлы (*.txt *.ps1 *.bat);;Все файлы (*.*)",
+                    "Compatible files (*.txt *.ps1 *.bat);;All files (*.*)",
                 ),
             )
         elif selected_kind["kind"] == "github":
@@ -5606,6 +8664,184 @@ class MainWindow(QMainWindow):
             )
         except Exception as error:
             self._show_error(self._t("Модификации", "Mods"), f"{self._t('Не удалось импортировать модификацию', 'Failed to import modification')}:\n{error}")
+
+    def _create_mod_dialog(self) -> None:
+        name = self._ask_text_value(
+            self._t("Новая модификация", "New modification"),
+            self._t("Введите название модификации.", "Enter modification name."),
+            self._t("Например: My game fix", "Example: My game fix"),
+        )
+        if not name:
+            return
+        author = self._ask_text_value(
+            self._t("Автор модификации", "Modification author"),
+            self._t("Кого указать автором? Если оставить пустым, будет указано «неизвестен».", "Who should be listed as author? Leave empty to use \"unknown\"."),
+            self._t("неизвестен", "unknown"),
+        ) or self._t("неизвестен", "unknown")
+        try:
+            entry = self.context.mods.create_empty(name=name, author=author)
+            self._mark_dirty("mods", "components", "files")
+            self._request_page_refresh("mods")
+            self._open_mod_editor(entry.id)
+        except Exception as error:
+            self._show_error(self._t("Модификации", "Mods"), str(error))
+
+    def _open_mod_editor(self, mod_id: str) -> None:
+        if mod_id == "unified-by-goshkow":
+            return
+        try:
+            installed = {item.id: item for item in self.context.mods.list_installed()}
+            entry = installed[mod_id]
+            files = self.context.mods.list_files(mod_id)
+        except Exception as error:
+            self._show_error(self._t("Модификации", "Mods"), str(error))
+            return
+
+        dialog = AppDialog(self, self.context, self._t("Редактор модификации", "Modification editor"))
+        dialog.setMinimumSize(760, 560)
+
+        form = QFormLayout()
+        name_input = QLineEdit(entry.name or entry.id)
+        author_input = QLineEdit(entry.author or self._t("неизвестен", "unknown"))
+        version_input = QLineEdit(entry.version or datetime.utcnow().strftime("%Y.%m.%d"))
+        description_input = QTextEdit(entry.description or "")
+        description_input.setFixedHeight(86)
+        form.addRow(self._t("Название", "Name"), name_input)
+        form.addRow(self._t("Автор", "Author"), author_input)
+        form.addRow(self._t("Версия", "Version"), version_input)
+        form.addRow(self._t("Описание", "Description"), description_input)
+        dialog.body_layout.addLayout(form)
+
+        split = QHBoxLayout()
+        split.setContentsMargins(0, 0, 0, 0)
+        split.setSpacing(12)
+        files_list = QListWidget()
+        files_list.setObjectName("ModFilesList")
+        files_list.setMinimumWidth(260)
+        files_list.setMaximumWidth(300)
+        files_list.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        files_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        files_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        files_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        editor = QTextEdit()
+        editor.setObjectName("FileEditor")
+        editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        current_path: dict[str, str] = {"path": ""}
+        modified: dict[str, bool] = {"value": False}
+
+        def reload_files() -> None:
+            files_list.clear()
+            try:
+                fresh = self.context.mods.list_files(mod_id)
+            except Exception:
+                fresh = []
+            for item in fresh:
+                rel = str(item.get("path", ""))
+                row = QListWidgetItem(f"{rel}\n{self._t('Размер', 'Size')}: {item.get('size', 0)}")
+                row.setData(Qt.ItemDataRole.UserRole, rel)
+                row.setToolTip(rel)
+                files_list.addItem(row)
+
+        def select_file(item: QListWidgetItem | None) -> None:
+            rel = str(item.data(Qt.ItemDataRole.UserRole) if item else "")
+            current_path["path"] = rel
+            if not rel:
+                editor.clear()
+                return
+            try:
+                editor.setPlainText(self.context.mods.read_file(mod_id, rel))
+            except Exception as error:
+                self._show_error(self._t("Файл модификации", "Mod file"), str(error))
+
+        files_list.currentItemChanged.connect(lambda item, _prev=None: select_file(item))
+        reload_files()
+        files_fade = ScrollFadeOverlay(files_list)
+        files_fade.set_surface_color(_dialog_surface_color(self.context.settings.get().theme))
+        editor_fade = ScrollFadeOverlay(editor)
+        editor_fade.set_surface_color(_dialog_surface_color(self.context.settings.get().theme))
+        dialog._scroll_fade_overlays = [files_fade, editor_fade]  # type: ignore[attr-defined]
+        self._smooth_scroll_helpers.append(SmoothScrollController(files_list))
+        self._smooth_scroll_helpers.append(SmoothScrollController(editor))
+        split.addWidget(files_list, 1)
+        split.addWidget(editor, 2)
+        dialog.body_layout.addLayout(split, 1)
+
+        buttons = QHBoxLayout()
+        save_meta_btn = QPushButton(self._t("Сохранить данные", "Save details"))
+        add_file_btn = QPushButton(self._t("Добавить файл", "Add file"))
+        save_file_btn = QPushButton(self._t("Сохранить файл", "Save file"))
+        delete_file_btn = QPushButton(self._t("Удалить файл", "Delete file"))
+        close_btn = QPushButton(self._t("Закрыть", "Close"))
+        for btn in (save_meta_btn, add_file_btn, save_file_btn, delete_file_btn, close_btn):
+            self._attach_button_animations(btn)
+            buttons.addWidget(btn)
+        dialog.body_layout.addLayout(buttons)
+
+        def save_metadata() -> None:
+            try:
+                self.context.mods.update_metadata(
+                    mod_id,
+                    name=name_input.text(),
+                    description=description_input.toPlainText(),
+                    author=author_input.text(),
+                    version=version_input.text(),
+                )
+                self._mark_dirty("mods")
+                modified["value"] = True
+            except Exception as error:
+                self._show_error(self._t("Модификации", "Mods"), str(error))
+
+        def add_file() -> None:
+            rel = self._ask_text_value(
+                self._t("Новый файл", "New file"),
+                self._t("Путь внутри модификации.", "Path inside the modification."),
+                "lists/list-general.txt",
+            )
+            if not rel:
+                return
+            try:
+                self.context.mods.write_file(mod_id, rel, "")
+                reload_files()
+                self._mark_dirty("mods", "components", "files")
+                modified["value"] = True
+            except Exception as error:
+                self._show_error(self._t("Файл модификации", "Mod file"), str(error))
+
+        def save_file() -> None:
+            rel = current_path["path"]
+            if not rel:
+                return
+            try:
+                self.context.mods.write_file(mod_id, rel, editor.toPlainText())
+                reload_files()
+                self._mark_dirty("mods", "components", "files")
+                modified["value"] = True
+            except Exception as error:
+                self._show_error(self._t("Файл модификации", "Mod file"), str(error))
+
+        def delete_file() -> None:
+            rel = current_path["path"]
+            if not rel:
+                return
+            try:
+                self.context.mods.delete_file(mod_id, rel)
+                current_path["path"] = ""
+                editor.clear()
+                reload_files()
+                self._mark_dirty("mods", "components", "files")
+                modified["value"] = True
+            except Exception as error:
+                self._show_error(self._t("Файл модификации", "Mod file"), str(error))
+
+        save_meta_btn.clicked.connect(save_metadata)
+        add_file_btn.clicked.connect(add_file)
+        save_file_btn.clicked.connect(save_file)
+        delete_file_btn.clicked.connect(delete_file)
+        close_btn.clicked.connect(dialog.accept)
+        dialog.prepare_and_center()
+        dialog.exec()
+        if modified["value"]:
+            self._request_page_refresh("mods")
 
     def _import_mod_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select mod folder")
@@ -5648,73 +8884,15 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _run_update_check_worker(self, manual: bool) -> None:
-        settings = self.context.settings.get()
-        original_selected = str(settings.selected_zapret_general or "")
-        original_ipset = str(settings.zapret_ipset_mode or "loaded")
-        original_game = str(settings.zapret_game_filter_mode or "disabled")
-        original_running = False
         try:
-            states = self._component_states()
-            original_running = bool(states.get("zapret") and states["zapret"].status == "running")
-        except Exception:
-            original_running = False
-
-        release: dict[str, str] | None = None
-        attempted: set[tuple[bool, str]] = set()
-
-        def _configure_runtime(use_zapret: bool, ipset_mode: str) -> None:
-            if not use_zapret:
-                self.context.processes.stop_component("zapret")
-                return
-            self.context.settings.update(
-                selected_zapret_general=original_selected,
-                zapret_ipset_mode=ipset_mode,
-                zapret_game_filter_mode=original_game,
-            )
-            self.context.processes.stop_component("zapret")
-            self.context.processes.start_component("zapret")
-
-        attempt_plan: list[tuple[bool, str]] = []
-        current_mode = original_ipset if original_running else "none"
-        attempt_plan.append((original_running, current_mode))
-        for mode in ("loaded", "none", "any"):
-            pair = (True, mode)
-            if pair not in attempt_plan:
-                attempt_plan.append(pair)
-        if (False, "none") not in attempt_plan:
-            attempt_plan.append((False, "none"))
-
-        try:
-            for use_zapret, mode in attempt_plan:
-                key = (use_zapret, mode)
-                if key in attempted:
-                    continue
-                attempted.add(key)
-                if use_zapret and not original_selected:
-                    continue
-                try:
-                    _configure_runtime(use_zapret, mode)
-                except Exception:
-                    continue
-                release = self.context.updates.fetch_latest_application_release()
-                if str(release.get("status", "error")) != "error":
-                    break
-            if release is None:
-                release = self.context.updates.fetch_latest_application_release()
-        finally:
-            self.context.settings.update(
-                selected_zapret_general=original_selected,
-                zapret_ipset_mode=original_ipset,
-                zapret_game_filter_mode=original_game,
-            )
-            if original_running and original_selected:
-                try:
-                    self.context.processes.stop_component("zapret")
-                    self.context.processes.start_component("zapret")
-                except Exception:
-                    pass
-            else:
-                self.context.processes.stop_component("zapret")
+            release = self.context.updates.fetch_latest_application_release()
+        except Exception as error:
+            release = {
+                "status": "error",
+                "current_version": __version__,
+                "latest_version": __version__,
+                "error": str(error),
+            }
         self._ui_signals.update_check_done.emit(release, manual)
 
     def _on_update_check_done(self, release: object, manual: bool) -> None:
@@ -5749,9 +8927,11 @@ class MainWindow(QMainWindow):
                     ),
                 )
             else:
+                message = str(release.get("error", self._t("Не удалось проверить обновления.", "Failed to check for updates.")))
+                self._add_notification("error", self._t("Обновления", "Updates"), message, source="updates")
                 self._show_error(
                     self._t("Обновления", "Updates"),
-                    str(release.get("error", self._t("Не удалось проверить обновления.", "Failed to check for updates."))),
+                    message,
                 )
 
     def _show_update_check_dialog(self) -> None:
@@ -5987,9 +9167,11 @@ class MainWindow(QMainWindow):
             self._update_prepare_dialog.accept()
             self._update_prepare_dialog = None
         if not isinstance(payload, dict) or not payload.get("ok"):
+            message = str((payload or {}).get("error", self._t("Не удалось подготовить обновление.", "Failed to prepare the update."))) if isinstance(payload, dict) else self._t("Не удалось подготовить обновление.", "Failed to prepare the update.")
+            self._add_notification("error", self._t("Обновления", "Updates"), message, source="updates")
             self._show_error(
                 self._t("Обновления", "Updates"),
-                str((payload or {}).get("error", self._t("Не удалось подготовить обновление.", "Failed to prepare the update."))) if isinstance(payload, dict) else self._t("Не удалось подготовить обновление.", "Failed to prepare the update."),
+                message,
             )
             return
         prepared = payload.get("prepared")
@@ -5999,8 +9181,15 @@ class MainWindow(QMainWindow):
         try:
             self.context.updates.launch_update(prepared)
         except Exception as error:
+            self._add_notification("error", self._t("Обновления", "Updates"), str(error), source="updates")
             self._show_error(self._t("Обновления", "Updates"), str(error))
             return
+        self._add_notification(
+            "success",
+            self._t("Обновления", "Updates"),
+            self._t("Обновление подготовлено, приложение перезапускается.", "Update is prepared, restarting the app."),
+            source="updates",
+        )
         self._quit_for_update()
 
     def _run_diagnostics_popup(self) -> None:
@@ -6410,7 +9599,7 @@ class MainWindow(QMainWindow):
             self._show_error(self._t("Файлы", "Files"), f"{self._t('Не удалось переименовать файл', 'Failed to rename file')}:\n{error}")
 
     def schedule_refresh_all(self) -> None:
-        self._refresh_dirty_sections.update({"dashboard", "components", "mods", "files", "logs", "tray"})
+        self._refresh_dirty_sections.update({"dashboard", "services", "components", "mods", "files", "logs", "tray"})
         self._schedule_dirty_refresh()
 
     def _mark_dirty(self, *sections: str) -> None:
@@ -6436,8 +9625,13 @@ class MainWindow(QMainWindow):
         if "dashboard" in dirty:
             try:
                 self.refresh_dashboard()
-            except Exception:
-                pass
+            except Exception as error:
+                self.context.logging.log("error", "refresh_dashboard_failed", error=str(error))
+        if "services" in dirty:
+            try:
+                self.refresh_services()
+            except Exception as error:
+                self.context.logging.log("error", "refresh_services_failed", error=str(error))
         if "tray" in dirty:
             try:
                 self._rebuild_tray_menu()
@@ -6446,8 +9640,8 @@ class MainWindow(QMainWindow):
         if "components" in dirty:
             try:
                 self.refresh_components()
-            except Exception:
-                pass
+            except Exception as error:
+                self.context.logging.log("error", "refresh_components_failed", error=str(error))
         if "mods" in dirty:
             try:
                 self.refresh_mods()
@@ -6636,6 +9830,7 @@ class MainWindow(QMainWindow):
             if section == "components":
                 self._update_runtime_snapshot_from_payload(payload)
                 self._update_general_options_from_payload(payload)
+                self._notify_component_errors_from_payload(payload)
             elif section == "mods":
                 self._update_mods_cache_from_payload(payload)
         visible_page = self.pages.currentIndex() if hasattr(self, "pages") else 0
@@ -6647,9 +9842,9 @@ class MainWindow(QMainWindow):
         elif section == "mods":
             self.refresh_mods(payload)
             QTimer.singleShot(0, self._sync_mod_card_layout)
-        elif section == "files" and visible_page == 3:
+        elif section == "files" and visible_page == 4:
             self.refresh_files(payload)
-        elif section == "logs" and visible_page == 4:
+        elif section == "logs" and visible_page == 5:
             self.refresh_logs(payload)
         if self._loading_overlay_context == f"page:{section}":
             self._hide_loading_overlay()
@@ -6662,23 +9857,27 @@ class MainWindow(QMainWindow):
             return
         settings = self.context.settings.get()
         if not self._startup_snapshot_ready:
+            self._ensure_local_runtime_snapshot()
+        if not self._startup_snapshot_ready:
+            self.power_button.setEnabled(False)
             self.power_button.setProperty("state", "loading")
             self._update_power_icon()
             if isinstance(self.power_button, AnimatedPowerButton):
                 self.power_button.set_loading_state(True, animate=not self._page_transition_running)
             if self.power_aura is not None:
                 self.power_aura.set_idle_pulse_enabled(False)
+                self.power_aura.set_status_glow_enabled(True)
             if self.power_caption_dots is not None:
                 self.power_caption_dots.setText("")
                 self.power_caption_dots.hide()
             self._power_caption_base_text = self._t("ЗАГРУЗКА", "LOADING")
             if self.power_caption_text is not None:
-                self.power_caption_text.setText(self._power_caption_base_text)
+                self._set_power_status_pill(self._power_caption_base_text, "loading")
             self._set_badge("app", self._t("Загрузка", "Loading"), "status_warn.svg")
             self._set_badge("zapret", self._t("Загрузка", "Loading"), "status_warn.svg")
             self._set_badge("tg", self._t("Загрузка", "Loading"), "status_warn.svg")
             self._set_badge("mods", self._t("Загрузка", "Loading"), "status_mod.svg")
-            self._set_badge("theme", settings.theme.title(), self._theme_status_icon_name())
+            self._set_badge("theme", _theme_display_name(settings.theme, settings.language), self._theme_status_icon_name())
             return
         if self.general_combo.isVisible():
             self._refresh_general_combo(settings.selected_zapret_general)
@@ -6693,34 +9892,285 @@ class MainWindow(QMainWindow):
 
         self.power_button.setProperty("state", "on" if fully_running else "off")
         self._update_power_icon()
+        self.power_button.setEnabled(not self._toggle_in_progress)
         if isinstance(self.power_button, AnimatedPowerButton):
             animate_power = not self._page_transition_running
             self.power_button.set_active_state(fully_running, animate=animate_power)
         if self.power_aura is not None:
             self.power_aura.set_idle_pulse_enabled(fully_running and not self._toggle_in_progress)
+            self.power_aura.set_status_glow_enabled(fully_running or self._toggle_in_progress)
         if self.power_caption_dots is not None:
             self.power_caption_dots.setText("")
             self.power_caption_dots.hide()
         self._power_caption_base_text = ""
         if not active_ids:
             if self.power_caption_text is not None:
-                self.power_caption_text.setText(self._t("НЕТ КОМПОНЕНТОВ", "NO COMPONENTS"))
+                self._set_power_status_pill(self._t("Нет компонентов", "No components"), "off")
                 self._power_caption_base_text = self._t("НЕТ КОМПОНЕНТОВ", "NO COMPONENTS")
         else:
-            target_caption = self._t("ВКЛ", "ON") if fully_running else (self._t("ЧАСТИЧНО", "PARTIAL") if any_running else self._t("ВЫКЛ", "OFF"))
+            target_caption = self._t("Включено", "On") if fully_running else (self._t("Частично", "Partial") if any_running else self._t("Выключено", "Off"))
             if self.power_caption_text is not None:
-                self.power_caption_text.setText(target_caption)
+                self._set_power_status_pill(target_caption, "on" if fully_running else ("partial" if any_running else "off"))
                 self._power_caption_base_text = target_caption
 
         enabled_mods = list(settings.enabled_mod_ids or [])
 
         self._set_badge("app", self._t("Работает", "Running") if fully_running else (self._t("Частично", "Partial") if any_running else self._t("Ожидание", "Idle")), "status_ok.svg" if fully_running else ("status_warn.svg" if any_running else "status_off.svg"))
-        zapret_text, zapret_icon = self._component_badge_state(components.get("zapret"), zapret_state, any_running)
+        vpn_state = states.get("goshkow-vpn")
+        vpn_running = bool(vpn_state and str(getattr(vpn_state, "status", "") or "") == "running")
+        vpn_enabled = "goshkow-vpn" in {str(item) for item in list(settings.enabled_component_ids or [])}
+        show_vpn_badge = vpn_enabled or vpn_running
+        if show_vpn_badge:
+            zapret_text, zapret_icon = self._component_badge_state(components.get("goshkow-vpn"), vpn_state, any_running)
+            self._set_badge_title("zapret", self._t("VPN", "VPN"))
+        else:
+            zapret_text, zapret_icon = self._component_badge_state(components.get("zapret"), zapret_state, any_running)
+            self._set_badge_title("zapret", "Zapret")
         tg_text, tg_icon = self._component_badge_state(components.get("tg-ws-proxy"), tg_state, any_running)
         self._set_badge("zapret", zapret_text, zapret_icon)
         self._set_badge("tg", tg_text, tg_icon)
         self._set_badge("mods", f"{len(enabled_mods)} {self._t('Активно', 'Active')}", "status_mod.svg")
-        self._set_badge("theme", settings.theme.title(), self._theme_status_icon_name())
+        self._set_badge("theme", _theme_display_name(settings.theme, settings.language), self._theme_status_icon_name())
+
+    def _set_power_status_pill(self, text: str, state: str) -> None:
+        if self.power_caption_text is None:
+            return
+        self._sync_power_vpn_button_style()
+        text_color, accent, alpha = self._power_status_palette(state)
+        border = QColor(accent)
+        border.setAlpha(96 if state != "off" else 56)
+        fill = QColor(accent)
+        fill.setAlpha(alpha)
+        self.power_caption_text.setText(text)
+        self.power_caption_text.setStyleSheet(
+            "QLabel#PowerStatusPill {"
+            f"color: {text_color};"
+            f"background: {fill.name(QColor.NameFormat.HexArgb)};"
+            f"border: 1px solid {border.name(QColor.NameFormat.HexArgb)};"
+            "border-radius: 15px;"
+            "font-size: 12px;"
+            "font-weight: 700;"
+            "padding: 0 14px;"
+            "}"
+        )
+
+    def _power_status_palette(self, state: str) -> tuple[str, str, int]:
+        theme = self.context.settings.get().theme
+        light = is_light_theme(theme)
+        colors = {
+            "on": ("#132447" if light else "#dce5ff", "#1f4fbf" if light else "#6e8fff", 26),
+            "partial": ("#3d2b08" if light else "#ffe1a0", "#c77908" if light else "#f0a020", 24),
+            "loading": ("#132447" if light else "#dce5ff", "#1f4fbf" if light else "#4fbfe8", 22),
+            "off": ("#334155" if light else "#b4bfcd", "#526071" if light else "#8793a4", 14),
+        }
+        return colors.get(state, colors["off"])
+
+    def _inactive_control_style_values(self) -> tuple[str, QColor, QColor]:
+        text_color, accent, alpha = self._power_status_palette("off")
+        border = QColor(accent)
+        border.setAlpha(56)
+        fill = QColor(accent)
+        fill.setAlpha(alpha)
+        return text_color, border, fill
+
+    def _sync_power_reconfigure_button_style(self) -> None:
+        button = self.power_reconfigure_btn
+        if button is None:
+            return
+        text, border, fill = self._inactive_control_style_values()
+        hover = QColor(fill)
+        hover.setAlpha(min(255, fill.alpha() + 14))
+        button.setIcon(self._build_tinted_icon(self._icons_dir / "rerun.svg", QColor(text)))
+        button.setStyleSheet(
+            "QToolButton#PowerReconfigureButton {"
+            f"background: {fill.name(QColor.NameFormat.HexArgb)};"
+            f"border: 1px solid {border.name(QColor.NameFormat.HexArgb)};"
+            f"color: {text};"
+            "border-radius: 15px;"
+            "padding: 0px;"
+            "margin: 0px;"
+            "}"
+            "QToolButton#PowerReconfigureButton:hover {"
+            f"background: {hover.name(QColor.NameFormat.HexArgb)};"
+            "}"
+        )
+
+    def _sync_power_vpn_button_style(self) -> None:
+        button = self.power_vpn_btn
+        if button is None:
+            return
+        settings = self.context.settings.get()
+        selected = "goshkow-vpn" in {str(item) for item in list(settings.enabled_component_ids or [])}
+        running = False
+        try:
+            states = self._component_states()
+            vpn_state = states.get("goshkow-vpn")
+            running = bool(vpn_state and str(getattr(vpn_state, "status", "") or "") == "running")
+            selected = selected or running
+        except Exception:
+            pass
+        if selected:
+            text = "#d9ffe9" if not is_light_theme(settings.theme) else "#06391d"
+            border = QColor("#22c55e")
+            border.setAlpha(120)
+            fill = QColor("#22c55e")
+            fill.setAlpha((64 if running else 42) if not is_light_theme(settings.theme) else (54 if running else 34))
+        else:
+            text, border, fill = self._inactive_control_style_values()
+        hover = QColor(fill)
+        hover.setAlpha(min(255, fill.alpha() + 18))
+        button.setEnabled(not self._vpn_mode_switch_in_progress)
+        button.setIcon(self._build_tinted_icon(self._icons_dir / self._vpn_icon_name(), QColor(text)))
+        button.setStyleSheet(
+            "QToolButton#PowerVpnButton {"
+            f"background: {fill.name(QColor.NameFormat.HexArgb)};"
+            f"border: 1px solid {border.name(QColor.NameFormat.HexArgb)};"
+            f"color: {text};"
+            "border-radius: 15px;"
+            "padding: 0px 2px 0px 0px;"
+            "margin: 0px;"
+            "}"
+            "QToolButton#PowerVpnButton:hover {"
+            f"background: {hover.name(QColor.NameFormat.HexArgb)};"
+            "}"
+            "QToolButton#PowerVpnButton:disabled {"
+            "opacity: 0.72;"
+            "}"
+        )
+
+    def _handle_power_vpn_button(self) -> None:
+        if self._vpn_mode_switch_in_progress:
+            return
+        vpn_state = {}
+        try:
+            vpn_state = self.context.vpn.state() if getattr(self.context, "vpn", None) is not None else {}
+        except Exception:
+            vpn_state = {}
+        configured = str(vpn_state.get("subscription_state", "") or "") == "valid"
+        if not configured:
+            self._open_goshkow_vpn_component()
+            return
+        settings = self.context.settings.get()
+        enabled = {str(item) for item in list(settings.enabled_component_ids or [])}
+        target_enabled = "goshkow-vpn" not in enabled
+        zapret_enabled_before = "zapret" in enabled
+        if target_enabled:
+            enabled.add("goshkow-vpn")
+            enabled.discard("zapret")
+        else:
+            enabled.discard("goshkow-vpn")
+            if zapret_enabled_before:
+                enabled.add("zapret")
+        self.context.settings.update(enabled_component_ids=sorted(enabled))
+        self._set_power_vpn_switch_pending(True)
+        if self._master_runtime_has_running_components():
+            self._begin_vpn_mode_power_transition()
+        self._mark_dirty("dashboard", "components", "tray")
+        self._submit_backend_task(
+            "toggle_goshkow_vpn_mode",
+            {"enabled": target_enabled, "zapret_enabled_before": zapret_enabled_before},
+            action_id="goshkow-vpn",
+        )
+
+    def _set_power_vpn_switch_pending(self, pending: bool) -> None:
+        self._vpn_mode_switch_in_progress = bool(pending)
+        if self.power_vpn_btn is not None:
+            self.power_vpn_btn.setEnabled(not pending)
+        self._sync_power_vpn_button_style()
+
+    def _master_runtime_has_running_components(self) -> bool:
+        try:
+            return any(str(state.status or "") == "running" for state in self._component_states().values())
+        except Exception:
+            return False
+
+    def _begin_vpn_mode_power_transition(self) -> None:
+        if self._toggle_in_progress:
+            return
+        self._vpn_switch_power_transition = True
+        self._loading_action = "connect"
+        self._toggle_in_progress = True
+        self.power_button.setEnabled(False)
+        self._loading_frame = 0
+        self._loading_timer.start()
+        self._advance_loading_caption()
+
+    def _finish_vpn_mode_power_transition(self) -> None:
+        if not self._vpn_switch_power_transition:
+            return
+        self._vpn_switch_power_transition = False
+        self._loading_timer.stop()
+        self._toggle_in_progress = False
+        self.power_button.setEnabled(bool(self._startup_snapshot_ready))
+        self._update_power_icon()
+
+    def _open_goshkow_vpn_component(self) -> None:
+        self._components_scroll_target_component_id = "goshkow-vpn"
+        try:
+            self._switch_page(2)
+        except Exception:
+            self.pages.setCurrentIndex(2)
+        self._mark_dirty("components")
+        QTimer.singleShot(0, self.refresh_components)
+        QTimer.singleShot(80, self._scroll_to_goshkow_vpn_component)
+        QTimer.singleShot(220, self._scroll_to_goshkow_vpn_component)
+
+    def _scroll_to_goshkow_vpn_component(self) -> None:
+        self._ensure_components_scroll_target_visible()
+
+    def _ensure_components_scroll_target_visible(self) -> None:
+        target_id = self._components_scroll_target_component_id
+        if not target_id or self._components_scroll is None:
+            return
+        target = self._components_card_by_id.get(target_id)
+        if target is not None and target.isVisible():
+            try:
+                self._components_scroll.ensureWidgetVisible(target, 18, 18)
+                self._components_scroll_target_component_id = ""
+                return
+            except Exception:
+                pass
+        if self._components_scroll is not None:
+            self._components_scroll.verticalScrollBar().setValue(self._components_scroll.verticalScrollBar().maximum())
+            if target is not None:
+                self._components_scroll_target_component_id = ""
+
+    def _sync_onboarding_back_button_style(self) -> None:
+        button = self._onboarding_back_btn
+        if button is None:
+            return
+        text, border, fill = self._inactive_control_style_values()
+        hover = QColor(fill)
+        hover.setAlpha(min(255, fill.alpha() + 14))
+        button.setIcon(self._build_tinted_icon(self._icons_dir / "arrow_left.svg", QColor(text)))
+        button.setStyleSheet(
+            "QToolButton#OnboardingBackButton {"
+            f"background: {fill.name(QColor.NameFormat.HexArgb)};"
+            f"border: 1px solid {border.name(QColor.NameFormat.HexArgb)};"
+            f"color: {text};"
+            "border-radius: 16px;"
+            "padding: 0px;"
+            "margin: 0px;"
+            "}"
+            "QToolButton#OnboardingBackButton:hover {"
+            f"background: {hover.name(QColor.NameFormat.HexArgb)};"
+            "}"
+        )
+
+    def _sync_onboarding_back_button_visibility(self, *, force: bool = False) -> None:
+        button = self._onboarding_back_btn
+        if button is None:
+            return
+        show = force or (
+            self._onboarding_stage == "services"
+            and (self._onboarding_quick_restart or self._onboarding_manual_restart)
+        )
+        if show:
+            self._reset_widget_opacity(button)
+            button.setVisible(True)
+            button.raise_()
+        else:
+            button.setVisible(False)
 
     def _ensure_merge_runtime_ready(self) -> None:
         if self._merge_ensure_in_progress:
@@ -6751,7 +10201,7 @@ class MainWindow(QMainWindow):
         return self._t("Неизвестно", "Unknown"), "status_off.svg"
 
     def _refresh_general_combo(self, selected_id: str) -> None:
-        options = self._sorted_general_options()
+        options = self._general_options_for_current_service_tests(self._sorted_general_options())
         self._updating_general_combo = True
         try:
             self.general_combo.clear()
@@ -6862,6 +10312,34 @@ class MainWindow(QMainWindow):
 
     def _set_onboarding_visible(self, visible: bool) -> None:
         self._onboarding_active = visible
+        self._onboarding_transition_busy = False
+        self._onboarding_transition_token += 1
+        self._clear_onboarding_intro_transition_overlay()
+        if not visible:
+            self._stop_onboarding_glow_orbit()
+            self._onboarding_quick_restart = False
+        if visible:
+            theme = self.context.settings.get().theme
+            if self._onboarding_quick_restart:
+                self._apply_onboarding_quick_chrome(theme, True)
+                if self._onboarding_widget is not None:
+                    self._onboarding_widget.setVisible(True)
+                if self._pages_shell is not None:
+                    self._pages_shell.setVisible(False)
+                if self._sidebar_widget is not None:
+                    self._sidebar_widget.setVisible(False)
+                if self._tools_btn is not None:
+                    self._tools_btn.setVisible(False)
+                if self._notifications_btn is not None:
+                    self._notifications_btn.setVisible(False)
+                if self._settings_btn is not None:
+                    self._settings_btn.setVisible(False)
+            else:
+                self._reset_onboarding_intro_state()
+                self._prepare_onboarding_services_stage()
+                self._sync_onboarding_background_stage(animated=False)
+            if not self._onboarding_prewarming:
+                QTimer.singleShot(0, self._schedule_onboarding_services_prewarm)
         if self._onboarding_widget is not None:
             self._onboarding_widget.setVisible(visible)
         if self._pages_shell is not None:
@@ -6885,10 +10363,105 @@ class MainWindow(QMainWindow):
             self._sidebar_widget.setVisible(not visible)
         if self._tools_btn is not None:
             self._tools_btn.setVisible(not visible)
+        if self._notifications_btn is not None:
+            self._notifications_btn.setVisible(not visible)
         if self._settings_btn is not None:
             self._settings_btn.setVisible(not visible)
-        self._apply_onboarding_style()
+        if not visible and self._onboarding_service_action_btn is not None:
+            self._onboarding_service_action_btn.hide()
+        if not visible and self._onboarding_back_btn is not None:
+            self._onboarding_back_btn.hide()
+        if not visible:
+            self._apply_onboarding_chrome(self.context.settings.get().theme, False)
+        elif not self._onboarding_quick_restart:
+            self._apply_onboarding_style()
         self._relayout_onboarding_content()
+        if visible:
+            QTimer.singleShot(0, self._relayout_onboarding_content)
+        else:
+            QTimer.singleShot(160, self._cache_quick_onboarding_entry_snapshot)
+
+    def _apply_onboarding_quick_chrome(self, theme: str, onboarding_active: bool) -> None:
+        if self._content_surface is None:
+            return
+        chrome = _chrome_surface_color(theme).name()
+        root_frame = self.findChild(OnboardingFrame, "RootFrame")
+        if root_frame is not None:
+            root_frame.set_onboarding_background(QColor(chrome), onboarding_active)
+        if self._onboarding_services_fade is not None:
+            self._onboarding_services_fade.set_onboarding_background_frame(root_frame if onboarding_active else None)
+        title_bar = self.findChild(QFrame, "TitleBar")
+        if title_bar is not None:
+            title_bar.setAutoFillBackground(False)
+            title_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            title_bar.setStyleSheet(
+                "QFrame#TitleBar {"
+                "background: transparent;"
+                "border: none;"
+                "border-top-left-radius: 16px;"
+                "border-top-right-radius: 16px;"
+                "}"
+                "QFrame#TitleBar QLabel, QFrame#TitleBar QToolButton {"
+                "background: transparent;"
+                "}"
+            )
+        self._content_surface.setStyleSheet(
+            "QFrame#ContentSurface {"
+            "background: transparent;"
+            "border: none;"
+            "border-top-left-radius: 18px;"
+            "border-top-right-radius: 0px;"
+            "border-bottom-left-radius: 16px;"
+            "border-bottom-right-radius: 16px;"
+            "}"
+        )
+        if isinstance(self._onboarding_widget, OnboardingPageWidget):
+            self._onboarding_widget.set_background_color(QColor(0, 0, 0, 0) if onboarding_active else QColor(chrome))
+            if self._onboarding_widget.property("onboardingPageStyleReady") is not True:
+                self._onboarding_widget.setStyleSheet("QWidget#OnboardingPage { border: none; }")
+                self._onboarding_widget.setProperty("onboardingPageStyleReady", True)
+        elif self._onboarding_widget is not None:
+            self._onboarding_widget.setStyleSheet(f"QWidget#OnboardingPage {{ background: {chrome}; border: none; }}")
+
+    def _sync_onboarding_background_stage(self, *, animated: bool = True) -> None:
+        frame = self.findChild(OnboardingFrame, "RootFrame")
+        if frame is None:
+            return
+        stage = self._onboarding_stage
+        if stage == "intro":
+            target = (0.12, 0.55)
+        elif stage in {"services_transition", "services"}:
+            target = (0.50, 1.18)
+        elif stage == "running":
+            target = (0.84, 0.18)
+        elif stage in {"success", "failed"}:
+            target = (0.50, -0.08)
+        else:
+            target = (0.50, 1.18)
+        frame.set_glow_position(target[0], target[1], animated=animated)
+        if self._onboarding_services_fade is not None:
+            self._onboarding_services_fade.update()
+
+    def _start_onboarding_glow_orbit(self) -> None:
+        self._onboarding_glow_orbit_index = 0
+        self._onboarding_glow_orbit_phase = -0.88
+        self._advance_onboarding_glow_orbit()
+        if not self._onboarding_glow_orbit_timer.isActive():
+            self._onboarding_glow_orbit_timer.start()
+
+    def _stop_onboarding_glow_orbit(self) -> None:
+        if self._onboarding_glow_orbit_timer.isActive():
+            self._onboarding_glow_orbit_timer.stop()
+
+    def _advance_onboarding_glow_orbit(self) -> None:
+        frame = self.findChild(OnboardingFrame, "RootFrame")
+        if frame is None or not self._onboarding_active or self._onboarding_stage != "running":
+            return
+        self._onboarding_glow_orbit_phase = (self._onboarding_glow_orbit_phase + 0.018) % (math.pi * 2.0)
+        phase = self._onboarding_glow_orbit_phase
+        x = 0.5 + math.cos(phase) * 0.43
+        y = 0.5 + math.sin(phase) * 0.72
+        frame.set_glow_position(x, y, animated=False)
 
     def _restore_sidebar_after_onboarding(self) -> None:
         self._nav_highlight_initialized = False
@@ -6902,6 +10475,318 @@ class MainWindow(QMainWindow):
             sidebar.clear_highlight()
         self._sync_nav_highlight(animated=False)
 
+    def _clear_onboarding_intro_transition_overlay(self) -> None:
+        overlay = self._onboarding_intro_transition_overlay
+        if overlay is None:
+            return
+        try:
+            effect = overlay.graphicsEffect()
+            if isinstance(effect, QGraphicsOpacityEffect):
+                effect.setOpacity(1.0)
+            overlay.hide()
+            overlay.deleteLater()
+        finally:
+            self._onboarding_intro_transition_overlay = None
+
+    def _handle_onboarding_primary_action(self) -> None:
+        if self._onboarding_transition_busy:
+            return
+        if self._onboarding_stage == "intro":
+            self._show_onboarding_services_stage()
+            return
+        if self._onboarding_stage == "services_transition":
+            return
+        if self._onboarding_stage == "services":
+            if len(self._selected_service_ids()) < self._onboarding_services_minimum:
+                self._update_service_selection_summary()
+                return
+            self._start_onboarding_flow()
+            return
+        if self._onboarding_stage in {"success", "failed"}:
+            self._finish_onboarding()
+            return
+
+    def _handle_onboarding_secondary_action(self) -> None:
+        if self._onboarding_stage == "services":
+            self._skip_onboarding()
+            return
+        self._skip_onboarding()
+
+    def _show_onboarding_services_stage(self) -> None:
+        if self._onboarding_transition_busy:
+            return
+        self._onboarding_stage = "services"
+        self._sync_onboarding_background_stage(animated=True)
+        self._run_onboarding_transition(
+            outgoing=self._onboarding_intro_panel,
+            incoming=self._onboarding_services_stage_panel,
+            out_duration=230,
+            in_duration=190,
+            overlap=100,
+            prepare_in=self._finish_show_onboarding_services_stage,
+        )
+
+    def _finish_show_onboarding_services_stage(self, token: int | None = None) -> None:
+        if token is not None and token != self._onboarding_transition_token:
+            return
+        if self._onboarding_title_label is not None:
+            self._onboarding_title_label.setText(self._t("Выберите сервисы", "Choose services"))
+        if self._onboarding_desc_label is not None:
+            self._onboarding_desc_label.setText(
+                self._t(
+                    "Выберите от трёх приложений, сайтов и сервисов, которыми вы планируете пользоваться. Приложение само настроит Zapret так, чтобы выбранные сервисы работали.",
+                    "Choose at least three apps, sites, and services you plan to use. The app will configure Zapret so the selected services work.",
+                )
+            )
+        if self._onboarding_services_panel is not None:
+            self._onboarding_services_panel.show()
+        if self._onboarding_primary_btn is not None:
+            self._onboarding_primary_btn.setText(self._t("Продолжить", "Continue"))
+        if self._onboarding_actions_widget is not None:
+            self._onboarding_actions_widget.hide()
+        if self._onboarding_service_action_btn is not None:
+            self._onboarding_service_action_btn.set_theme(self.context.settings.get().theme)
+            self._onboarding_service_action_btn.set_selection_state(
+                len(self._selected_service_ids()),
+                self._onboarding_services_minimum,
+                text=self._t("Продолжить", "Continue"),
+            )
+            self._onboarding_service_action_btn.show()
+            self._position_onboarding_service_action()
+            self._onboarding_service_action_btn.raise_()
+        if self._onboarding_secondary_btn is not None:
+            self._onboarding_secondary_btn.hide()
+            self._onboarding_secondary_btn.setText(self._t("Пропустить", "Skip"))
+        self._update_service_selection_summary()
+        if self._onboarding_services_scroll is not None:
+            QTimer.singleShot(0, lambda: self._onboarding_services_scroll.verticalScrollBar().setValue(0))
+        self._sync_onboarding_back_button_visibility()
+
+    def _sync_onboarding_service_action_button(self) -> None:
+        button = self._onboarding_service_action_btn
+        if button is None or self._onboarding_stage != "services" or self._onboarding_transition_busy:
+            return
+        self._reset_widget_opacity(button)
+        button.setEnabled(True)
+        button.setVisible(True)
+        button.set_theme(self.context.settings.get().theme)
+        button.set_selection_state(
+            len(self._selected_service_ids()),
+            self._onboarding_services_minimum,
+            text=self._t("Продолжить", "Continue"),
+        )
+        self._position_onboarding_service_action()
+        button.raise_()
+
+    def _reset_onboarding_intro_state(self) -> None:
+        self._onboarding_running = False
+        self._onboarding_stage = "intro"
+        self._sync_onboarding_background_stage(animated=False)
+        self._reset_widget_opacity(self._onboarding_intro_panel)
+        self._reset_widget_opacity(self._onboarding_services_stage_panel)
+        self._reset_widget_opacity(self._onboarding_running_stage_panel)
+        self._reset_widget_opacity(self._onboarding_result_stage_panel)
+        self._reset_widget_opacity(self._onboarding_actions_widget)
+        if self._onboarding_stage_layout is not None and self._onboarding_intro_panel is not None:
+            self._onboarding_stage_layout.setCurrentWidget(self._onboarding_intro_panel)
+        if self._onboarding_intro_panel is not None:
+            self._onboarding_intro_panel.show()
+        if self._onboarding_services_stage_panel is not None:
+            self._onboarding_services_stage_panel.hide()
+        if self._onboarding_running_stage_panel is not None:
+            self._onboarding_running_stage_panel.hide()
+        if self._onboarding_result_stage_panel is not None:
+            self._onboarding_result_stage_panel.hide()
+        legacy_seen = self._legacy_onboarding_seen() and not self._onboarding_seen() and not self._onboarding_manual_restart
+        if self._onboarding_intro_title_label is not None:
+            self._onboarding_intro_title_label.setText(self._t("Приложение обновилось", "The app has been updated") if legacy_seen else self._t("Добро пожаловать", "Welcome"))
+        if self._onboarding_intro_desc_label is not None:
+            self._onboarding_intro_desc_label.setText(
+                self._t(
+                    "В новой версии Zapret Hub появилась настройка обхода по сервисам. Выберите приложения, сайты и игры, которыми пользуетесь, а приложение само подготовит подходящие правила.",
+                    "This Zapret Hub update adds per-service bypass setup. Choose the apps, sites, and games you use, and the app will prepare the right rules automatically.",
+                )
+                if legacy_seen
+                else self._t(
+                    "Zapret Hub помогает получить доступ к сервисам, которые могут работать нестабильно или не открываться. Пройдите первичную настройку, чтобы приложение аккуратно подстроилось под ваши приложения и сайты.",
+                    "Zapret Hub helps you access services that may be unstable or unavailable. Complete the initial setup so the app can adapt to your apps and sites.",
+                )
+            )
+        if self._onboarding_result_card is not None:
+            self._onboarding_result_card.hide()
+        if self._onboarding_progress_label is not None:
+            self._onboarding_progress_label.hide()
+            self._onboarding_progress_label.setText("")
+        if self._onboarding_progress_counter_label is not None:
+            self._onboarding_progress_counter_label.hide()
+            self._onboarding_progress_counter_label.setText("")
+        if self._onboarding_progress_bar is not None:
+            self._onboarding_progress_bar.hide()
+            self._onboarding_progress_bar.setValue(0)
+        if self._onboarding_services_panel is not None:
+            self._onboarding_services_panel.hide()
+        if self._onboarding_result_actions_widget is not None:
+            self._onboarding_result_actions_widget.hide()
+        if self._onboarding_result_primary_btn is not None:
+            self._onboarding_result_primary_btn.setText(self._t("Далее", "Next"))
+        if self._onboarding_primary_btn is not None:
+            self._onboarding_primary_btn.setEnabled(True)
+            self._onboarding_primary_btn.setVisible(True)
+            self._onboarding_primary_btn.setText(self._t("Далее", "Next"))
+        if self._onboarding_secondary_btn is not None:
+            self._onboarding_secondary_btn.hide()
+            self._onboarding_secondary_btn.setText(self._t("Пропустить", "Skip"))
+        if self._onboarding_actions_widget is not None:
+            self._onboarding_actions_widget.show()
+        if self._onboarding_service_action_btn is not None:
+            self._reset_widget_opacity(self._onboarding_service_action_btn)
+            self._onboarding_service_action_btn.hide()
+        self._update_service_selection_summary()
+        self._relayout_onboarding_content()
+
+    def _animate_widget_visibility(self, widget: QWidget, visible: bool, *, duration: int = 220) -> QPropertyAnimation:
+        effect = getattr(widget, "_opacity_effect", None)
+        if not isinstance(effect, QGraphicsOpacityEffect):
+            effect = QGraphicsOpacityEffect(widget)
+            widget.setGraphicsEffect(effect)
+            widget._opacity_effect = effect  # type: ignore[attr-defined]
+        animation = getattr(widget, "_opacity_animation", None)
+        if isinstance(animation, QPropertyAnimation):
+            animation.stop()
+        if visible:
+            widget.show()
+            effect.setOpacity(0.0)
+            start_value = 0.0
+            end_value = 1.0
+        else:
+            start_value = float(effect.opacity())
+            end_value = 0.0
+        animation = QPropertyAnimation(effect, b"opacity", widget)
+        animation.setDuration(duration)
+        animation.setStartValue(start_value)
+        animation.setEndValue(end_value)
+        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        if not visible:
+            animation.finished.connect(widget.hide)
+        animation.start()
+        widget._opacity_animation = animation  # type: ignore[attr-defined]
+        return animation
+
+    def _reset_widget_opacity(self, widget: QWidget | None) -> None:
+        if widget is None:
+            return
+        animation = getattr(widget, "_opacity_animation", None)
+        if isinstance(animation, QPropertyAnimation):
+            animation.stop()
+        effect = getattr(widget, "_opacity_effect", None)
+        if isinstance(effect, QGraphicsOpacityEffect):
+            effect.setOpacity(1.0)
+        widget.show()
+
+    def _run_onboarding_transition(
+        self,
+        *,
+        outgoing: QWidget | None,
+        incoming: QWidget | None,
+        out_duration: int,
+        in_duration: int,
+        overlap: int,
+        prepare_in,
+        on_finished=None,
+    ) -> None:
+        if outgoing is None or incoming is None:
+            return
+        self._onboarding_transition_token += 1
+        token = self._onboarding_transition_token
+        self._onboarding_transition_busy = True
+        self._ensure_widget_opacity_ready(outgoing)
+        self._ensure_widget_opacity_ready(incoming)
+        outgoing_effect = getattr(outgoing, "_opacity_effect", None)
+        incoming_effect = getattr(incoming, "_opacity_effect", None)
+        if not isinstance(outgoing_effect, QGraphicsOpacityEffect) or not isinstance(incoming_effect, QGraphicsOpacityEffect):
+            self._onboarding_transition_busy = False
+            return
+
+        for panel in (
+            self._onboarding_intro_panel,
+            self._onboarding_services_stage_panel,
+            self._onboarding_running_stage_panel,
+            self._onboarding_result_stage_panel,
+        ):
+            animation = getattr(panel, "_opacity_animation", None)
+            if isinstance(animation, QPropertyAnimation):
+                animation.stop()
+
+        outgoing.show()
+        outgoing.raise_()
+        outgoing_effect.setOpacity(1.0)
+        incoming.hide()
+        incoming_effect.setOpacity(0.0)
+
+        out_animation = QPropertyAnimation(outgoing_effect, b"opacity", outgoing)
+        out_animation.setDuration(out_duration)
+        out_animation.setStartValue(1.0)
+        out_animation.setEndValue(0.0)
+        out_animation.setEasingCurve(QEasingCurve.Type.InCubic)
+        outgoing._opacity_animation = out_animation  # type: ignore[attr-defined]
+        out_animation.start()
+
+        begin_delay = max(0, out_duration - max(0, overlap))
+        end_delay = max(out_duration, begin_delay + in_duration)
+
+        def _begin_in() -> None:
+            if token != self._onboarding_transition_token:
+                return
+            prepare_in(token)
+            if self._onboarding_stage_layout is not None:
+                self._onboarding_stage_layout.setCurrentWidget(incoming)
+            incoming.show()
+            incoming.raise_()
+            incoming_effect.setOpacity(0.0)
+            in_animation = QPropertyAnimation(incoming_effect, b"opacity", incoming)
+            in_animation.setDuration(in_duration)
+            in_animation.setStartValue(0.0)
+            in_animation.setEndValue(1.0)
+            in_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            incoming._opacity_animation = in_animation  # type: ignore[attr-defined]
+            in_animation.start()
+
+        QTimer.singleShot(begin_delay, _begin_in)
+        QTimer.singleShot(
+            end_delay,
+            lambda: self._finish_onboarding_transition(
+                token,
+                outgoing=outgoing,
+                incoming=incoming,
+                on_finished=on_finished,
+            ),
+        )
+
+    def _finish_onboarding_transition(
+        self,
+        token: int,
+        *,
+        outgoing: QWidget,
+        incoming: QWidget,
+        on_finished=None,
+    ) -> None:
+        if token != self._onboarding_transition_token:
+            return
+        outgoing.hide()
+        outgoing_effect = getattr(outgoing, "_opacity_effect", None)
+        incoming_effect = getattr(incoming, "_opacity_effect", None)
+        if isinstance(outgoing_effect, QGraphicsOpacityEffect):
+            outgoing_effect.setOpacity(1.0)
+        if isinstance(incoming_effect, QGraphicsOpacityEffect):
+            incoming_effect.setOpacity(1.0)
+        incoming.show()
+        incoming.raise_()
+        self._onboarding_transition_busy = False
+        if self._onboarding_stage == "services":
+            QTimer.singleShot(0, self._sync_onboarding_service_action_button)
+        if on_finished is not None:
+            on_finished(token)
+
     def _skip_onboarding(self) -> None:
         self._mark_onboarding_seen()
         self.context.settings.update(general_autotest_done=True)
@@ -6912,38 +10797,343 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(80, self._restore_sidebar_after_onboarding)
 
     def _start_onboarding_flow(self) -> None:
-        if self._onboarding_running:
+        if self._onboarding_running or self._onboarding_transition_busy:
             return
+        if self._onboarding_back_btn is not None and self._onboarding_back_btn.isVisible():
+            self._animate_widget_visibility(self._onboarding_back_btn, False, duration=140)
+        self._onboarding_stage = "running"
+        self._sync_onboarding_background_stage(animated=True)
+        self._start_onboarding_glow_orbit()
         self._onboarding_running = True
-        if self._onboarding_title_label is not None:
-            self._onboarding_title_label.setText(self._t("Подбор конфигурации", "Selecting configuration"))
-        if self._onboarding_desc_label is not None:
-            self._onboarding_desc_label.setText(
+        self._finish_start_onboarding_flow()
+        self._run_onboarding_transition(
+            outgoing=self._onboarding_services_stage_panel,
+            incoming=self._onboarding_running_stage_panel,
+            out_duration=230,
+            in_duration=200,
+            overlap=55,
+            prepare_in=lambda _token: None,
+            on_finished=lambda token: (
+                token == self._onboarding_transition_token
+                and self._run_general_tests_popup(auto_apply=True, embedded=True)
+            ),
+        )
+
+    def _finish_start_onboarding_flow(self, token: int | None = None) -> None:
+        if token is not None and token != self._onboarding_transition_token:
+            return
+        if token is not None and self._onboarding_back_btn is not None:
+            self._onboarding_back_btn.hide()
+        if self._onboarding_running_title_label is not None:
+            self._onboarding_running_title_label.setText(self._t("Подбор конфигурации", "Selecting configuration"))
+        if self._onboarding_running_desc_label is not None:
+            self._onboarding_running_desc_label.setText(
                 self._t(
                     "Сейчас приложение проверит доступные конфигурации и автоматически выберет первую полностью рабочую.",
                     "The app will now check available configurations and automatically choose the first fully working one.",
                 )
             )
-        if self._onboarding_result_card is not None:
-            self._onboarding_result_card.hide()
         if self._onboarding_progress_label is not None:
             self._onboarding_progress_label.setText(self._t("Подготовка...", "Preparing..."))
             self._onboarding_progress_label.show()
+        if self._onboarding_progress_counter_label is not None:
+            self._onboarding_progress_counter_label.setText("")
+            self._onboarding_progress_counter_label.show()
         if self._onboarding_progress_bar is not None:
             self._onboarding_progress_bar.setMaximum(100)
             self._onboarding_progress_bar.setValue(0)
             self._onboarding_progress_bar.show()
         if self._onboarding_actions_widget is not None:
             self._onboarding_actions_widget.hide()
-        self._relayout_onboarding_content()
-        self._run_general_tests_popup(auto_apply=True, embedded=True)
+        if self._onboarding_service_action_btn is not None:
+            self._onboarding_service_action_btn.hide()
+
+    def _show_onboarding_completion_stage(
+        self,
+        *,
+        success: bool,
+        chosen_id: str,
+        best_failed_targets: list[object],
+    ) -> None:
+        self._onboarding_stage = "success" if success else "failed"
+        self._sync_onboarding_background_stage(animated=True)
+
+        def _begin_completion_stage(token: int) -> None:
+            if token != self._onboarding_transition_token:
+                return
+            if self._onboarding_result_title_label is not None:
+                self._onboarding_result_title_label.setText(
+                    self._t("Настройка завершена", "Setup complete")
+                    if success
+                    else self._t("Настройка не завершена", "Setup was not completed")
+                )
+            if self._onboarding_result_desc_label is not None:
+                if success:
+                    failed_service_ids = self._service_ids_from_failed_targets(best_failed_targets)
+                    if failed_service_ids:
+                        failed_names = ", ".join(self._service_title_by_id(service_id) for service_id in failed_service_ids)
+                        text = self._t(
+                            f"Приложение выбрало лучшую доступную конфигурацию, но не смогло настроить подключение к: {failed_names}. Эти сервисы могут не работать.",
+                            f"The app selected the best available configuration, but could not configure access to: {failed_names}. These services may not work.",
+                        )
+                    else:
+                        text = self._t(
+                            "Подходящая конфигурация уже выбрана и применена. Можно перейти в главное меню.",
+                            "A suitable configuration has been selected and applied. You can continue to the main interface.",
+                        )
+                else:
+                    text = self._t(
+                        "Не удалось автоматически подобрать полностью рабочую конфигурацию. Вы можете продолжить без этого шага.",
+                        "Could not automatically find a fully working configuration. You can continue without this step.",
+                    )
+                self._onboarding_result_desc_label.setText(text)
+            if success and chosen_id and self._onboarding_result_card is not None:
+                chosen_label = self._format_general_option_label(
+                    next((item for item in self._sorted_general_options() if item["id"] == chosen_id), {"id": chosen_id, "bundle": "", "name": chosen_id})
+                )
+                if self._onboarding_found_label is not None:
+                    self._onboarding_found_label.setText(self._format_onboarding_general_line(f"General: {chosen_label}"))
+                self._reset_widget_opacity(self._onboarding_result_card)
+                self._onboarding_result_card.show()
+            elif self._onboarding_result_card is not None:
+                self._onboarding_result_card.hide()
+            if self._onboarding_actions_widget is not None:
+                self._onboarding_actions_widget.hide()
+            if self._onboarding_result_actions_widget is not None:
+                self._reset_widget_opacity(self._onboarding_result_actions_widget)
+                self._onboarding_result_actions_widget.show()
+            if self._onboarding_result_primary_btn is not None:
+                self._onboarding_result_primary_btn.setEnabled(True)
+                self._onboarding_result_primary_btn.setVisible(True)
+                self._onboarding_result_primary_btn.setText(self._t("Далее", "Next") if success else self._t("Продолжить", "Continue"))
+            if self._onboarding_secondary_btn is not None:
+                self._onboarding_secondary_btn.hide()
+        self._run_onboarding_transition(
+            outgoing=self._onboarding_running_stage_panel,
+            incoming=self._onboarding_result_stage_panel,
+            out_duration=190,
+            in_duration=210,
+            overlap=82,
+            prepare_in=_begin_completion_stage,
+        )
 
     def _finish_onboarding(self) -> None:
         self._mark_onboarding_seen()
+        self._onboarding_quick_restart = False
+        self._fade_out_onboarding_to_app()
+
+    def _fade_out_onboarding_to_app(self) -> None:
+        if self._onboarding_widget is None:
+            self._set_onboarding_visible(False)
+            self.refresh_all()
+            QTimer.singleShot(0, self._restore_sidebar_after_onboarding)
+            return
+        self._stop_onboarding_glow_orbit()
+        pixmap = self._onboarding_widget.grab()
+        top_left = self._onboarding_widget.mapTo(self, QPoint(0, 0))
+        overlay = QLabel(self)
+        overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        overlay.setPixmap(pixmap)
+        overlay.setGeometry(QRect(top_left, self._onboarding_widget.size()))
+        overlay.show()
+        overlay.raise_()
+        self._startup_snapshot_ready = True
         self._set_onboarding_visible(False)
+        self._sync_power_aura_geometry()
         self.refresh_all()
         QTimer.singleShot(0, self._restore_sidebar_after_onboarding)
-        QTimer.singleShot(80, self._restore_sidebar_after_onboarding)
+        QTimer.singleShot(0, self._sync_power_aura_geometry)
+        QTimer.singleShot(80, self._sync_power_aura_geometry)
+        effect = QGraphicsOpacityEffect(overlay)
+        overlay.setGraphicsEffect(effect)
+        effect.setOpacity(1.0)
+        anim = QPropertyAnimation(effect, b"opacity", overlay)
+        anim.setDuration(280)
+        anim.setStartValue(1.0)
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        def _finish() -> None:
+            overlay.hide()
+            overlay.deleteLater()
+            QTimer.singleShot(80, self._restore_sidebar_after_onboarding)
+
+        anim.finished.connect(_finish)
+        overlay._finish_fade_animation = anim  # type: ignore[attr-defined]
+        anim.start()
+
+    def _selected_service_ids(self) -> list[str]:
+        selected = list(self.context.settings.get().selected_service_ids or [])
+        valid = {preset.id for preset in SERVICE_PRESETS}
+        return [item for item in selected if item in valid]
+
+    def _normalize_service_ids(self, service_ids: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+        raw = {str(item).strip() for item in service_ids if str(item).strip()}
+        ordered: list[str] = []
+        for preset in SERVICE_PRESETS:
+            if preset.id in raw:
+                ordered.append(preset.id)
+        return ordered
+
+    def _apply_fortnite_service_preferences_locally(self) -> None:
+        changes: dict[str, str] = {
+            "zapret_ipset_mode": "any",
+            "zapret_game_filter_mode": "tcpudp",
+        }
+        options = self._general_options_for_current_service_tests(self._sorted_general_options())
+        for wanted in FORTNITE_GENERAL_PRIORITY:
+            match = next((option for option in options if str(option.get("name", "")).strip().lower() == wanted.lower()), None)
+            if match is not None and str(match.get("id", "")).strip():
+                changes["selected_zapret_general"] = str(match["id"])
+                break
+        self.context.settings.update(**changes)
+
+    def _on_service_card_toggled(self, service_id: str, selected: bool) -> None:
+        current = set(self._selected_service_ids())
+        selected = service_id not in current
+        if selected:
+            current.add(service_id)
+        else:
+            current.discard(service_id)
+        self._set_selected_service_ids(list(current))
+
+    def _refresh_service_cards_subset(self, service_ids: set[str], *, theme: str | None = None) -> None:
+        if not service_ids:
+            return
+        active_theme = theme or self.context.settings.get().theme
+        selected = set(self._selected_service_ids())
+        preset_map = {preset.id: preset for preset in SERVICE_PRESETS}
+        for service_id in service_ids:
+            preset = preset_map.get(service_id)
+            if preset is None:
+                continue
+            is_selected = service_id in selected
+            for card in self._service_cards_by_id.get(service_id, []):
+                try:
+                    card.blockSignals(True)
+                    card.set_icon_pixmap(self._service_icon_pixmap(preset, 34, selected=is_selected))
+                    card.set_check_pixmap(self._service_check_pixmap(10))
+                    card.set_selected(is_selected)
+                finally:
+                    try:
+                        card.blockSignals(False)
+                    except Exception:
+                        pass
+
+    def _schedule_selected_services_backend_sync(self, normalized: list[str], revision: int) -> None:
+        self._pending_selected_service_ids = list(normalized)
+        self._pending_selected_services_revision = int(revision)
+        self._optimistic_selected_service_ids = list(normalized)
+        self._services_sync_timer.start(140)
+
+    def _restore_optimistic_service_selection_if_needed(self) -> None:
+        if self._optimistic_selected_service_ids is None:
+            return
+        if self._services_selection_acked_revision >= self._services_selection_revision:
+            self._optimistic_selected_service_ids = None
+            return
+        normalized = self._normalize_service_ids(self._optimistic_selected_service_ids)
+        if normalized != self._selected_service_ids():
+            self.context.settings.update(selected_service_ids=normalized)
+            if "fortnite" in normalized:
+                self._apply_fortnite_service_preferences_locally()
+
+    def _flush_selected_services_backend_sync(self) -> None:
+        pending = list(self._pending_selected_service_ids or [])
+        revision = int(self._pending_selected_services_revision)
+        self._pending_selected_service_ids = None
+        self._pending_selected_services_revision = 0
+        if self.context.backend is None:
+            return
+        try:
+            self._submit_backend_task(
+                "set_selected_services",
+                {"service_ids": pending, "client_revision": revision},
+                action_id="__services_selection__",
+            )
+        except Exception as error:
+            self._show_error(self._t("Сервисы", "Services"), str(error))
+
+    def _set_selected_service_ids(self, service_ids: list[str] | tuple[str, ...] | set[str]) -> None:
+        current = self._selected_service_ids()
+        normalized = self._normalize_service_ids(service_ids)
+        if normalized != current:
+            self._services_selection_revision += 1
+            revision = self._services_selection_revision
+            self.context.settings.update(selected_service_ids=normalized)
+            if "fortnite" in normalized:
+                self._apply_fortnite_service_preferences_locally()
+            changed = set(current).symmetric_difference(normalized)
+            self._refresh_service_cards_subset(changed)
+            self._update_service_selection_summary()
+            self._schedule_selected_services_backend_sync(normalized, revision)
+            return
+        self._update_service_selection_summary()
+
+    def _update_service_selection_summary(self) -> None:
+        count = len(self._selected_service_ids())
+        total = len(SERVICE_PRESETS)
+        if self._services_count_label is not None:
+            self._services_count_label.setText(
+                self._t(
+                    f"Выбрано: {count} из {total}",
+                    f"Selected: {count} of {total}",
+                )
+            )
+        if self._onboarding_services_count_label is not None:
+            self._onboarding_services_count_label.hide()
+            if count >= self._onboarding_services_minimum:
+                text = self._t(
+                    f"Выбрано {count} сервисов. Можно продолжать.",
+                    f"{count} services selected. You can continue.",
+                )
+            else:
+                remaining = self._onboarding_services_minimum - count
+                text = self._t(
+                    f"Нужно выбрать ещё {remaining}, минимум {self._onboarding_services_minimum}.",
+                    f"Choose {remaining} more, at least {self._onboarding_services_minimum} total.",
+                )
+            self._onboarding_services_count_label.setText(text)
+            good = count >= self._onboarding_services_minimum
+            color = "#4f73d9" if (good and is_light_theme(self.context.settings.get().theme)) else "#b86b4b" if is_light_theme(self.context.settings.get().theme) else "#7ea5ff" if good else "#d18a5e"
+            self._onboarding_services_count_label.setStyleSheet(
+                f"color: {color}; background: transparent;"
+            )
+        if self._onboarding_primary_btn is not None and self._onboarding_stage == "services":
+            self._onboarding_primary_btn.setEnabled(False)
+            self._onboarding_primary_btn.setVisible(False)
+        if self._onboarding_service_action_btn is not None:
+            self._onboarding_service_action_btn.set_selection_state(
+                count,
+                self._onboarding_services_minimum,
+                text=self._t("Продолжить", "Continue"),
+            )
+            self._position_onboarding_service_action()
+
+    def refresh_services(self) -> None:
+        theme = self.context.settings.get().theme
+        selected = set(self._selected_service_ids())
+        for preset in SERVICE_PRESETS:
+            title, description = self._service_card_texts(preset)
+            is_selected = preset.id in selected
+            for card in self._service_cards_by_id.get(preset.id, []):
+                try:
+                    card.blockSignals(True)
+                    card.set_theme(theme)
+                    card.set_texts(title, description)
+                    card.set_icon_pixmap(self._service_icon_pixmap(preset, 34, selected=is_selected))
+                    card.set_check_pixmap(self._service_check_pixmap(10))
+                    card.set_selected(is_selected)
+                finally:
+                    try:
+                        card.blockSignals(False)
+                    except Exception:
+                        pass
+        self._update_service_selection_summary()
+        if self._services_grid is not None:
+            self._services_grid.updateGeometry()
+        if self._onboarding_services_grid is not None:
+            self._onboarding_services_grid.updateGeometry()
 
     def _restart_zapret_worker(self) -> None:
         self.context.settings.save()
@@ -6952,6 +11142,10 @@ class MainWindow(QMainWindow):
         self._ui_signals.toggle_done.emit()
 
     def _on_component_action_done(self, action_id: str) -> None:
+        if action_id == "goshkow-vpn":
+            self._set_power_vpn_switch_pending(False)
+            self._finish_vpn_mode_power_transition()
+
         if action_id == "__settings__":
             self._hide_loading_overlay()
             self._mark_dirty("dashboard", "components", "files", "tray")
@@ -7004,12 +11198,14 @@ class MainWindow(QMainWindow):
     def _run_general_tests_popup(self, auto_apply: bool = False, embedded: bool = False) -> None:
         if self._general_test_running:
             return
-        options = self._sorted_general_options()
+        options = self._general_options_for_current_service_tests(self._sorted_general_options())
         if not options:
             if embedded:
                 self._onboarding_running = False
                 if self._onboarding_progress_label is not None:
                     self._onboarding_progress_label.hide()
+                if self._onboarding_progress_counter_label is not None:
+                    self._onboarding_progress_counter_label.hide()
                 if self._onboarding_progress_bar is not None:
                     self._onboarding_progress_bar.hide()
                 if self._onboarding_actions_widget is not None:
@@ -7022,6 +11218,7 @@ class MainWindow(QMainWindow):
         self._general_test_show_results = True
         self._general_test_auto_apply = auto_apply
         self._general_test_embedded = embedded
+        self._general_test_original_general = str(self.context.settings.get().selected_zapret_general or "")
         self._general_test_started_at = time.time()
         self._general_test_current_index = 0
         self._general_test_total = len(options)
@@ -7037,6 +11234,7 @@ class MainWindow(QMainWindow):
             self._general_test_dialog = None
             self._general_test_status_label = self._onboarding_progress_label
             self._general_test_eta_label = None
+            self._general_test_counter_label = self._onboarding_progress_counter_label
             self._general_test_progress_bar = self._onboarding_progress_bar
             self._start_next_general_test()
             return
@@ -7060,11 +11258,16 @@ class MainWindow(QMainWindow):
         bar.setRange(0, 100)
         bar.setValue(0)
         dialog.body_layout.addWidget(bar)
+        counter = QLabel("")
+        counter.setProperty("class", "muted")
+        counter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dialog.body_layout.addWidget(counter)
         dialog.prepare_and_center()
         dialog.show()
         self._general_test_dialog = dialog
         self._general_test_status_label = status
         self._general_test_eta_label = eta
+        self._general_test_counter_label = counter
         self._general_test_progress_bar = bar
         dialog.rejected.connect(self._cancel_general_tests)
         self._update_general_test_eta()
@@ -7073,40 +11276,113 @@ class MainWindow(QMainWindow):
 
     def _run_general_tests_worker(self) -> None:
         results = self.context.processes.run_general_diagnostics(
-            progress_callback=lambda current, total, name: self._ui_signals.general_test_progress.emit(current, total, name),
+            progress_callback=lambda current, total, name: self._ui_signals.general_test_progress.emit(
+                {
+                    "target_current": current,
+                    "target_total": total,
+                    "target_name": name,
+                    "config_index": max(1, self._general_test_next_option_index + 1),
+                    "config_total": max(1, self._general_test_total),
+                }
+            ),
             stop_callback=lambda: self._general_test_cancelled,
         )
         self._ui_signals.general_test_done.emit(results)
 
     def _cancel_general_tests(self) -> None:
+        if not self._general_test_running and not self._general_test_task_id:
+            return
         self._general_test_cancelled = True
         self._general_test_show_results = False
+        self._general_test_running = False
         self._general_test_eta_timer.stop()
         if self.context.backend is not None and self._general_test_task_id:
             self.context.backend.cancel(self._general_test_task_id)
+        original = str(self._general_test_original_general or "").strip()
+        if original:
+            self.context.settings.update(selected_zapret_general=original)
+        if self._general_test_dialog is not None:
+            self._general_test_dialog = None
+        self._general_test_status_label = None
+        self._general_test_eta_label = None
+        self._general_test_counter_label = None
+        self._general_test_progress_bar = None
+        self._general_test_auto_apply = False
+        self._clear_windows_taskbar_progress()
+        if self._general_test_embedded:
+            self._general_test_embedded = False
+            self._onboarding_running = False
+            if self._onboarding_progress_label is not None:
+                self._onboarding_progress_label.setText(self._t("Подбор конфигурации остановлен.", "Configuration selection stopped."))
+            if self._onboarding_primary_btn is not None:
+                self._onboarding_primary_btn.setEnabled(True)
+                self._onboarding_primary_btn.setVisible(True)
+                self._onboarding_primary_btn.setText(self._t("Далее", "Next"))
+            if self._onboarding_actions_widget is not None:
+                self._onboarding_actions_widget.show()
+        self._mark_dirty("dashboard", "components", "tray")
 
     def _start_next_general_test(self) -> None:
+        if self._general_test_cancelled:
+            return
         if self._general_test_next_option_index >= len(self._general_test_options):
             self._on_general_test_done(list(self._general_test_results))
             return
         option = self._general_test_options[self._general_test_next_option_index]
+        config_index = self._general_test_next_option_index + 1
+        if self._general_test_progress_bar is not None:
+            self._general_test_progress_bar.setMaximum(100)
+            self._general_test_progress_bar.setValue(0)
+        if self._general_test_counter_label is not None:
+            self._general_test_counter_label.setText(self._format_general_test_counter(config_index, self._general_test_total))
+            self._general_test_counter_label.show()
+        self._set_windows_taskbar_progress(0)
         self._general_test_task_id = self._submit_backend_task(
             "run_general_diagnostic_single",
-            {"general_id": option["id"]},
+            {
+                "general_id": option["id"],
+                "ipset_mode": option.get("ipset_mode", "loaded"),
+                "game_mode": option.get("game_mode", "tcpudp"),
+            },
             action_id="__general_test__",
         )
 
-    def _on_general_test_progress(self, current: int, total: int, name: str) -> None:
+    def _format_general_test_counter(self, current: int, total: int) -> str:
+        return self._t(
+            f"{max(1, int(current))} конфигурация из {max(1, int(total))}",
+            f"Configuration {max(1, int(current))} of {max(1, int(total))}",
+        )
+
+    def _on_general_test_progress(self, payload: object) -> None:
+        if isinstance(payload, dict):
+            current = int(payload.get("target_current", payload.get("current", 0)) or 0)
+            total = int(payload.get("target_total", payload.get("total", 0)) or 0)
+            name = str(payload.get("target_name", payload.get("name", "")) or "")
+            config_index = int(payload.get("config_index", self._general_test_next_option_index + 1) or 1)
+            config_total = int(payload.get("config_total", self._general_test_total) or self._general_test_total or 1)
+        else:
+            current = 0
+            total = 0
+            name = ""
+            config_index = self._general_test_next_option_index + 1
+            config_total = self._general_test_total or 1
         self._general_test_current_index = current
         self._general_test_last_progress_at = time.time()
+        progress_value = 0
+        if total > 0:
+            progress_value = int(round((max(0, min(total, current)) / max(1, total)) * 100))
         if self._general_test_progress_bar is not None:
-            self._general_test_progress_bar.setMaximum(max(1, self._general_test_total))
-            self._general_test_progress_bar.setValue(max(0, min(self._general_test_next_option_index, self._general_test_total)))
+            self._general_test_progress_bar.setMaximum(100)
+            self._general_test_progress_bar.setValue(max(0, min(100, progress_value)))
+        if self._general_test_counter_label is not None:
+            self._general_test_counter_label.setText(self._format_general_test_counter(config_index, config_total))
+            self._general_test_counter_label.show()
+        self._set_windows_taskbar_progress(progress_value)
         if self._general_test_status_label is not None:
             self._general_test_status_label.setText(
                 self._t(
-                    f"Проверяется: {name}",
-                    f"Checking: {name}",
+                    f"Проверяется: {name}" if name else "Проверяется текущая конфигурация...",
+                    f"Checking: {name}" if name else "Checking current configuration...",
                 )
             )
         self._update_general_test_eta()
@@ -7128,13 +11404,20 @@ class MainWindow(QMainWindow):
         )
 
     def _on_general_test_done(self, results: object) -> None:
+        if self._general_test_cancelled:
+            self._general_test_task_id = None
+            self._general_test_auto_apply = False
+            self._general_test_embedded = False
+            self._clear_windows_taskbar_progress()
+            return
         if isinstance(results, dict) and results.get("id"):
             self._general_test_task_id = None
             self._general_test_results.append(results)
             self._general_test_next_option_index += 1
             if self._general_test_progress_bar is not None:
-                self._general_test_progress_bar.setMaximum(max(1, self._general_test_total))
-                self._general_test_progress_bar.setValue(self._general_test_next_option_index)
+                self._general_test_progress_bar.setMaximum(100)
+                self._general_test_progress_bar.setValue(100)
+            self._set_windows_taskbar_progress(100)
             passed = int(results.get("passed_targets", 0) or 0)
             total_targets = int(results.get("total_targets", 0) or 0)
             self._general_test_remaining_budget_seconds = max(
@@ -7170,8 +11453,12 @@ class MainWindow(QMainWindow):
                     if use_found:
                         chosen_id = self._general_test_found_working_id
                         if chosen_id:
+                            chosen_raw = next((raw for raw in self._general_test_results if str(raw.get("id", "")) == chosen_id), {})
+                            current_settings = self.context.settings.get()
                             self.context.settings.update(
                                 selected_zapret_general=chosen_id,
+                                zapret_ipset_mode=str(chosen_raw.get("ipset_mode", current_settings.zapret_ipset_mode) or current_settings.zapret_ipset_mode),
+                                zapret_game_filter_mode=str(chosen_raw.get("game_mode", current_settings.zapret_game_filter_mode) or current_settings.zapret_game_filter_mode),
                                 general_autotest_done=True,
                             )
                             self._set_general_favorite(chosen_id, True)
@@ -7193,7 +11480,11 @@ class MainWindow(QMainWindow):
         self._general_test_dialog = None
         self._general_test_status_label = None
         self._general_test_eta_label = None
+        self._general_test_counter_label = None
         self._general_test_progress_bar = None
+        self._clear_windows_taskbar_progress()
+        if self.isMinimized() or not self.isActiveWindow():
+            self._request_windows_attention()
 
         checked = results if isinstance(results, list) else []
         working: list[str] = []
@@ -7203,6 +11494,7 @@ class MainWindow(QMainWindow):
         best_total = 0
         best_id = ""
         best_working_id = ""
+        best_failed_targets: list[object] = []
         for raw in checked:
             if not isinstance(raw, dict):
                 continue
@@ -7220,6 +11512,7 @@ class MainWindow(QMainWindow):
                 best_total = total
                 best_label = label
                 best_id = str(raw.get("id", ""))
+                best_failed_targets = list(raw.get("failed_targets", []) or [])
             if raw.get("status") == "ok":
                 working.append(label)
                 if not best_working_id:
@@ -7231,8 +11524,12 @@ class MainWindow(QMainWindow):
         chosen_id = best_working_id or best_id
         auto_applied = False
         if self._general_test_auto_apply and chosen_id:
+            chosen_raw = next((raw for raw in checked if isinstance(raw, dict) and str(raw.get("id", "")) == chosen_id), {})
+            current_settings = self.context.settings.get()
             self.context.settings.update(
                 selected_zapret_general=chosen_id,
+                zapret_ipset_mode=str(chosen_raw.get("ipset_mode", current_settings.zapret_ipset_mode) or current_settings.zapret_ipset_mode),
+                zapret_game_filter_mode=str(chosen_raw.get("game_mode", current_settings.zapret_game_filter_mode) or current_settings.zapret_game_filter_mode),
                 general_autotest_done=True,
             )
             self._set_general_favorite(chosen_id, True)
@@ -7243,69 +11540,16 @@ class MainWindow(QMainWindow):
         if self._general_test_embedded:
             self._general_test_embedded = False
             self._onboarding_running = False
-            if chosen_id and self._onboarding_result_card is not None:
-                chosen_label = self._format_general_option_label(
-                    next((item for item in self._sorted_general_options() if item["id"] == chosen_id), {"id": chosen_id, "bundle": "", "name": chosen_id})
-                )
-                if self._onboarding_title_label is not None:
-                    self._onboarding_title_label.setText(self._t("Настройка завершена", "Setup complete"))
-                if self._onboarding_desc_label is not None:
-                    self._onboarding_desc_label.setText(
-                        self._t(
-                            "Подходящая конфигурация уже выбрана и применена. Можно перейти в главное меню.",
-                            "A suitable configuration has been selected and applied. You can continue to the main interface.",
-                        )
-                    )
-                if self._onboarding_found_label is not None:
-                    self._onboarding_found_label.setText(self._format_onboarding_general_line(f"General: {chosen_label}"))
-                if self._onboarding_progress_label is not None:
-                    self._onboarding_progress_label.hide()
-                if self._onboarding_progress_bar is not None:
-                    self._onboarding_progress_bar.hide()
-                self._onboarding_result_card.show()
-                if self._onboarding_actions_widget is not None:
-                    self._onboarding_actions_widget.show()
-                if self._onboarding_primary_btn is not None:
-                    self._onboarding_primary_btn.setEnabled(True)
-                    self._onboarding_primary_btn.setText(self._t("Далее", "Continue"))
-                    try:
-                        self._onboarding_primary_btn.clicked.disconnect()
-                    except Exception:
-                        pass
-                    self._onboarding_primary_btn.clicked.connect(lambda: self._finish_onboarding())
-                if self._onboarding_secondary_btn is not None:
-                    self._onboarding_secondary_btn.hide()
-                self._relayout_onboarding_content()
-            else:
-                if self._onboarding_title_label is not None:
-                    self._onboarding_title_label.setText(self._t("Настройка не завершена", "Setup was not completed"))
-                if self._onboarding_desc_label is not None:
-                    self._onboarding_desc_label.setText(
-                        self._t(
-                            "Не удалось автоматически подобрать полностью рабочую конфигурацию. Вы можете продолжить без этого шага.",
-                            "Could not automatically find a fully working configuration. You can continue without this step.",
-                        )
-                    )
-                if self._onboarding_progress_label is not None:
-                    self._onboarding_progress_label.hide()
-                if self._onboarding_progress_bar is not None:
-                    self._onboarding_progress_bar.hide()
-                if self._onboarding_result_card is not None:
-                    self._onboarding_result_card.hide()
-                if self._onboarding_actions_widget is not None:
-                    self._onboarding_actions_widget.show()
-                if self._onboarding_primary_btn is not None:
-                    self._onboarding_primary_btn.setEnabled(True)
-                    self._onboarding_primary_btn.setText(self._t("Продолжить", "Continue"))
-                    try:
-                        self._onboarding_primary_btn.clicked.disconnect()
-                    except Exception:
-                        pass
-                    self._onboarding_primary_btn.clicked.connect(lambda: self._finish_onboarding())
-                if self._onboarding_secondary_btn is not None:
-                    self._onboarding_secondary_btn.hide()
-                self._relayout_onboarding_content()
+            self._stop_onboarding_glow_orbit()
+            if self._onboarding_services_panel is not None:
+                self._onboarding_services_panel.hide()
+            self._show_onboarding_completion_stage(
+                success=bool(chosen_id and self._onboarding_result_card is not None),
+                chosen_id=chosen_id,
+                best_failed_targets=best_failed_targets,
+            )
             self.context.settings.update(general_autotest_done=True)
+            self._mark_onboarding_seen()
             self._submit_backend_task("set_general_autotest_done", {"done": True}, action_id="__autotest_declined__")
             return
 
@@ -7356,6 +11600,13 @@ class MainWindow(QMainWindow):
             return
         badge.value_label.setText(text)
         badge.icon_label.setPixmap(self._icon(icon_name).pixmap(18, 18))
+
+    def _set_badge_title(self, key: str, title: str) -> None:
+        badge = self._status_badges.get(key)
+        if not badge:
+            return
+        badge.title = title
+        badge.title_label.setText(title)
 
     def _show_info(self, title: str, text: str) -> None:
         dialog = AppDialog(self, self.context, title)
@@ -7472,7 +11723,10 @@ class MainWindow(QMainWindow):
             components = list(self._component_defs().values())
         if not states and not explicit_payload:
             states = self._component_states()
+        order = {"zapret": 0, "goshkow-vpn": 1, "tg-ws-proxy": 2}
+        components = sorted(components, key=lambda item: order.get(item.id, 99))
         self.components_list.clear()
+        self._components_card_by_id = {}
         if not self._startup_snapshot_ready and not components:
             if self._components_cards_layout is None:
                 return
@@ -7541,27 +11795,55 @@ class MainWindow(QMainWindow):
                 "Локальный Telegram Proxy. Позволяет подключаться к Telegram в обход блокировок, маскируясь под обычный https-трафик.",
                 "Local Telegram Proxy. Lets Telegram connect through restrictions by blending in with regular HTTPS traffic.",
             ),
+            "goshkow-vpn": self._t(
+                "Авторская VPN-подписка без ограничений по трафику и количеству устройств. Доступна на смартфонах, ПК, ноутбуках и других устройствах. Первые 10 дней подписки бесплатно.",
+                "Author VPN subscription with no traffic or device limits. Available on phones, PCs, laptops, and other devices. The first 10 days are free.",
+            ),
         }
-        icons = {"zapret": "component_zapret.svg", "tg-ws-proxy": "component_tg.svg"}
+        icons = {"zapret": "component_zapret.svg", "tg-ws-proxy": "component_tg.svg", "goshkow-vpn": self._vpn_icon_name()}
+        vpn_state = {}
+        if isinstance(payload, dict) and isinstance(payload.get("goshkow_vpn"), dict):
+            vpn_state = dict(payload.get("goshkow_vpn") or {})
+        elif getattr(self.context, "vpn", None) is not None:
+            try:
+                vpn_state = self.context.vpn.state()
+            except Exception:
+                vpn_state = {}
         component_cards: list[QFrame] = []
 
         for index, component in enumerate(components):
             state = states.get(component.id)
             status_text, _status_icon = self._component_badge_state(component, state, any_running=False)
-            display_name = {"zapret": "Zapret", "tg-ws-proxy": "Tg-Ws-Proxy"}.get(component.id, component.name)
+            display_name = {"zapret": "Zapret", "tg-ws-proxy": "Tg-Ws-Proxy", "goshkow-vpn": "goshkow vpn"}.get(component.id, component.name)
             card, card_layout = self._card()
             card.setMinimumWidth(360)
-            card.setMinimumHeight(300)
-            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+            self._components_card_by_id[component.id] = card
             icon = QLabel()
             icon_size = 38 if component.id in {"tg-ws-proxy"} else 36
             icon.setPixmap(self._icon(icons.get(component.id, "components.svg")).pixmap(icon_size, icon_size))
             icon_row = QHBoxLayout()
-            icon_row.setContentsMargins(0, 12, 0, 0)
+            icon_row.setContentsMargins(0, 6, 0, 0)
             icon_row.setSpacing(8)
             icon_row.addWidget(icon, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             icon_row.addStretch(1)
-            if component.id in {"zapret", "tg-ws-proxy"}:
+            if component.id in {"zapret", "tg-ws-proxy"} or (component.id == "goshkow-vpn" and str(vpn_state.get("subscription_state", "") or "") == "valid"):
+                settings_icon_btn = QToolButton()
+                settings_icon_btn.setProperty("class", "action")
+                settings_icon_btn.setIcon(self._icon("settings.svg"))
+                settings_icon_btn.setIconSize(QSize(16, 16))
+                settings_icon_btn.setFixedSize(30, 30)
+                settings_icon_btn.setToolTip(
+                    self._t("Настройки Zapret", "Zapret settings")
+                    if component.id == "zapret"
+                    else self._t("Настройки TG WS Proxy", "TG WS Proxy settings")
+                    if component.id == "tg-ws-proxy"
+                    else self._t("Настройки goshkow vpn", "goshkow vpn settings")
+                )
+                settings_icon_btn.clicked.connect(lambda _=False, cid=component.id: self._open_component_settings(cid))
+                self._attach_button_animations(settings_icon_btn)
+                icon_row.addWidget(settings_icon_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+            if component.id in {"zapret", "tg-ws-proxy", "goshkow-vpn"}:
                 source_icon_btn = QToolButton()
                 source_icon_btn.setProperty("class", "action")
                 source_icon_btn.setIcon(self._icon("external.svg"))
@@ -7571,21 +11853,22 @@ class MainWindow(QMainWindow):
                 source_icon_btn.clicked.connect(lambda _=False, url=component.source: self._open_update_link(url))
                 self._attach_button_animations(source_icon_btn)
                 icon_row.addWidget(source_icon_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
-                update_icon_btn = QToolButton()
-                update_icon_btn.setProperty("class", "action")
-                update_icon_btn.setIcon(self._icon("refresh.svg"))
-                update_icon_btn.setIconSize(QSize(16, 16))
-                update_icon_btn.setFixedSize(30, 30)
-                update_icon_btn.setToolTip(
-                    self._t("Обновить Zapret", "Update Zapret")
-                    if component.id == "zapret"
-                    else self._t("Обновить TG WS Proxy", "Update TG WS Proxy")
-                )
-                update_icon_btn.clicked.connect(
-                    self._update_zapret_runtime if component.id == "zapret" else self._update_tg_ws_proxy_runtime
-                )
-                self._attach_button_animations(update_icon_btn)
-                icon_row.addWidget(update_icon_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+                if component.id != "goshkow-vpn":
+                    update_icon_btn = QToolButton()
+                    update_icon_btn.setProperty("class", "action")
+                    update_icon_btn.setIcon(self._icon("refresh.svg"))
+                    update_icon_btn.setIconSize(QSize(16, 16))
+                    update_icon_btn.setFixedSize(30, 30)
+                    update_icon_btn.setToolTip(
+                        self._t("Обновить Zapret", "Update Zapret")
+                        if component.id == "zapret"
+                        else self._t("Обновить TG WS Proxy", "Update TG WS Proxy")
+                    )
+                    update_icon_btn.clicked.connect(
+                        self._update_zapret_runtime if component.id == "zapret" else self._update_tg_ws_proxy_runtime
+                    )
+                    self._attach_button_animations(update_icon_btn)
+                    icon_row.addWidget(update_icon_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
             card_layout.addLayout(icon_row)
 
             title = QLabel(display_name)
@@ -7593,20 +11876,25 @@ class MainWindow(QMainWindow):
             title.setWordWrap(True)
             card_layout.addWidget(title)
 
-            desc = QLabel(descriptions.get(component.id, component.description))
+            description_text = descriptions.get(component.id, component.description)
+            if component.id == "goshkow-vpn" and str(vpn_state.get("subscription_state", "") or "") == "valid":
+                description_text = self._t(
+                    "Авторский VPN без ограничений по трафику и количеству устройств.",
+                    "Author VPN with no traffic or device limits.",
+                )
+            desc = QLabel(description_text)
             desc.setProperty("class", "muted")
             desc.setWordWrap(True)
             card_layout.addWidget(desc)
 
             details = QLabel(
-                f"Author: {'Flowseal'}\n"
-                f"{self._t('Status', 'Status')}: {status_text}\n"
-                f"{self._t('Version', 'Version')}: {component.version}"
+                f"{self._t('Автор', 'Author')}: {'goshkow' if component.id == 'goshkow-vpn' else 'Flowseal'}\n"
+                f"{self._t('Статус', 'Status')}: {status_text}\n"
+                f"{self._t('Версия', 'Version')}: {component.version}"
             )
             details.setProperty("class", "muted")
             details.setWordWrap(True)
             card_layout.addWidget(details)
-            card_layout.addStretch(1)
 
             enabled_text = self._t("включен", "enabled") if component.enabled else self._t("выключен", "disabled")
             participation = QLabel(f"{self._t('Участие в ON/OFF', 'ON/OFF participation')}: {enabled_text}")
@@ -7674,8 +11962,9 @@ class MainWindow(QMainWindow):
             if component.id == "tg-ws-proxy":
                 telegram_link = QLabel()
                 telegram_link.setProperty("class", "muted")
+                link_color = "#2563eb" if is_light_theme(self.context.settings.get().theme) else "#60a5fa"
                 telegram_link.setText(
-                    f'<a href="tg-download://telegram-desktop">{self._t("Скачать Telegram Desktop", "Download Telegram Desktop")}</a>'
+                    f'<a style="color:{link_color};" href="tg-download://telegram-desktop">{self._t("Скачать Telegram Desktop", "Download Telegram Desktop")}</a>'
                 )
                 telegram_link.setTextFormat(Qt.TextFormat.RichText)
                 telegram_link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
@@ -7686,21 +11975,25 @@ class MainWindow(QMainWindow):
                 connect_btn.clicked.connect(self._prompt_tg_proxy_connect)
                 self._attach_button_animations(connect_btn)
                 card_layout.addWidget(connect_btn)
+            if component.id == "goshkow-vpn":
+                self._add_goshkow_vpn_controls(card_layout, vpn_state, state)
             if state is not None and getattr(state, "last_error", ""):
                 error_label = QLabel(str(getattr(state, "last_error", "")))
                 error_label.setProperty("class", "muted")
                 error_label.setWordWrap(True)
                 card_layout.addWidget(error_label)
 
-            toggle_btn = QPushButton(
-                self._t("Выключить компонент", "Disable component")
-                if component.enabled
-                else self._t("Включить компонент", "Enable component")
-            )
-            toggle_btn.setProperty("class", "danger" if component.enabled else "primary")
-            toggle_btn.clicked.connect(lambda _=False, cid=component.id, btn=toggle_btn: self._toggle_component_card(cid, btn))
-            self._attach_button_animations(toggle_btn)
-            card_layout.addWidget(toggle_btn)
+            vpn_configured = str(vpn_state.get("subscription_state", "") or "") == "valid"
+            if component.id != "goshkow-vpn" or vpn_configured:
+                toggle_btn = QPushButton(
+                    self._t("Выключить компонент", "Disable component")
+                    if component.enabled
+                    else self._t("Включить компонент", "Enable component")
+                )
+                toggle_btn.setProperty("class", "danger" if component.enabled else "primary")
+                toggle_btn.clicked.connect(lambda _=False, cid=component.id, btn=toggle_btn: self._toggle_component_card(cid, btn))
+                self._attach_button_animations(toggle_btn)
+                card_layout.addWidget(toggle_btn)
             component_cards.append(card)
             self._components_cards_layout.addWidget(
                 card,
@@ -7709,10 +12002,103 @@ class MainWindow(QMainWindow):
                 Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
             )
         self._sync_component_card_layout(component_cards)
+        if self._components_scroll_target_component_id:
+            QTimer.singleShot(0, self._ensure_components_scroll_target_visible)
+            QTimer.singleShot(120, self._ensure_components_scroll_target_visible)
+
+    def _add_goshkow_vpn_controls(
+        self,
+        layout: QVBoxLayout,
+        vpn_state: dict[str, object],
+        component_state: ComponentState | None = None,
+    ) -> None:
+        subscription_state = str(vpn_state.get("subscription_state", "empty") or "empty")
+        running = bool(component_state is not None and str(getattr(component_state, "status", "") or "") == "running")
+        configured = subscription_state == "valid" or running
+        invalid = subscription_state == "invalid"
+
+        if not configured:
+            access_btn = QPushButton(self._t("10 дней бесплатно", "10 days free"))
+            access_btn.setProperty("class", "primary")
+            access_btn.clicked.connect(lambda: self._open_external_url("https://vpn.goshkow.ru"))
+            self._attach_button_animations(access_btn)
+            layout.addWidget(access_btn)
+
+        if not configured:
+            sub_row = QHBoxLayout()
+            sub_row.setContentsMargins(0, 0, 0, 0)
+            sub_row.setSpacing(8)
+            sub_input = QLineEdit()
+            sub_input.setPlaceholderText("https://vpn.goshkow.ru/sub/...")
+            sub_input.setText(str(vpn_state.get("subscription_url", "") or ""))
+            import_btn = QPushButton(self._t("Импорт", "Import"))
+            import_btn.clicked.connect(lambda _=False, field=sub_input: self._import_goshkow_vpn_subscription(field.text()))
+            self._attach_button_animations(import_btn)
+            sub_row.addWidget(sub_input, 1)
+            sub_row.addWidget(import_btn, 0)
+            layout.addLayout(sub_row)
+
+        if invalid:
+            invalid_label = QLabel(str(vpn_state.get("last_error", "") or self._t("Ссылка подписки невалидна.", "Subscription link is invalid.")))
+            invalid_label.setProperty("class", "muted")
+            invalid_label.setWordWrap(True)
+            layout.addWidget(invalid_label)
+
+        if not configured:
+            return
+
+        servers = [item for item in list(vpn_state.get("servers", []) or []) if isinstance(item, dict)]
+        server_combo = ClickSelectComboBox()
+        selected_server = str(vpn_state.get("selected_server_id", "") or "")
+        if servers:
+            for server in servers:
+                server_combo.addItem(self._display_goshkow_vpn_server_name(server), str(server.get("id", "") or ""))
+            for index in range(server_combo.count()):
+                if str(server_combo.itemData(index) or "") == selected_server:
+                    server_combo.setCurrentIndex(index)
+                    break
+            server_combo.currentIndexChanged.connect(
+                lambda _=0, combo=server_combo: self._update_goshkow_vpn_settings({"selected_server_id": str(combo.currentData() or "")})
+            )
+        else:
+            server_combo.addItem(self._t("Добавьте подписку, чтобы увидеть локации", "Add a subscription to see locations"), "")
+            server_combo.setEnabled(False)
+        layout.addWidget(server_combo)
+
+    def _display_goshkow_vpn_server_name(self, server: dict[str, object]) -> str:
+        raw_name = str(server.get("name", "") or server.get("host", "") or "goshkow vpn")
+        cleaned = raw_name
+        for token in ("🇫🇮", "🇳🇱", "🇩🇪", "🇷🇺", "🇺🇸", "🇨🇦", "🇸🇪", "🇳🇴", "🇩🇰", "🇵🇱", "🇫🇷", "🇨🇿", "🇸🇰"):
+            cleaned = cleaned.replace(token, "")
+        cleaned = cleaned.replace(" - ", " ").replace(" #", " ").replace("#", "")
+        cleaned = cleaned.replace("обход ", "обход ")
+        cleaned = " ".join(cleaned.split()).strip(" -–—")
+        return cleaned or str(server.get("host", "") or "goshkow vpn")
+
+    def _format_bytes(self, value: int) -> str:
+        size = float(max(0, int(value)))
+        for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+            if size < 1024.0 or unit == "ТБ":
+                return f"{size:.1f} {unit}" if unit != "Б" else f"{int(size)} {unit}"
+            size /= 1024.0
+        return f"{int(value)} Б"
+
+    def _select_combo_value(self, combo: QComboBox, value: str) -> None:
+        for index in range(combo.count()):
+            if str(combo.itemData(index) or "") == value:
+                combo.setCurrentIndex(index)
+                return
+
+    def _import_goshkow_vpn_subscription(self, url: str) -> None:
+        self._submit_backend_task("import_goshkow_vpn_subscription", {"url": url})
+
+    def _update_goshkow_vpn_settings(self, payload: dict[str, object]) -> None:
+        self._submit_backend_task("update_goshkow_vpn_settings", payload)
 
     def _prompt_tg_proxy_connect(self) -> None:
         try:
             self.context.processes.prompt_telegram_proxy_link()
+            self._notify_telegram_proxy_status_from_payload({"telegram_proxy": self.context.processes.consume_telegram_proxy_launch_info() or {}})
         except Exception as error:
             self._show_error(
                 self._t("TG Proxy", "TG Proxy"),
@@ -7744,12 +12130,13 @@ class MainWindow(QMainWindow):
             else "https://github.com/telegramdesktop/tdesktop/releases/latest/download/tsetup-x64.exe"
         )
         try:
-            request = Request(
+            payload = self.context.updates.github.github_json(
                 "https://api.github.com/repos/telegramdesktop/tdesktop/releases/latest",
-                headers={"User-Agent": f"ZapretHub/{__version__}"},
+                timeout=10,
+                purpose="telegram-release-metadata",
             )
-            with urlopen(request, timeout=10) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                return fallback
             assets = payload.get("assets") or []
             preferred_markers = ("arm64", "arm") if want_arm else ("x64",)
             for asset in assets:
@@ -7798,16 +12185,29 @@ class MainWindow(QMainWindow):
         if viewport.height() <= 0:
             QTimer.singleShot(0, self._sync_component_card_layout)
             return
-        bottom_margin = self._components_cards_layout.contentsMargins().bottom()
-        available_height = max(320, viewport.height() - bottom_margin)
-        spacing = self._components_cards_layout.verticalSpacing()
-        rows = max(1, (len(widgets) + 1) // 2)
-        if rows == 1:
-            target_height = max(300, available_height - 2)
-        else:
-            target_height = max(300, min(520, int((available_height - max(0, rows - 1) * spacing) / rows) - 4))
-        for widget in widgets:
-            widget.setFixedHeight(target_height)
+        row_groups: dict[int, list[QFrame]] = {}
+        for index, widget in enumerate(widgets):
+            widget.setMinimumHeight(0)
+            widget.setMaximumHeight(16777215)
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            row_groups.setdefault(index // 2, []).append(widget)
+        for row_widgets in row_groups.values():
+            target_height = 0
+            for widget in row_widgets:
+                try:
+                    if widget.layout() is not None:
+                        widget.layout().activate()
+                except Exception:
+                    pass
+                widget.adjustSize()
+                target_height = max(
+                    target_height,
+                    widget.minimumSizeHint().height(),
+                    widget.sizeHint().height(),
+                )
+            for widget in row_widgets:
+                widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                widget.setFixedHeight(target_height)
         self._components_cards_root.updateGeometry()
 
     def _sync_mod_card_layout(self) -> None:
@@ -8055,6 +12455,8 @@ class MainWindow(QMainWindow):
             mod_id = str(_field(installed_item, "id", "") or "")
             if not mod_id:
                 continue
+            if mod_id == "unified-by-goshkow":
+                continue
             seen.add(mod_id)
             indexed = index_map.get(mod_id)
             enabled = bool(_field(installed_item, "enabled", False))
@@ -8064,7 +12466,7 @@ class MainWindow(QMainWindow):
                     "id": mod_id,
                     "name": str(_field(indexed or installed_item, "name", mod_id) or mod_id),
                     "description": str(_field(indexed or installed_item, "description", "") or self._t("Локальная модификация без описания.", "Local mod without description.")),
-                    "subtitle": f"{self._t('Автор', 'Author')}: {str(_field(indexed or installed_item, 'author', 'goshkow') or 'goshkow')} | {self._t('Версия', 'Version')}: {str(_field(installed_item, 'version', _field(indexed or installed_item, 'version', '')))}",
+                    "subtitle": f"{self._t('Автор', 'Author')}: {str(_field(indexed or installed_item, 'author', self._t('неизвестен', 'unknown')) or self._t('неизвестен', 'unknown'))} | {self._t('Версия', 'Version')}: {str(_field(installed_item, 'version', _field(indexed or installed_item, 'version', '')))}",
                     "state": state,
                     "enabled": enabled,
                     "changelog": str(_field(indexed or installed_item, "changelog", "") or ""),
@@ -8078,12 +12480,14 @@ class MainWindow(QMainWindow):
             item_id = str(_field(item, "id", "") or "")
             if not item_id or item_id in seen:
                 continue
+            if item_id == "unified-by-goshkow":
+                continue
             combined.append(
                 {
                     "id": item_id,
                     "name": str(_field(item, "name", item_id)),
                     "description": str(_field(item, "description", "") or self._t("Описание не указано.", "No description.")),
-                    "subtitle": f"{self._t('Автор', 'Author')}: {str(_field(item, 'author', 'goshkow'))} | {self._t('Версия', 'Version')}: {str(_field(item, 'version', ''))}",
+                    "subtitle": f"{self._t('Автор', 'Author')}: {str(_field(item, 'author', self._t('неизвестен', 'unknown')) or self._t('неизвестен', 'unknown'))} | {self._t('Версия', 'Version')}: {str(_field(item, 'version', ''))}",
                     "state": "not installed",
                     "enabled": False,
                     "changelog": str(_field(item, "changelog", "") or ""),
@@ -8095,6 +12499,13 @@ class MainWindow(QMainWindow):
 
         if not hasattr(self, "mods_cards_layout"):
             return
+        scroll_bar = self.mods_scroll.verticalScrollBar() if getattr(self, "mods_scroll", None) is not None else None
+        previous_scroll_value = int(scroll_bar.value()) if scroll_bar is not None else 0
+
+        def restore_scroll_position() -> None:
+            if scroll_bar is None:
+                return
+            scroll_bar.setValue(min(previous_scroll_value, scroll_bar.maximum()))
 
         enabled_count = sum(1 for mod in combined if bool(mod["enabled"]))
         if hasattr(self, "mods_summary_chip"):
@@ -8121,6 +12532,7 @@ class MainWindow(QMainWindow):
         if not combined:
             empty, empty_layout = self._card()
             empty.setProperty("class", "modCard")
+            empty_layout.setContentsMargins(14, 14, 14, 14)
             title = QLabel(self._t("Пока пусто", "Nothing here yet"))
             title.setProperty("class", "title")
             text = QLabel(
@@ -8135,6 +12547,7 @@ class MainWindow(QMainWindow):
             empty_layout.addWidget(text)
             self.mods_cards_layout.addWidget(empty)
             self.mods_cards_layout.addStretch(1)
+            QTimer.singleShot(0, restore_scroll_position)
             return
 
         for mod in combined:
@@ -8147,8 +12560,9 @@ class MainWindow(QMainWindow):
                     "Helps bypass restrictions for the most popular services, including gaming platforms, social networks, and other services.",
                 )
 
-            card = QFrame()
+            card = ModCardFrame(mod_id, bool(mod.get("installed")) and mod_id != "unified-by-goshkow")
             card.setProperty("class", "modCard")
+            card.clicked.connect(self._open_mod_editor)
             card_layout = QHBoxLayout(card)
             card_layout.setContentsMargins(16, 16, 16, 16)
             card_layout.setSpacing(16)
@@ -8298,6 +12712,7 @@ class MainWindow(QMainWindow):
             self.mods_cards_layout.addWidget(card)
 
         self.mods_cards_layout.addStretch(1)
+        QTimer.singleShot(0, restore_scroll_position)
 
     def refresh_files(self, payload: object | None = None) -> None:
         mode_index = self._file_mode_stack.currentIndex() if self._file_mode_stack is not None else 0
@@ -8448,6 +12863,7 @@ class MainWindow(QMainWindow):
             ("app", self._t("Приложение", "App")),
             ("zapret", "Zapret"),
             ("tg-ws-proxy", "TG WS Proxy"),
+            ("goshkow-vpn", self._t("VPN", "VPN")),
             ("all", self._t("Все логи", "All logs")),
         ]
         current = self._current_log_source
@@ -8463,6 +12879,7 @@ class MainWindow(QMainWindow):
         if self._logs_source_combo is None:
             return
         self._current_log_source = str(self._logs_source_combo.currentData() or "app")
+        self._logs_force_scroll_bottom = True
         self.refresh_logs()
 
     def _set_logs_live_enabled(self, enabled: bool) -> None:
@@ -8473,7 +12890,7 @@ class MainWindow(QMainWindow):
             self._logs_live_timer.stop()
 
     def _refresh_logs_live(self) -> None:
-        if not hasattr(self, "pages") or self.pages.currentIndex() != 4:
+        if not hasattr(self, "pages") or self.pages.currentIndex() != 5:
             self._set_logs_live_enabled(False)
             return
         if self._logs_view_update_locked():
@@ -8482,6 +12899,7 @@ class MainWindow(QMainWindow):
 
     def refresh_logs(self, payload: object | None = None) -> None:
         if payload is None:
+            self._logs_force_scroll_bottom = True
             if self._logs_stack is not None:
                 self._logs_stack.setCurrentIndex(0)
             self._request_page_refresh("logs")
@@ -8504,20 +12922,25 @@ class MainWindow(QMainWindow):
             return
         self._pending_logs_payload = None
         scrollbar = self.logs_text.verticalScrollBar()
-        at_bottom = scrollbar.value() >= max(0, scrollbar.maximum() - 4)
+        old_maximum = scrollbar.maximum()
         old_value = scrollbar.value()
+        distance_from_bottom = max(0, old_maximum - old_value)
+        at_bottom = bool(self._logs_force_scroll_bottom) or distance_from_bottom <= 4
+        self._logs_force_scroll_bottom = False
         if self._logs_stack is not None:
             self._logs_stack.setCurrentIndex(1)
         self.logs_text.setPlainText("\n".join(lines) if lines else self._t("Логи пока пустые.", "No logs yet."))
-        target_value = None if at_bottom else old_value
 
         def _restore_scroll_position() -> None:
-            if target_value is None:
+            if at_bottom:
                 scrollbar.setValue(scrollbar.maximum())
             else:
-                scrollbar.setValue(min(target_value, scrollbar.maximum()))
+                target = old_value
+                scrollbar.setValue(min(target, scrollbar.maximum()))
 
         QTimer.singleShot(0, _restore_scroll_position)
+        if at_bottom:
+            QTimer.singleShot(40, _restore_scroll_position)
 
     def _logs_view_update_locked(self) -> bool:
         if not hasattr(self, "logs_text") or self.logs_text is None:

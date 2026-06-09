@@ -13,7 +13,7 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     QWidget {
         background: #0f1420;
         color: #d9e0f0;
-        font-family: "Segoe UI";
+        font-family: "JetBrains Sans", "Segoe UI Variable", "Segoe UI", "Arial", "Noto Sans", sans-serif;
         font-size: 10pt;
     }
     #WindowShell {
@@ -105,6 +105,20 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         background: #141f32;
         border: 1px solid #284061;
         border-radius: 16px;
+    }
+    QFrame#NotificationsPopup {
+        background: #141f32;
+        border: 1px solid #304463;
+        border-radius: 14px;
+    }
+    QFrame[class="notificationCard"] {
+        background: #17233a;
+        border: 1px solid #2e4269;
+        border-radius: 12px;
+    }
+    QScrollArea#NotificationsScroll, QWidget#NotificationsCanvas {
+        background: transparent;
+        border: none;
     }
     QFrame[class="modIconWrap"] {
         background: #1b2b45;
@@ -409,20 +423,29 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         background: transparent;
     }
-    QListWidget#FilesList, QListWidget#FilesList::viewport {
+    QListWidget#FilesList, QListWidget#FilesList::viewport,
+    QListWidget#ModFilesList, QListWidget#ModFilesList::viewport {
         background: transparent;
         border: none;
     }
     QListWidget#FilesList {
         padding: 0px;
     }
-    QListWidget#FilesList::item {
+    QListWidget#ModFilesList {
+        padding: 4px;
+        border: 1px solid #2d456d;
+        border-radius: 12px;
+    }
+    QListWidget#FilesList::item,
+    QListWidget#ModFilesList::item {
         margin: 0px 0px 8px 0px;
     }
-    QListWidget#FilesList::item:selected {
+    QListWidget#FilesList::item:selected,
+    QListWidget#ModFilesList::item:selected {
         color: #d9e0f0;
     }
     QListWidget#FilesList QScrollBar:vertical,
+    QListWidget#ModFilesList QScrollBar:vertical,
     QTextEdit#FileEditor QScrollBar:vertical {
         background: transparent;
         border: none;
@@ -430,12 +453,14 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         margin: 0px;
     }
     QListWidget#FilesList QScrollBar::handle:vertical,
+    QListWidget#ModFilesList QScrollBar::handle:vertical,
     QTextEdit#FileEditor QScrollBar::handle:vertical {
         background: transparent;
         min-height: 40px;
         border-radius: 4px;
     }
     QListWidget#FilesList QScrollBar:horizontal,
+    QListWidget#ModFilesList QScrollBar:horizontal,
     QTextEdit#FileEditor QScrollBar:horizontal {
         background: transparent;
         border: none;
@@ -443,6 +468,7 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         margin: 0px;
     }
     QListWidget#FilesList QScrollBar::handle:horizontal,
+    QListWidget#ModFilesList QScrollBar::handle:horizontal,
     QTextEdit#FileEditor QScrollBar::handle:horizontal {
         background: transparent;
         min-width: 40px;
@@ -450,16 +476,22 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     }
     QListWidget#FilesList QScrollBar::add-page:vertical,
     QListWidget#FilesList QScrollBar::sub-page:vertical,
+    QListWidget#ModFilesList QScrollBar::add-page:vertical,
+    QListWidget#ModFilesList QScrollBar::sub-page:vertical,
     QTextEdit#FileEditor QScrollBar::add-page:vertical,
     QTextEdit#FileEditor QScrollBar::sub-page:vertical,
     QListWidget#FilesList QScrollBar::add-page:horizontal,
     QListWidget#FilesList QScrollBar::sub-page:horizontal,
+    QListWidget#ModFilesList QScrollBar::add-page:horizontal,
+    QListWidget#ModFilesList QScrollBar::sub-page:horizontal,
     QTextEdit#FileEditor QScrollBar::add-page:horizontal,
     QTextEdit#FileEditor QScrollBar::sub-page:horizontal {
         background: transparent;
     }
     QListWidget#FilesList QScrollBar::groove:vertical,
     QListWidget#FilesList QScrollBar::groove:horizontal,
+    QListWidget#ModFilesList QScrollBar::groove:vertical,
+    QListWidget#ModFilesList QScrollBar::groove:horizontal,
     QTextEdit#FileEditor QScrollBar::groove:vertical,
     QTextEdit#FileEditor QScrollBar::groove:horizontal,
     QAbstractScrollArea::corner {
@@ -485,7 +517,7 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     QWidget {
         background: #eef2f8;
         color: #1f2a3d;
-        font-family: "Segoe UI";
+        font-family: "JetBrains Sans", "Segoe UI Variable", "Segoe UI", "Arial", "Noto Sans", sans-serif;
         font-size: 10pt;
     }
     #WindowShell {
@@ -577,6 +609,20 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         background: #ffffff;
         border: 1px solid #d6e1f0;
         border-radius: 16px;
+    }
+    QFrame#NotificationsPopup {
+        background: #ffffff;
+        border: 1px solid #c9d7eb;
+        border-radius: 14px;
+    }
+    QFrame[class="notificationCard"] {
+        background: #f8fbff;
+        border: 1px solid #d3e0ef;
+        border-radius: 12px;
+    }
+    QScrollArea#NotificationsScroll, QWidget#NotificationsCanvas {
+        background: transparent;
+        border: none;
     }
     QFrame[class="modIconWrap"] {
         background: #edf3ff;
@@ -881,20 +927,29 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
         background: transparent;
     }
-    QListWidget#FilesList, QListWidget#FilesList::viewport {
+    QListWidget#FilesList, QListWidget#FilesList::viewport,
+    QListWidget#ModFilesList, QListWidget#ModFilesList::viewport {
         background: transparent;
         border: none;
     }
     QListWidget#FilesList {
         padding: 0px;
     }
-    QListWidget#FilesList::item {
+    QListWidget#ModFilesList {
+        padding: 4px;
+        border: 1px solid #cedbea;
+        border-radius: 12px;
+    }
+    QListWidget#FilesList::item,
+    QListWidget#ModFilesList::item {
         margin: 0px 0px 8px 0px;
     }
-    QListWidget#FilesList::item:selected {
+    QListWidget#FilesList::item:selected,
+    QListWidget#ModFilesList::item:selected {
         color: #1f2a3d;
     }
     QListWidget#FilesList QScrollBar:vertical,
+    QListWidget#ModFilesList QScrollBar:vertical,
     QTextEdit#FileEditor QScrollBar:vertical {
         background: transparent;
         border: none;
@@ -902,12 +957,14 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         margin: 0px;
     }
     QListWidget#FilesList QScrollBar::handle:vertical,
+    QListWidget#ModFilesList QScrollBar::handle:vertical,
     QTextEdit#FileEditor QScrollBar::handle:vertical {
         background: transparent;
         min-height: 40px;
         border-radius: 4px;
     }
     QListWidget#FilesList QScrollBar:horizontal,
+    QListWidget#ModFilesList QScrollBar:horizontal,
     QTextEdit#FileEditor QScrollBar:horizontal {
         background: transparent;
         border: none;
@@ -915,6 +972,7 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         margin: 0px;
     }
     QListWidget#FilesList QScrollBar::handle:horizontal,
+    QListWidget#ModFilesList QScrollBar::handle:horizontal,
     QTextEdit#FileEditor QScrollBar::handle:horizontal {
         background: transparent;
         min-width: 40px;
@@ -922,16 +980,22 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     }
     QListWidget#FilesList QScrollBar::add-page:vertical,
     QListWidget#FilesList QScrollBar::sub-page:vertical,
+    QListWidget#ModFilesList QScrollBar::add-page:vertical,
+    QListWidget#ModFilesList QScrollBar::sub-page:vertical,
     QTextEdit#FileEditor QScrollBar::add-page:vertical,
     QTextEdit#FileEditor QScrollBar::sub-page:vertical,
     QListWidget#FilesList QScrollBar::add-page:horizontal,
     QListWidget#FilesList QScrollBar::sub-page:horizontal,
+    QListWidget#ModFilesList QScrollBar::add-page:horizontal,
+    QListWidget#ModFilesList QScrollBar::sub-page:horizontal,
     QTextEdit#FileEditor QScrollBar::add-page:horizontal,
     QTextEdit#FileEditor QScrollBar::sub-page:horizontal {
         background: transparent;
     }
     QListWidget#FilesList QScrollBar::groove:vertical,
     QListWidget#FilesList QScrollBar::groove:horizontal,
+    QListWidget#ModFilesList QScrollBar::groove:vertical,
+    QListWidget#ModFilesList QScrollBar::groove:horizontal,
     QTextEdit#FileEditor QScrollBar::groove:vertical,
     QTextEdit#FileEditor QScrollBar::groove:horizontal,
     QAbstractScrollArea::corner {
