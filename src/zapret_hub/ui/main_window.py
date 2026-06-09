@@ -5163,7 +5163,7 @@ class MainWindow(QMainWindow):
         self.power_vpn_btn.setObjectName("PowerVpnButton")
         self.power_vpn_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.power_vpn_btn.setIcon(self._icon(self._vpn_icon_name()))
-        self.power_vpn_btn.setIconSize(QSize(15, 15))
+        self.power_vpn_btn.setIconSize(QSize(12, 12))
         self.power_vpn_btn.setFixedSize(30, 30)
         self.power_vpn_btn.setToolTip("goshkow vpn")
         self.power_vpn_btn.clicked.connect(self._handle_power_vpn_button)
@@ -10027,7 +10027,7 @@ class MainWindow(QMainWindow):
             f"border: 1px solid {border.name(QColor.NameFormat.HexArgb)};"
             f"color: {text};"
             "border-radius: 15px;"
-            "padding: 0px 2px 0px 0px;"
+            "padding: 1px 0px 0px 1px;"
             "margin: 0px;"
             "}"
             "QToolButton#PowerVpnButton:hover {"
@@ -11820,7 +11820,12 @@ class MainWindow(QMainWindow):
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
             self._components_card_by_id[component.id] = card
             icon = QLabel()
-            icon_size = 38 if component.id in {"tg-ws-proxy"} else 36
+            if component.id == "tg-ws-proxy":
+                icon_size = 38
+            elif component.id == "goshkow-vpn":
+                icon_size = 29
+            else:
+                icon_size = 36
             icon.setPixmap(self._icon(icons.get(component.id, "components.svg")).pixmap(icon_size, icon_size))
             icon_row = QHBoxLayout()
             icon_row.setContentsMargins(0, 6, 0, 0)
