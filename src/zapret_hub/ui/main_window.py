@@ -3551,13 +3551,105 @@ class MainWindow(QMainWindow):
             return QColor("#2d3c57")
         return QColor("#f3f7ff")
 
-    def _build_tinted_icon(self, icon_path: Path, color: QColor) -> QIcon:
+    def _compose_icon_slot_pixmap(
+        self,
+        pixmap: QPixmap,
+        slot_size: QSize,
+        fill_ratio: float = 1.0,
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
+        device_ratio: float | None = None,
+    ) -> QPixmap:
+        if pixmap.isNull() or not slot_size.isValid():
+            return pixmap
+        dpr = max(1.0, float(device_ratio if device_ratio is not None else pixmap.devicePixelRatio()))
+        logical_width = float(slot_size.width())
+        logical_height = float(slot_size.height())
+        physical_width = max(1, int(round(logical_width * dpr)))
+        physical_height = max(1, int(round(logical_height * dpr)))
+        canvas = QPixmap(physical_width, physical_height)
+        canvas.fill(Qt.GlobalColor.transparent)
+        canvas.setDevicePixelRatio(dpr)
+        source_size = pixmap.deviceIndependentSize() if hasattr(pixmap, "deviceIndependentSize") else QSizeF(
+            float(pixmap.width()) / max(1.0, float(pixmap.devicePixelRatio())),
+            float(pixmap.height()) / max(1.0, float(pixmap.devicePixelRatio())),
+        )
+        target_width = float(source_size.width())
+        target_height = float(source_size.height())
+        max_box_width = logical_width * max(0.0, fill_ratio)
+        max_box_height = logical_height * max(0.0, fill_ratio)
+        if target_width > 0.0 and target_height > 0.0 and max_box_width > 0.0 and max_box_height > 0.0:
+            scale = min(max_box_width / target_width, max_box_height / target_height, 1.0)
+            target_width *= scale
+            target_height *= scale
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        if hasattr(QPainter.RenderHint, "LosslessImageRendering"):
+            painter.setRenderHint(QPainter.RenderHint.LosslessImageRendering, True)
+        painter.drawPixmap(
+            QRectF(
+                (logical_width - target_width) / 2.0 + offset_x,
+                (logical_height - target_height) / 2.0 + offset_y,
+                target_width,
+                target_height,
+            ),
+            pixmap,
+            QRectF(0, 0, pixmap.width(), pixmap.height()),
+        )
+        painter.end()
+        return canvas
+
+    def _load_trimmed_icon_pixmap(self, icon_path: Path, size: int) -> QPixmap:
+        pixmap = QPixmap()
+        physical_px = max(64, int(round(size * 3)))
+        if icon_path.exists():
+            if icon_path.suffix.lower() == ".svg":
+                renderer = QSvgRenderer(str(icon_path))
+                if renderer.isValid():
+                    image = QImage(physical_px, physical_px, QImage.Format.Format_ARGB32_Premultiplied)
+                    image.fill(Qt.GlobalColor.transparent)
+                    painter = QPainter(image)
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                    if hasattr(QPainter.RenderHint, "LosslessImageRendering"):
+                        painter.setRenderHint(QPainter.RenderHint.LosslessImageRendering, True)
+                    renderer.render(painter, QRectF(0, 0, physical_px, physical_px))
+                    painter.end()
+                    image = self._trim_transparent_bounds(image, padding=max(2, physical_px // 12))
+                    pixmap = QPixmap.fromImage(image)
+            if pixmap.isNull():
+                image = QImage(str(icon_path))
+                if not image.isNull():
+                    image = self._trim_transparent_bounds(image, padding=max(2, physical_px // 12))
+                    pixmap = QPixmap.fromImage(image)
+        if pixmap.isNull():
+            pixmap = QIcon(str(icon_path)).pixmap(size, size)
+        return pixmap
+
+    def _build_tinted_icon(
+        self,
+        icon_path: Path,
+        color: QColor,
+        *,
+        fill_ratio: float = 1.0,
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
+    ) -> QIcon:
         base = QIcon(str(icon_path))
         icon = QIcon()
         for size in (14, 16, 18, 20, 24, 26, 32):
-            pixmap = base.pixmap(size, size)
-            if pixmap.isNull():
+            source = self._load_trimmed_icon_pixmap(icon_path, size)
+            if source.isNull():
                 continue
+            pixmap = self._compose_icon_slot_pixmap(
+                source,
+                QSize(size, size),
+                fill_ratio,
+                offset_x,
+                offset_y,
+                device_ratio=self._service_icon_device_ratio(),
+            )
             painter = QPainter(pixmap)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
             painter.fillRect(pixmap.rect(), color)
@@ -5162,8 +5254,16 @@ class MainWindow(QMainWindow):
         self.power_vpn_btn = QToolButton(self.power_caption)
         self.power_vpn_btn.setObjectName("PowerVpnButton")
         self.power_vpn_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.power_vpn_btn.setIcon(self._icon(self._vpn_icon_name()))
-        self.power_vpn_btn.setIconSize(QSize(12, 12))
+        self.power_vpn_btn.setIcon(
+            self._build_tinted_icon(
+                self._icons_dir / self._vpn_icon_name(),
+                self._themed_icon_color(self._vpn_icon_name()) or QColor("#f3f7ff"),
+                fill_ratio=0.82,
+                offset_x=-1.0,
+                offset_y=1.0,
+            )
+        )
+        self.power_vpn_btn.setIconSize(QSize(16, 16))
         self.power_vpn_btn.setFixedSize(30, 30)
         self.power_vpn_btn.setToolTip("goshkow vpn")
         self.power_vpn_btn.clicked.connect(self._handle_power_vpn_button)
@@ -5171,7 +5271,15 @@ class MainWindow(QMainWindow):
         self.power_reconfigure_btn = QToolButton(self.power_caption)
         self.power_reconfigure_btn.setObjectName("PowerReconfigureButton")
         self.power_reconfigure_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.power_reconfigure_btn.setIcon(self._icon("rerun.svg"))
+        self.power_reconfigure_btn.setIcon(
+            self._build_tinted_icon(
+                self._icons_dir / "rerun.svg",
+                self._themed_icon_color("refresh.svg") or QColor("#f3f7ff"),
+                fill_ratio=0.82,
+                offset_x=-0.8,
+                offset_y=0.6,
+            )
+        )
         self.power_reconfigure_btn.setIconSize(QSize(15, 15))
         self.power_reconfigure_btn.setFixedSize(30, 30)
         self.power_reconfigure_btn.setToolTip(self._t("Подобрать настройки", "Find settings"))
@@ -9980,7 +10088,15 @@ class MainWindow(QMainWindow):
         text, border, fill = self._inactive_control_style_values()
         hover = QColor(fill)
         hover.setAlpha(min(255, fill.alpha() + 14))
-        button.setIcon(self._build_tinted_icon(self._icons_dir / "rerun.svg", QColor(text)))
+        button.setIcon(
+            self._build_tinted_icon(
+                self._icons_dir / "rerun.svg",
+                QColor(text),
+                fill_ratio=0.82,
+                offset_x=-0.8,
+                offset_y=0.6,
+            )
+        )
         button.setStyleSheet(
             "QToolButton#PowerReconfigureButton {"
             f"background: {fill.name(QColor.NameFormat.HexArgb)};"
@@ -10020,14 +10136,22 @@ class MainWindow(QMainWindow):
         hover = QColor(fill)
         hover.setAlpha(min(255, fill.alpha() + 18))
         button.setEnabled(not self._vpn_mode_switch_in_progress)
-        button.setIcon(self._build_tinted_icon(self._icons_dir / self._vpn_icon_name(), QColor(text)))
+        button.setIcon(
+            self._build_tinted_icon(
+                self._icons_dir / self._vpn_icon_name(),
+                QColor(text),
+                fill_ratio=0.82,
+                offset_x=-1.0,
+                offset_y=1.0,
+            )
+        )
         button.setStyleSheet(
             "QToolButton#PowerVpnButton {"
             f"background: {fill.name(QColor.NameFormat.HexArgb)};"
             f"border: 1px solid {border.name(QColor.NameFormat.HexArgb)};"
             f"color: {text};"
             "border-radius: 15px;"
-            "padding: 1px 0px 0px 1px;"
+            "padding: 0px;"
             "margin: 0px;"
             "}"
             "QToolButton#PowerVpnButton:hover {"
@@ -11826,7 +11950,18 @@ class MainWindow(QMainWindow):
                 icon_size = 29
             else:
                 icon_size = 36
-            icon.setPixmap(self._icon(icons.get(component.id, "components.svg")).pixmap(icon_size, icon_size))
+            icon_slot = QSize(icon_size, icon_size + (4 if component.id == "goshkow-vpn" else 0))
+            icon.setFixedSize(icon_slot)
+            raw_icon_pixmap = self._icon(icons.get(component.id, "components.svg")).pixmap(icon_size, icon_size)
+            icon.setPixmap(
+                self._compose_icon_slot_pixmap(
+                    raw_icon_pixmap,
+                    icon_slot,
+                    1.0,
+                    0.0,
+                    3.0 if component.id == "goshkow-vpn" else 0.0,
+                )
+            )
             icon_row = QHBoxLayout()
             icon_row.setContentsMargins(0, 6, 0, 0)
             icon_row.setSpacing(8)
