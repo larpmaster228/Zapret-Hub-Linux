@@ -2827,6 +2827,7 @@ class SettingsDialog(AppDialog):
         )
         self.vpn_refresh_btn = QPushButton(self._t("Обновить подписку", "Refresh subscription"))
         self.vpn_refresh_btn.clicked.connect(self._refresh_vpn_subscription)
+        self._vpn_refresh_default_text = self.vpn_refresh_btn.text()
 
         scroll = QScrollArea()
         scroll.setObjectName("SettingsScroll")
@@ -3125,7 +3126,21 @@ class SettingsDialog(AppDialog):
         parent = self.parent()
         if parent is None or not hasattr(parent, "_refresh_goshkow_vpn_subscription_from_settings"):
             return
+        self.set_vpn_refresh_state("loading")
         getattr(parent, "_refresh_goshkow_vpn_subscription_from_settings")(self.vpn_subscription_input.text().strip())
+
+    def set_vpn_refresh_state(self, state: str) -> None:
+        if state == "loading":
+            self.vpn_refresh_btn.setEnabled(False)
+            self.vpn_refresh_btn.setText(self._t("Обновление...", "Refreshing..."))
+            return
+        if state == "done":
+            self.vpn_refresh_btn.setEnabled(False)
+            self.vpn_refresh_btn.setText(self._t("Обновлено", "Updated"))
+            QTimer.singleShot(2000, lambda: self.set_vpn_refresh_state("idle"))
+            return
+        self.vpn_refresh_btn.setText(self._t("Обновить подписку", "Refresh subscription"))
+        self.vpn_refresh_btn.setEnabled(True)
 
     def _sync_tg_media_mode_from_dc_ip(self, value: str) -> None:
         normalized = "\n".join(line.strip() for line in str(value or "").splitlines() if line.strip())
@@ -3236,6 +3251,8 @@ class MainWindow(QMainWindow):
         self._general_test_eta_timer.timeout.connect(self._update_general_test_eta)
         self._general_test_task_id: str | None = None
         self._general_test_original_general = ""
+        self._general_test_waiting_runtime_prepare = False
+        self._general_test_runtime_restore_payload: dict[str, object] | None = None
         self._first_general_prompt: AppDialog | None = None
         self._onboarding_active = False
         self._onboarding_running = False
@@ -5474,7 +5491,7 @@ class MainWindow(QMainWindow):
         for preset in SERVICE_PRESETS:
             card = ServiceCardFrame(preset)
             card.set_visual_scope(scope)
-            title, description = self._service_card_texts(preset)
+            title, description = self._service_card_texts(preset, scope=scope)
             is_selected = preset.id in selected
             card.set_texts(title, description)
             card.set_icon_pixmap(self._service_icon_pixmap(preset, 34, selected=is_selected))
@@ -5487,8 +5504,13 @@ class MainWindow(QMainWindow):
             self._service_cards_by_id.setdefault(preset.id, []).append(card)
         return cards
 
-    def _service_card_texts(self, preset: ServicePreset) -> tuple[str, str]:
-        return self._t(preset.title_ru, preset.title_en), self._t(preset.description_ru, preset.description_en)
+    def _service_card_texts(self, preset: ServicePreset, *, scope: str = "onboarding") -> tuple[str, str]:
+        description_ru = preset.description_ru
+        description_en = preset.description_en
+        if scope == "main":
+            description_ru = preset.short_description_ru or description_ru
+            description_en = preset.short_description_en or description_en
+        return self._t(preset.title_ru, preset.title_en), self._t(description_ru, description_en)
 
     def _service_title_by_id(self, service_id: str) -> str:
         preset = next((item for item in SERVICE_PRESETS if item.id == service_id), None)
@@ -7042,8 +7064,22 @@ class MainWindow(QMainWindow):
             self._mark_dirty("dashboard", "services", "components", "mods", "files", "tray")
             return
         if action == "apply_settings":
-            if bool(payload.get("autostart_changed")):
-                self.context.autostart.set_enabled(bool(self.context.settings.get().autostart_windows))
+            desired_autostart = bool(self.context.settings.get().autostart_windows)
+            actual_autostart = self.context.autostart.is_enabled()
+            if bool(payload.get("autostart_changed")) or desired_autostart != actual_autostart:
+                actual_autostart = self.context.autostart.set_enabled(desired_autostart)
+                if actual_autostart != desired_autostart:
+                    self.context.settings.update(autostart_windows=actual_autostart)
+                    self._add_notification(
+                        "error",
+                        self._t("Автозапуск Windows", "Windows autostart"),
+                        self._t(
+                            "Не удалось включить автозапуск. Проверьте права Windows или политики безопасности.",
+                            "Could not enable autostart. Check Windows permissions or security policies.",
+                        ),
+                        source="settings",
+                        details={"dedupe_key": "settings-autostart-failed"},
+                    )
             if bool(payload.get("theme_changed")):
                 self._apply_theme()
             if bool(payload.get("language_changed")):
@@ -7063,7 +7099,15 @@ class MainWindow(QMainWindow):
             return
         if action in {"select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic"}:
             self._mark_dirty("dashboard", "components", "tray")
+            if action_id == "__settings_vpn_refresh__":
+                self._finish_settings_vpn_refresh(success=True)
             self._ui_signals.component_action_done.emit(action_id)
+            return
+        if action == "prepare_general_autotest_runtime":
+            self._on_general_test_runtime_prepared(payload)
+            return
+        if action == "restore_general_autotest_runtime":
+            self._mark_dirty("dashboard", "components", "tray")
             return
         if action == "apply_settings":
             self._ui_signals.component_action_done.emit("__settings__")
@@ -7180,12 +7224,20 @@ class MainWindow(QMainWindow):
             self._ui_signals.component_action_done.emit("__settings__")
         if action in {"toggle_component_enabled", "toggle_component_autostart", "start_component", "stop_component", "toggle_goshkow_vpn_mode"}:
             self._ui_signals.component_action_done.emit(action_id)
+        if action_id == "__settings_vpn_refresh__":
+            self._finish_settings_vpn_refresh(success=False)
+        if action == "prepare_general_autotest_runtime":
+            self._general_test_waiting_runtime_prepare = False
+            if self._general_test_running and not self._general_test_cancelled:
+                self._start_next_general_test()
+            return
         if action in {"run_general_diagnostics", "run_general_diagnostic_single"}:
             if self._general_test_cancelled:
                 self._general_test_task_id = None
                 self._general_test_eta_timer.stop()
                 self._general_test_cancelled = False
                 self._clear_windows_taskbar_progress()
+                self._restore_general_test_runtime_after_run()
                 return
             self._general_test_running = False
             self._general_test_task_id = None
@@ -7198,6 +7250,7 @@ class MainWindow(QMainWindow):
             self._general_test_eta_label = None
             self._general_test_counter_label = None
             self._general_test_progress_bar = None
+            self._restore_general_test_runtime_after_run()
         if action == "run_settings_diagnostics":
             self._settings_diag_task_id = None
             if self._settings_diag_dialog is not None:
@@ -7215,6 +7268,43 @@ class MainWindow(QMainWindow):
             details={"dedupe_key": f"backend-error:{action}:{error}"},
         )
         self._show_error("Zapret Hub", error)
+
+    def _finish_settings_vpn_refresh(self, *, success: bool) -> None:
+        dialog = self._settings_dialog
+        if dialog is None:
+            return
+        if success:
+            dialog.set_vpn_refresh_state("done")
+            return
+        dialog.set_vpn_refresh_state("idle")
+
+    def _prepare_general_test_runtime_before_run(self) -> None:
+        self._general_test_waiting_runtime_prepare = True
+        self._general_test_runtime_restore_payload = None
+        self._submit_backend_task(
+            "prepare_general_autotest_runtime",
+            action_id="__general_test_runtime_prepare__",
+        )
+
+    def _on_general_test_runtime_prepared(self, payload: object) -> None:
+        self._general_test_waiting_runtime_prepare = False
+        if isinstance(payload, dict) and isinstance(payload.get("restore_runtime"), dict):
+            self._general_test_runtime_restore_payload = dict(payload.get("restore_runtime") or {})
+        self._mark_dirty("dashboard", "components", "tray")
+        if self._general_test_running and not self._general_test_cancelled:
+            self._start_next_general_test()
+
+    def _restore_general_test_runtime_after_run(self) -> None:
+        restore_payload = self._general_test_runtime_restore_payload
+        self._general_test_runtime_restore_payload = None
+        self._general_test_waiting_runtime_prepare = False
+        if not restore_payload:
+            return
+        self._submit_backend_task(
+            "restore_general_autotest_runtime",
+            {"restore_runtime": restore_payload},
+            action_id="__general_test_runtime_restore__",
+        )
 
     def _show_settings_diagnostics_result(self, payload: object) -> None:
         self._settings_diag_task_id = None
@@ -10230,15 +10320,16 @@ class MainWindow(QMainWindow):
         self._update_power_icon()
 
     def _open_goshkow_vpn_component(self) -> None:
-        self._components_scroll_target_component_id = "goshkow-vpn"
+        self._components_scroll_target_component_id = ""
         try:
             self._switch_page(2)
         except Exception:
             self.pages.setCurrentIndex(2)
         self._mark_dirty("components")
         QTimer.singleShot(0, self.refresh_components)
-        QTimer.singleShot(80, self._scroll_to_goshkow_vpn_component)
-        QTimer.singleShot(220, self._scroll_to_goshkow_vpn_component)
+        if self._components_scroll is not None:
+            QTimer.singleShot(0, lambda: self._components_scroll.verticalScrollBar().setValue(0))
+            QTimer.singleShot(120, lambda: self._components_scroll.verticalScrollBar().setValue(0))
 
     def _scroll_to_goshkow_vpn_component(self) -> None:
         self._ensure_components_scroll_target_visible()
@@ -11239,9 +11330,9 @@ class MainWindow(QMainWindow):
         theme = self.context.settings.get().theme
         selected = set(self._selected_service_ids())
         for preset in SERVICE_PRESETS:
-            title, description = self._service_card_texts(preset)
             is_selected = preset.id in selected
             for card in self._service_cards_by_id.get(preset.id, []):
+                title, description = self._service_card_texts(preset, scope=str(card.property("serviceScope") or "onboarding"))
                 try:
                     card.blockSignals(True)
                     card.set_theme(theme)
@@ -11361,7 +11452,7 @@ class MainWindow(QMainWindow):
             self._general_test_eta_label = None
             self._general_test_counter_label = self._onboarding_progress_counter_label
             self._general_test_progress_bar = self._onboarding_progress_bar
-            self._start_next_general_test()
+            self._prepare_general_test_runtime_before_run()
             return
 
         dialog = AppDialog(self, self.context, self._t("Подобрать конфигурацию", "Find best configuration"))
@@ -11397,7 +11488,7 @@ class MainWindow(QMainWindow):
         dialog.rejected.connect(self._cancel_general_tests)
         self._update_general_test_eta()
         self._general_test_eta_timer.start()
-        self._start_next_general_test()
+        self._prepare_general_test_runtime_before_run()
 
     def _run_general_tests_worker(self) -> None:
         results = self.context.processes.run_general_diagnostics(
@@ -11446,6 +11537,7 @@ class MainWindow(QMainWindow):
             if self._onboarding_actions_widget is not None:
                 self._onboarding_actions_widget.show()
         self._mark_dirty("dashboard", "components", "tray")
+        self._restore_general_test_runtime_after_run()
 
     def _start_next_general_test(self) -> None:
         if self._general_test_cancelled:
@@ -11661,6 +11753,7 @@ class MainWindow(QMainWindow):
             self.refresh_all()
             auto_applied = True
         self._general_test_auto_apply = False
+        self._restore_general_test_runtime_after_run()
 
         if self._general_test_embedded:
             self._general_test_embedded = False
