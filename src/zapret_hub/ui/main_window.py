@@ -2821,8 +2821,8 @@ class SettingsDialog(AppDialog):
         self.vpn_processes_input = QLineEdit()
         self.vpn_processes_input.setPlaceholderText(
             self._t(
-                "Например: qBittorrent.exe, Transmission.exe",
-                "For example: qBittorrent.exe, Transmission.exe",
+                "Список процессов через запятую",
+                "Comma-separated process list",
             )
         )
         self.vpn_refresh_btn = QPushButton(self._t("Обновить подписку", "Refresh subscription"))
@@ -2864,7 +2864,7 @@ class SettingsDialog(AppDialog):
         vpn_form.addRow("", self.vpn_tun_checkbox)
         vpn_form.addRow(self._t("Маршрутизация", "Routing"), self.vpn_routing_combo)
         vpn_form.addRow(self._t("Системный прокси", "System proxy"), self.vpn_proxy_combo)
-        vpn_form.addRow(self._t("Процессы", "Processes"), self.vpn_processes_input)
+        vpn_form.addRow(self._t("Проксировать процессы", "Proxy processes"), self.vpn_processes_input)
 
         zapret_form = self._settings_section(canvas_layout, "Zapret", "zapret")
         zapret_form.addRow("IPSet mode", self.ipset_mode_combo)
