@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import ctypes
-import json
 import math
 import os
 import platform
@@ -10093,10 +10092,11 @@ class MainWindow(QMainWindow):
                 self._icons_dir / "rerun.svg",
                 QColor(text),
                 fill_ratio=0.82,
-                offset_x=-0.8,
-                offset_y=1.8,
+                offset_x=-1.0,
+                offset_y=-0.3,
             )
         )
+        button.setIconSize(QSize(15, 15))
         button.setStyleSheet(
             "QToolButton#PowerReconfigureButton {"
             f"background: {fill.name(QColor.NameFormat.HexArgb)};"
@@ -10141,10 +10141,11 @@ class MainWindow(QMainWindow):
                 self._icons_dir / self._vpn_icon_name(),
                 QColor(text),
                 fill_ratio=0.72,
-                offset_x=0.4,
-                offset_y=1.0,
+                offset_x=-0.2,
+                offset_y=0.6,
             )
         )
+        button.setIconSize(QSize(16, 16))
         button.setStyleSheet(
             "QToolButton#PowerVpnButton {"
             f"background: {fill.name(QColor.NameFormat.HexArgb)};"
