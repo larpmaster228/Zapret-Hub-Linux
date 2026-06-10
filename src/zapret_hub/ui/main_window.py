@@ -9102,16 +9102,19 @@ class MainWindow(QMainWindow):
 
         status = str(release.get("status", "error"))
         latest_version = str(release.get("latest_version", ""))
+        prompt_key = latest_version
+        if bool(release.get("is_hotfix")):
+            prompt_key = f"{latest_version}:{release.get('release_updated_at', '')}"
         if status == "up-to-date":
             if self.context.settings.get().apply_update_on_next_launch:
                 self.context.settings.update(apply_update_on_next_launch=False)
         if status == "available" and not manual and self.context.settings.get().apply_update_on_next_launch:
-            self._last_prompted_update_version = latest_version
+            self._last_prompted_update_version = prompt_key
             self._start_update_apply(None, release)
             return
         if status == "available":
-            if manual or self._last_prompted_update_version != latest_version:
-                self._last_prompted_update_version = latest_version
+            if manual or self._last_prompted_update_version != prompt_key:
+                self._last_prompted_update_version = prompt_key
                 self._show_update_prompt(release)
             return
         if manual:
@@ -9203,12 +9206,24 @@ class MainWindow(QMainWindow):
             pass
 
     def _show_update_prompt(self, release: dict[str, str]) -> None:
-        dialog = AppDialog(self, self.context, self._t("Доступно обновление", "Update available"))
-        message = QLabel(
-            self._t(
-                f"Вышла новая версия Zapret Hub.\n\nТекущая версия: {release.get('current_version', '')}\nНовая версия: {release.get('latest_version', '')}",
-                f"A new Zapret Hub version is available.\n\nCurrent version: {release.get('current_version', '')}\nNew version: {release.get('latest_version', '')}",
+        is_hotfix = bool(release.get("is_hotfix"))
+        dialog = AppDialog(self, self.context, self._t("Доступен hotfix", "Hotfix available") if is_hotfix else self._t("Доступно обновление", "Update available"))
+        if is_hotfix:
+            message_text_ru = (
+                "Доступна обновленная сборка текущей версии Zapret Hub.\n\n"
+                f"Версия: {release.get('current_version', '')}\n"
+                "Рекомендуется установить hotfix, даже если номер версии не изменился."
             )
+            message_text_en = (
+                "An updated build of the current Zapret Hub version is available.\n\n"
+                f"Version: {release.get('current_version', '')}\n"
+                "Installing this hotfix is recommended even though the version number did not change."
+            )
+        else:
+            message_text_ru = f"Вышла новая версия Zapret Hub.\n\nТекущая версия: {release.get('current_version', '')}\nНовая версия: {release.get('latest_version', '')}"
+            message_text_en = f"A new Zapret Hub version is available.\n\nCurrent version: {release.get('current_version', '')}\nNew version: {release.get('latest_version', '')}"
+        message = QLabel(
+            self._t(message_text_ru, message_text_en)
         )
         message.setWordWrap(True)
         dialog.body_layout.addWidget(message)
@@ -9255,6 +9270,8 @@ class MainWindow(QMainWindow):
             title = version
             if bool(item.get("is_latest")):
                 title = f"{version} · {self._t('последняя', 'latest')}"
+            if bool(item.get("is_hotfix")):
+                title = f"{version} · hotfix"
             row_item = QListWidgetItem(title)
             row_item.setData(Qt.ItemDataRole.UserRole, dict(item))
             row_item.setSizeHint(QSize(140, 38))
