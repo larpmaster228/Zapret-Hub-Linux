@@ -17,6 +17,7 @@ from zapret_hub import __version__
 from zapret_hub.domain import ComponentDefinition, ComponentState, FileRecord, NotificationEntry
 from zapret_hub.services.service_catalog import (
     FORTNITE_GENERAL_PRIORITY,
+    GAMING_GENERAL_PRIORITY,
     SERVICE_PRESETS,
     ServicePreset,
     prioritize_generals_for_services,
@@ -1320,7 +1321,7 @@ class PowerAuraWidget(QWidget):
     def _advance_status_glow_breath(self) -> None:
         if not self._status_glow_enabled:
             return
-        # Irregular "campfire" breathing: slow overall motion with small phase drift.
+    # мягкое дыхание огонька, без одинаковых циклов
         wobble = 0.5 + 0.5 * math.sin(self._status_glow_phase * 0.71 + 0.8)
         self._status_glow_phase = (self._status_glow_phase + 0.026 + 0.018 * wobble) % (math.pi * 2.0)
         wave = math.sin(self._status_glow_phase + 0.28 * math.sin(self._status_glow_phase * 1.9))
@@ -2825,6 +2826,9 @@ class SettingsDialog(AppDialog):
                 "Comma-separated process list",
             )
         )
+        self.vpn_processes_exclude_checkbox = QCheckBox(self._t("Исключать процессы", "Exclude processes"))
+        self.vpn_processes_label = QLabel(self._t("Проксировать процессы", "Proxy processes"))
+        self.vpn_processes_exclude_checkbox.toggled.connect(self._sync_vpn_processes_label)
         self.vpn_refresh_btn = QPushButton(self._t("Обновить подписку", "Refresh subscription"))
         self.vpn_refresh_btn.clicked.connect(self._refresh_vpn_subscription)
         self._vpn_refresh_default_text = self.vpn_refresh_btn.text()
@@ -2865,7 +2869,8 @@ class SettingsDialog(AppDialog):
         vpn_form.addRow("", self.vpn_tun_checkbox)
         vpn_form.addRow(self._t("Маршрутизация", "Routing"), self.vpn_routing_combo)
         vpn_form.addRow(self._t("Системный прокси", "System proxy"), self.vpn_proxy_combo)
-        vpn_form.addRow(self._t("Проксировать процессы", "Proxy processes"), self.vpn_processes_input)
+        vpn_form.addRow("", self.vpn_processes_exclude_checkbox)
+        vpn_form.addRow(self.vpn_processes_label, self.vpn_processes_input)
 
         zapret_form = self._settings_section(canvas_layout, "Zapret", "zapret")
         zapret_form.addRow("IPSet mode", self.ipset_mode_combo)
@@ -3026,6 +3031,10 @@ class SettingsDialog(AppDialog):
         self.vpn_processes_input.setText(
             str(vpn_state.get("processes", settings.goshkow_vpn_processes) or "")
         )
+        self.vpn_processes_exclude_checkbox.setChecked(
+            bool(vpn_state.get("processes_exclude_mode", settings.goshkow_vpn_processes_exclude_mode))
+        )
+        self._sync_vpn_processes_label()
         if self.vpn_section_frame is not None:
             self.vpn_section_frame.setVisible(str(vpn_state.get("subscription_state", "") or "") == "valid")
 
@@ -3074,6 +3083,10 @@ class SettingsDialog(AppDialog):
         self.vpn_processes_input.setText(
             str(payload.get("goshkow_vpn_processes", self.vpn_processes_input.text()))
         )
+        self.vpn_processes_exclude_checkbox.setChecked(
+            bool(payload.get("goshkow_vpn_processes_exclude_mode", self.vpn_processes_exclude_checkbox.isChecked()))
+        )
+        self._sync_vpn_processes_label()
 
     def payload(self) -> dict[str, object]:
         try:
@@ -3115,7 +3128,17 @@ class SettingsDialog(AppDialog):
             "goshkow_vpn_routing_mode": self.vpn_routing_combo.currentData() or "global",
             "goshkow_vpn_system_proxy_mode": self.vpn_proxy_combo.currentData() or "pac",
             "goshkow_vpn_processes": self.vpn_processes_input.text().strip(),
+            "goshkow_vpn_processes_exclude_mode": self.vpn_processes_exclude_checkbox.isChecked(),
         }
+
+    def _sync_vpn_processes_label(self) -> None:
+        if getattr(self, "vpn_processes_label", None) is None:
+            return
+        self.vpn_processes_label.setText(
+            self._t("Исключать процессы", "Exclude processes")
+            if self.vpn_processes_exclude_checkbox.isChecked()
+            else self._t("Проксировать процессы", "Proxy processes")
+        )
 
     def _select_combo_value(self, combo: QComboBox, value: str) -> None:
         index = combo.findData(value)
@@ -4597,13 +4620,13 @@ class MainWindow(QMainWindow):
             return
         self._add_notification(
             "warning",
-            self._t("Telegram Desktop не найден", "Telegram Desktop was not found"),
+            self._t("Telegram не открыл подключение", "Telegram did not open the connection"),
             self._t(
-                "Telegram Desktop не найден на компьютере. Откройте раздел компонентов, скачайте Telegram Desktop и после установки нажмите «Подключить к Telegram».",
-                "Telegram Desktop was not found on this PC. Open Components, download Telegram Desktop, and after installation press 'Connect to Telegram'.",
+                "Не удалось открыть ссылку подключения Telegram Proxy. Откройте Telegram Desktop вручную и снова нажмите «Подключить к Telegram».",
+                "Could not open the Telegram Proxy link. Open Telegram Desktop manually and press 'Connect to Telegram' again.",
             ),
             source="tg-ws-proxy",
-            details={"dedupe_key": "telegram-desktop-missing"},
+            details={"dedupe_key": "telegram-proxy-link-not-opened"},
         )
 
     def _notify_zapret_restart_from_payload(self, payload: object) -> None:
@@ -5217,7 +5240,7 @@ class MainWindow(QMainWindow):
         self._dashboard_title_label = title
         top_layout.addWidget(title)
 
-        # настройка general перенесена в компоненты
+        # general теперь настраивается в компонентах
         general_label = QLabel(self._t("Конфигурация", "General"))
         self.general_combo = ClickSelectComboBox()
         self.general_combo.currentIndexChanged.connect(self._on_general_selected)
@@ -5527,7 +5550,7 @@ class MainWindow(QMainWindow):
             "cloudflare": ("cloudflare", "1.1.1.1"),
             "discord": ("discord",),
             "youtube": ("youtube", "youtu", "googlevideo"),
-            "roblox": ("roblox", "rbx"),
+            "gaming": ("gaming", "game", "steam", "epic", "roblox", "riot", "league", "fortnite", "battle", "blizzard"),
             "clouds": ("clouds", "cloudfront", "amazon", "aws", "bunny", "ovh", "fastly", "akamai"),
             "tiktok": ("tiktok",),
             "instagram": ("instagram",),
@@ -6521,7 +6544,7 @@ class MainWindow(QMainWindow):
             self._tray_toggle_action.setText(f"{self._t('Компоненты', 'Components')}: {state_text}")
 
     def _should_minimize_to_tray(self) -> bool:
-        # В close path используем только последний snapshot, без live runtime вызовов.
+        # при закрытии берём последний snapshot и не дёргаем runtime
         states = self._component_states()
         for component_id in self._master_active_components():
             state = states.get(component_id)
@@ -6868,7 +6891,12 @@ class MainWindow(QMainWindow):
 
     def _apply_settings_payload(self, before, payload: dict[str, object]) -> None:
         effective_payload = dict(payload)
-        if "fortnite" in {str(item) for item in list(self.context.settings.get().selected_service_ids or [])}:
+        selected_services = {str(item) for item in list(self.context.settings.get().selected_service_ids or [])}
+        if "gaming" in selected_services:
+            gaming_general = self._preferred_service_general_id(GAMING_GENERAL_PRIORITY)
+            if gaming_general:
+                effective_payload["selected_zapret_general"] = gaming_general
+        elif "fortnite" in selected_services:
             effective_payload["zapret_ipset_mode"] = "any"
             effective_payload["zapret_game_filter_mode"] = "tcpudp"
         before_theme = str(getattr(before, "theme", self.context.settings.get().theme))
@@ -7040,14 +7068,14 @@ class MainWindow(QMainWindow):
         self._update_runtime_snapshot_from_payload(payload)
         self._update_mods_cache_from_payload(payload)
         self._update_general_options_from_payload(payload)
-        if action in {"toggle_master_runtime", "start_enabled_components", "start_component", "select_general", "apply_settings", "load_startup_snapshot", "load_components_payload", "select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic"}:
+        if action in {"toggle_master_runtime", "start_enabled_components", "start_component", "select_general", "apply_settings", "load_startup_snapshot", "load_components_payload", "select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic", "refresh_xbox_dns"}:
             self._notify_component_errors_from_payload(payload)
         self._notify_telegram_proxy_status_from_payload(payload)
         self._notify_zapret_restart_from_payload(payload)
         if action in {"update_zapret_runtime", "update_tg_ws_proxy_runtime"}:
             self._invalidate_general_options_cache()
             self._page_payload_cache.clear()
-        elif action in {"toggle_mod", "toggle_component_enabled", "move_mod", "set_mod_emoji", "install_mod", "remove_mod", "import_mod_from_github", "import_mod_from_paths", "import_mod_from_path", "rebuild_merge_runtime", "set_selected_services", "select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic"}:
+        elif action in {"toggle_mod", "toggle_component_enabled", "move_mod", "set_mod_emoji", "install_mod", "remove_mod", "import_mod_from_github", "import_mod_from_paths", "import_mod_from_path", "rebuild_merge_runtime", "set_selected_services", "select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic", "refresh_xbox_dns"}:
             self._page_payload_cache.clear()
         if action == "load_startup_snapshot":
             self._startup_snapshot_ready = True
@@ -7097,7 +7125,7 @@ class MainWindow(QMainWindow):
             self._mark_dirty("dashboard", "components", "tray")
             self._ui_signals.component_action_done.emit(action_id)
             return
-        if action in {"select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic"}:
+        if action in {"select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic", "refresh_xbox_dns"}:
             self._mark_dirty("dashboard", "components", "tray")
             if action_id == "__settings_vpn_refresh__":
                 self._finish_settings_vpn_refresh(success=True)
@@ -7224,7 +7252,7 @@ class MainWindow(QMainWindow):
                 self._ui_signals.component_action_done.emit("__general__")
         if action == "apply_settings":
             self._ui_signals.component_action_done.emit("__settings__")
-        if action in {"toggle_component_enabled", "toggle_component_autostart", "start_component", "stop_component", "toggle_goshkow_vpn_mode"}:
+        if action in {"toggle_component_enabled", "toggle_component_autostart", "start_component", "stop_component", "toggle_goshkow_vpn_mode", "refresh_xbox_dns"}:
             self._ui_signals.component_action_done.emit(action_id)
         if action_id == "__settings_vpn_refresh__":
             self._finish_settings_vpn_refresh(success=False)
@@ -7277,6 +7305,8 @@ class MainWindow(QMainWindow):
         if source:
             return source
         normalized = (action or "").strip().lower()
+        if "xbox_dns" in normalized or "xbox-dns" in normalized or "dns" in normalized:
+            return "xbox-dns"
         if "tg_ws_proxy" in normalized or "tg-ws-proxy" in normalized or "telegram" in normalized:
             return "tg-ws-proxy"
         if "goshkow_vpn" in normalized or "goshkow-vpn" in normalized or "vpn" in normalized:
@@ -7299,6 +7329,7 @@ class MainWindow(QMainWindow):
         labels = {
             "tg-ws-proxy": "TG WS Proxy",
             "goshkow-vpn": "goshkow vpn",
+            "xbox-dns": "XBox DNS",
             "zapret": "Zapret",
             "mods": self._t("Модификации", "Mods"),
             "settings": self._t("Настройки", "Settings"),
@@ -11257,17 +11288,28 @@ class MainWindow(QMainWindow):
                 ordered.append(preset.id)
         return ordered
 
-    def _apply_fortnite_service_preferences_locally(self) -> None:
-        changes: dict[str, str] = {
-            "zapret_ipset_mode": "any",
-            "zapret_game_filter_mode": "tcpudp",
-        }
+    def _preferred_service_general_id(self, priority: tuple[str, ...]) -> str:
         options = self._general_options_for_current_service_tests(self._sorted_general_options())
-        for wanted in FORTNITE_GENERAL_PRIORITY:
+        for wanted in priority:
             match = next((option for option in options if str(option.get("name", "")).strip().lower() == wanted.lower()), None)
             if match is not None and str(match.get("id", "")).strip():
-                changes["selected_zapret_general"] = str(match["id"])
-                break
+                return str(match["id"])
+        return ""
+
+    def _apply_service_preferences_locally(self, normalized: list[str]) -> None:
+        changes: dict[str, str] = {}
+        if "gaming" in normalized:
+            general_id = self._preferred_service_general_id(GAMING_GENERAL_PRIORITY)
+            if general_id:
+                changes["selected_zapret_general"] = general_id
+        elif "fortnite" in normalized:
+            changes["zapret_ipset_mode"] = "any"
+            changes["zapret_game_filter_mode"] = "tcpudp"
+            general_id = self._preferred_service_general_id(FORTNITE_GENERAL_PRIORITY)
+            if general_id:
+                changes["selected_zapret_general"] = general_id
+        if not changes:
+            return
         self.context.settings.update(**changes)
 
     def _on_service_card_toggled(self, service_id: str, selected: bool) -> None:
@@ -11317,8 +11359,7 @@ class MainWindow(QMainWindow):
         normalized = self._normalize_service_ids(self._optimistic_selected_service_ids)
         if normalized != self._selected_service_ids():
             self.context.settings.update(selected_service_ids=normalized)
-            if "fortnite" in normalized:
-                self._apply_fortnite_service_preferences_locally()
+            self._apply_service_preferences_locally(normalized)
 
     def _flush_selected_services_backend_sync(self) -> None:
         pending = list(self._pending_selected_service_ids or [])
@@ -11343,8 +11384,7 @@ class MainWindow(QMainWindow):
             self._services_selection_revision += 1
             revision = self._services_selection_revision
             self.context.settings.update(selected_service_ids=normalized)
-            if "fortnite" in normalized:
-                self._apply_fortnite_service_preferences_locally()
+            self._apply_service_preferences_locally(normalized)
             changed = set(current).symmetric_difference(normalized)
             self._refresh_service_cards_subset(changed)
             self._update_service_selection_summary()
@@ -12017,7 +12057,7 @@ class MainWindow(QMainWindow):
             components = list(self._component_defs().values())
         if not states and not explicit_payload:
             states = self._component_states()
-        order = {"zapret": 0, "goshkow-vpn": 1, "tg-ws-proxy": 2}
+        order = {"zapret": 0, "goshkow-vpn": 1, "tg-ws-proxy": 2, "xbox-dns": 3}
         components = sorted(components, key=lambda item: order.get(item.id, 99))
         self.components_list.clear()
         self._components_card_by_id = {}
@@ -12047,9 +12087,19 @@ class MainWindow(QMainWindow):
         for component in components:
             state = states.get(component.id)
             status_text = state.status if state else "stopped"
-            subtitle = f"{self._t('Версия', 'Version')}: {component.version} | {self._t('Включен', 'Enabled')}: {self._t('да', 'yes') if component.enabled else self._t('нет', 'no')} | {self._t('Автозапуск', 'Autostart')}: {self._t('да', 'yes') if component.autostart else self._t('нет', 'no')} | {self._t('Статус', 'Status')}: {status_text}"
+            subtitle_parts = []
+            if component.id in {"zapret", "tg-ws-proxy"} and str(component.version or "").strip():
+                subtitle_parts.append(f"{self._t('Версия', 'Version')}: {component.version}")
+            subtitle_parts.extend(
+                [
+                    f"{self._t('Включен', 'Enabled')}: {self._t('да', 'yes') if component.enabled else self._t('нет', 'no')}",
+                    f"{self._t('Автозапуск', 'Autostart')}: {self._t('да', 'yes') if component.autostart else self._t('нет', 'no')}",
+                    f"{self._t('Статус', 'Status')}: {status_text}",
+                ]
+            )
+            subtitle = " | ".join(subtitle_parts)
             source = f"{self._t('Источник', 'Source')}: {component.source}"
-            display_name = {"zapret": "Zapret", "tg-ws-proxy": "Tg-Ws-Proxy"}.get(component.id, component.name)
+            display_name = {"zapret": "Zapret", "tg-ws-proxy": "Tg-Ws-Proxy", "goshkow-vpn": "goshkow vpn", "xbox-dns": "XBox DNS"}.get(component.id, component.name)
             item = QListWidgetItem(f"{display_name}\n{subtitle}\n{source}")
             item.setData(Qt.ItemDataRole.UserRole, component.id)
             item.setSizeHint(QSize(200, 70))
@@ -12093,8 +12143,17 @@ class MainWindow(QMainWindow):
                 "Авторская VPN-подписка без ограничений по трафику и количеству устройств. Доступна на смартфонах, ПК, ноутбуках и других устройствах. Первые 10 дней подписки бесплатно.",
                 "Author VPN subscription with no traffic or device limits. Available on phones, PCs, laptops, and other devices. The first 10 days are free.",
             ),
+            "xbox-dns": self._t(
+                "DNS-серверы для доступа к нейросетям, играм и полезным инструментам без VPN.",
+                "DNS servers for access to AI services, games, and useful tools without a VPN.",
+            ),
         }
-        icons = {"zapret": "component_zapret.svg", "tg-ws-proxy": "component_tg.svg", "goshkow-vpn": self._vpn_icon_name()}
+        icons = {
+            "zapret": "component_zapret.svg",
+            "tg-ws-proxy": "component_tg.svg",
+            "goshkow-vpn": self._vpn_icon_name(),
+            "xbox-dns": "component_xbox_dns.svg",
+        }
         vpn_state = {}
         if isinstance(payload, dict) and isinstance(payload.get("goshkow_vpn"), dict):
             vpn_state = dict(payload.get("goshkow_vpn") or {})
@@ -12108,14 +12167,14 @@ class MainWindow(QMainWindow):
         for index, component in enumerate(components):
             state = states.get(component.id)
             status_text, _status_icon = self._component_badge_state(component, state, any_running=False)
-            display_name = {"zapret": "Zapret", "tg-ws-proxy": "Tg-Ws-Proxy", "goshkow-vpn": "goshkow vpn"}.get(component.id, component.name)
+            display_name = {"zapret": "Zapret", "tg-ws-proxy": "Tg-Ws-Proxy", "goshkow-vpn": "goshkow vpn", "xbox-dns": "XBox DNS"}.get(component.id, component.name)
             card, card_layout = self._card()
             card.setMinimumWidth(360)
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
             self._components_card_by_id[component.id] = card
             icon = QLabel()
             if component.id == "tg-ws-proxy":
-                icon_size = 38
+                icon_size = 36
             elif component.id == "goshkow-vpn":
                 icon_size = 29
             else:
@@ -12123,11 +12182,12 @@ class MainWindow(QMainWindow):
             icon_slot = QSize(icon_size, icon_size + (4 if component.id == "goshkow-vpn" else 0))
             icon.setFixedSize(icon_slot)
             raw_icon_pixmap = self._icon(icons.get(component.id, "components.svg")).pixmap(icon_size, icon_size)
+            icon_fill = 0.75 if component.id == "tg-ws-proxy" else 1.0
             icon.setPixmap(
                 self._compose_icon_slot_pixmap(
                     raw_icon_pixmap,
                     icon_slot,
-                    1.0,
+                    icon_fill,
                     0.0,
                     3.0 if component.id == "goshkow-vpn" else 0.0,
                 )
@@ -12153,7 +12213,7 @@ class MainWindow(QMainWindow):
                 settings_icon_btn.clicked.connect(lambda _=False, cid=component.id: self._open_component_settings(cid))
                 self._attach_button_animations(settings_icon_btn)
                 icon_row.addWidget(settings_icon_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
-            if component.id in {"zapret", "tg-ws-proxy", "goshkow-vpn"}:
+            if component.id in {"zapret", "tg-ws-proxy", "goshkow-vpn", "xbox-dns"}:
                 source_icon_btn = QToolButton()
                 source_icon_btn.setProperty("class", "action")
                 source_icon_btn.setIcon(self._icon("external.svg"))
@@ -12172,11 +12232,16 @@ class MainWindow(QMainWindow):
                     update_icon_btn.setToolTip(
                         self._t("Обновить Zapret", "Update Zapret")
                         if component.id == "zapret"
+                        else self._t("Обновить DNS", "Refresh DNS")
+                        if component.id == "xbox-dns"
                         else self._t("Обновить TG WS Proxy", "Update TG WS Proxy")
                     )
-                    update_icon_btn.clicked.connect(
-                        self._update_zapret_runtime if component.id == "zapret" else self._update_tg_ws_proxy_runtime
-                    )
+                    if component.id == "zapret":
+                        update_icon_btn.clicked.connect(self._update_zapret_runtime)
+                    elif component.id == "xbox-dns":
+                        update_icon_btn.clicked.connect(self._refresh_xbox_dns)
+                    else:
+                        update_icon_btn.clicked.connect(self._update_tg_ws_proxy_runtime)
                     self._attach_button_animations(update_icon_btn)
                     icon_row.addWidget(update_icon_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
             card_layout.addLayout(icon_row)
@@ -12197,11 +12262,14 @@ class MainWindow(QMainWindow):
             desc.setWordWrap(True)
             card_layout.addWidget(desc)
 
-            details = QLabel(
-                f"{self._t('Автор', 'Author')}: {'goshkow' if component.id == 'goshkow-vpn' else 'Flowseal'}\n"
-                f"{self._t('Статус', 'Status')}: {status_text}\n"
-                f"{self._t('Версия', 'Version')}: {component.version}"
-            )
+            author = "goshkow" if component.id == "goshkow-vpn" else "xbox-dns.ru" if component.id == "xbox-dns" else "Flowseal"
+            detail_lines = [
+                f"{self._t('Автор', 'Author')}: {author}",
+                f"{self._t('Статус', 'Status')}: {status_text}",
+            ]
+            if component.id in {"zapret", "tg-ws-proxy"} and str(component.version or "").strip():
+                detail_lines.append(f"{self._t('Версия', 'Version')}: {component.version}")
+            details = QLabel("\n".join(detail_lines))
             details.setProperty("class", "muted")
             details.setWordWrap(True)
             card_layout.addWidget(details)
@@ -12209,6 +12277,7 @@ class MainWindow(QMainWindow):
             enabled_text = self._t("включен", "enabled") if component.enabled else self._t("выключен", "disabled")
             participation = QLabel(f"{self._t('Участие в ON/OFF', 'ON/OFF participation')}: {enabled_text}")
             participation.setWordWrap(True)
+            card_layout.addStretch(1)
             card_layout.addWidget(participation)
             if component.id == "zapret":
                 if not self._sorted_general_options() and general_options_from_payload:
@@ -12430,6 +12499,9 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self._close_component_update_dialog()
             self._show_error("TG WS Proxy", str(error))
+
+    def _refresh_xbox_dns(self) -> None:
+        self._submit_backend_task("refresh_xbox_dns", action_id="xbox-dns")
 
     def _telegram_download_url(self) -> str:
         machine = platform.machine().lower()
