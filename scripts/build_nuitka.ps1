@@ -49,7 +49,7 @@ foreach ($pattern in $excludeFilePatterns) {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-# runtime-конфиг хранит подписку и создаётся заново при запуске
+# runtime-конфиг vpn каждый раз собирается заново при запуске
 $vpnGeneratedConfig = Join-Path $runtimeStage "v2rayN\goshkow-vpn"
 if (Test-Path $vpnGeneratedConfig) {
     Remove-Item $vpnGeneratedConfig -Recurse -Force
@@ -69,8 +69,8 @@ $nuitkaArgs = @(
   "--windows-icon-from-ico=ui_assets\icons\app_shell.ico",
   '--company-name=goshkow',
   '--product-name=Zapret Hub',
-  '--file-version=2.0.1.0',
-  '--product-version=2.0.1.0',
+  '--file-version=2.0.2.0',
+  '--product-version=2.0.2.0',
   '--file-description=Zapret Hub',
   '--copyright=goshkow',
   "--output-dir=$OutputDir",

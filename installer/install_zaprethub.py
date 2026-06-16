@@ -50,6 +50,7 @@ def _is_ru() -> bool:
 RU = _is_ru()
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ZapretHub"
 INSTALLER_LOG_PATH = Path(tempfile.gettempdir()) / "zapret_hub_installer.log"
+INSTALLER_VERSION = "2.0.2"
 
 def tr(ru: str, en: str) -> str:
     return ru if RU else en
@@ -745,7 +746,7 @@ def _write_uninstall_registry(install_dir: Path, uninstaller_exe: Path, app_exe:
     uninstall_cmd = f'"{uninstaller_exe}" --uninstall --install-dir "{install_dir}"'
     values = {
         "DisplayName": "Zapret Hub",
-        "DisplayVersion": "1.4.0",
+        "DisplayVersion": INSTALLER_VERSION,
         "Publisher": "goshkow",
         "InstallLocation": str(install_dir),
         "DisplayIcon": str(app_exe),
@@ -802,15 +803,21 @@ def _install_dir_from_registry() -> Path | None:
 
 
 def _launch_folder_removal(install_dir: Path) -> None:
-    cmd = (
-        "@echo off\r\n"
-        ":retry\r\n"
-        f'rmdir /s /q "{install_dir}"\r\n'
-        f'if exist "{install_dir}" (\r\n'
-        "  ping 127.0.0.1 -n 2 > nul\r\n"
-        "  goto retry\r\n"
-        ")\r\n"
-    )
+    script_path = Path(tempfile.gettempdir()) / f"zapret_hub_uninstall_{int(time.time() * 1000)}.ps1"
+    target = str(install_dir).replace("'", "''")
+    script = (
+        "$target = '{target}'\n"
+        "for ($i = 0; $i -lt 40; $i++) {\n"
+        "  try {\n"
+        "    if (-not (Test-Path -LiteralPath $target)) { break }\n"
+        "    Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop\n"
+        "    if (-not (Test-Path -LiteralPath $target)) { break }\n"
+        "  } catch {}\n"
+        "  Start-Sleep -Milliseconds 800\n"
+        "}\n"
+        "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\n"
+    ).format(target=target)
+    script_path.write_text(script, encoding="utf-8")
     startup = None
     flags = 0
     if sys.platform.startswith("win"):
@@ -818,7 +825,11 @@ def _launch_folder_removal(install_dir: Path) -> None:
         startup = subprocess.STARTUPINFO()
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup.wShowWindow = 0
-    subprocess.Popen(["cmd", "/c", cmd], creationflags=flags, startupinfo=startup)
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+        creationflags=flags,
+        startupinfo=startup,
+    )
 
 
 class InstallerDialog(QDialog):
@@ -1150,13 +1161,14 @@ class InstallerWindow(QMainWindow):
             #InstallerTitleBar {{ background: transparent; border-bottom: 1px solid #243551; }}
             QLabel#title {{ font-size: 18pt; font-weight: 800; color: #ffffff; }}
             QLabel {{ background: transparent; }}
-            QLineEdit {{ background: #15213a; border: 1px solid #304a73; border-radius: 10px; padding: 9px; font-size: 11pt; }}
+            QLineEdit {{ background: #15213a; border: 1px solid #304a73; border-radius: 10px; padding: 9px; font-size: 11pt; color: #dbe5fb; selection-background-color: #5865f2; }}
             QPushButton {{ background: #253b62; border: 1px solid #396197; border-radius: 12px; padding: 10px 14px; font-size: 11pt; color: #dbe5fb; }}
             QPushButton#primary {{ background: #5865f2; border: 1px solid #7481ff; color: #fff; font-weight: 800; }}
             QToolButton {{ border: none; background: transparent; min-width: 26px; min-height: 26px; max-width: 26px; max-height: 26px; border-radius: 12px; padding: 0px; margin: 0px; }}
             QToolButton[role="close"]:hover {{ background: rgba(170, 84, 97, 0.62); border-radius: 12px; }}
             QProgressBar {{ background: #15213a; border: 1px solid #304a73; border-radius: 10px; text-align: center; }}
             QProgressBar::chunk {{ background: #5865f2; border-radius: 9px; }}
+            QCheckBox {{ color: #dbe5fb; background: transparent; }}
             QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 5px; border: 1px solid #4f6a98; background: transparent; }}
             QCheckBox::indicator:checked {{ background: #5865f2; border: 1px solid #7a86ff; image: url("{check_icon}"); }}
             """

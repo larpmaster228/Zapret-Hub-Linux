@@ -4802,6 +4802,8 @@ class MainWindow(QMainWindow):
     def _format_notification_time(self, value: str) -> str:
         try:
             dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
             return dt.strftime("%d.%m %H:%M")
         except Exception:
             return str(value)[:16]
@@ -5552,7 +5554,7 @@ class MainWindow(QMainWindow):
             "youtube": ("youtube", "youtu", "googlevideo"),
             "gaming": ("gaming", "game", "steam", "epic", "roblox", "riot", "league", "fortnite", "battle", "blizzard"),
             "clouds": ("clouds", "cloudfront", "amazon", "aws", "bunny", "ovh", "fastly", "akamai"),
-            "tiktok": ("tiktok",),
+            "ai": ("ai", "chatgpt", "claude", "gemini", "copilot"),
             "instagram": ("instagram",),
             "epic-games": ("epic",),
             "battle-net": ("battle", "blizzard"),
@@ -6331,6 +6333,7 @@ class MainWindow(QMainWindow):
             return
         if self._general_test_running:
             self._cancel_general_tests()
+        self._commit_pending_service_selection_if_needed()
         if not self._force_exit:
             if self._should_minimize_to_tray():
                 event.ignore()
@@ -6452,6 +6455,7 @@ class MainWindow(QMainWindow):
         self._begin_fast_exit()
 
     def _begin_fast_exit(self) -> None:
+        self._commit_pending_service_selection_if_needed()
         self._force_exit = True
         if self._window_opacity_animation is not None:
             self._window_opacity_animation.stop()
@@ -6615,6 +6619,7 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def _switch_page(self, index: int) -> None:
+        self._commit_pending_service_selection_if_needed()
         current_index = self.pages.currentIndex()
         try:
             if self._active_emoji_popup is not None:
@@ -6891,14 +6896,6 @@ class MainWindow(QMainWindow):
 
     def _apply_settings_payload(self, before, payload: dict[str, object]) -> None:
         effective_payload = dict(payload)
-        selected_services = {str(item) for item in list(self.context.settings.get().selected_service_ids or [])}
-        if "gaming" in selected_services:
-            gaming_general = self._preferred_service_general_id(GAMING_GENERAL_PRIORITY)
-            if gaming_general:
-                effective_payload["selected_zapret_general"] = gaming_general
-        elif "fortnite" in selected_services:
-            effective_payload["zapret_ipset_mode"] = "any"
-            effective_payload["zapret_game_filter_mode"] = "tcpudp"
         before_theme = str(getattr(before, "theme", self.context.settings.get().theme))
         before_language = str(getattr(before, "language", self.context.settings.get().language))
         next_theme = str(effective_payload.get("theme", before_theme))
@@ -11350,6 +11347,15 @@ class MainWindow(QMainWindow):
         self._optimistic_selected_service_ids = list(normalized)
         self._services_sync_timer.start(140)
 
+    def _commit_pending_service_selection_if_needed(self) -> None:
+        if self._pending_selected_service_ids is None and not self._services_sync_timer.isActive():
+            return
+        try:
+            self._services_sync_timer.stop()
+        except Exception:
+            pass
+        self._flush_selected_services_backend_sync()
+
     def _restore_optimistic_service_selection_if_needed(self) -> None:
         if self._optimistic_selected_service_ids is None:
             return
@@ -12446,9 +12452,8 @@ class MainWindow(QMainWindow):
 
     def _display_goshkow_vpn_server_name(self, server: dict[str, object]) -> str:
         raw_name = str(server.get("name", "") or server.get("host", "") or "goshkow vpn")
-        cleaned = raw_name
-        for token in ("🇫🇮", "🇳🇱", "🇩🇪", "🇷🇺", "🇺🇸", "🇨🇦", "🇸🇪", "🇳🇴", "🇩🇰", "🇵🇱", "🇫🇷", "🇨🇿", "🇸🇰"):
-            cleaned = cleaned.replace(token, "")
+        cleaned = re.sub(r"[\U0001F1E6-\U0001F1FF]{2}", "", raw_name)
+        cleaned = re.sub(r"[\U0001F300-\U0001FAFF]", " ", cleaned)
         cleaned = cleaned.replace(" - ", " ").replace(" #", " ").replace("#", "")
         cleaned = cleaned.replace("обход ", "обход ")
         cleaned = " ".join(cleaned.split()).strip(" -–—")
