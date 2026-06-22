@@ -10538,7 +10538,13 @@ class MainWindow(QMainWindow):
         effect = self._power_reconfigure_opacity
         if button is None or slot is None or effect is None:
             return
-        if self._power_reconfigure_visible == visible and self._power_reconfigure_slot_visible == visible:
+        current_width = max(0, int(slot.maximumWidth()))
+        already_visible = (
+            self._power_reconfigure_visible == visible
+            and self._power_reconfigure_slot_visible == visible
+            and ((visible and current_width >= 30 and float(effect.opacity()) >= 0.99) or (not visible and current_width <= 0))
+        )
+        if already_visible:
             return
         self._power_reconfigure_visible = visible
         self._power_reconfigure_slot_visible = visible
@@ -10553,7 +10559,7 @@ class MainWindow(QMainWindow):
             button.setEnabled(True)
             start_width = 0 if int(slot.maximumWidth()) <= 0 else max(0, min(30, int(slot.width() or slot.maximumWidth())))
             end_width = 30
-            start_opacity = 0.0 if start_width <= 0 else float(effect.opacity())
+            start_opacity = 1.0
             end_opacity = 1.0
         else:
             start_width = max(0, min(30, int(slot.width() or slot.maximumWidth())))
@@ -10568,6 +10574,8 @@ class MainWindow(QMainWindow):
             slot.setVisible(visible)
             button.setVisible(True)
             button.setEnabled(visible)
+            button.update()
+            slot.update()
             return
         slot.setMinimumWidth(start_width)
         slot.setMaximumWidth(start_width)
@@ -10590,10 +10598,10 @@ class MainWindow(QMainWindow):
         width_group.addAnimation(min_width_anim)
         width_group.addAnimation(width_anim)
         if visible:
-            effect.setOpacity(0.0)
-            group = QSequentialAnimationGroup(self)
-            group.addAnimation(width_group)
-            group.addAnimation(opacity_anim)
+            effect.setOpacity(1.0)
+            button.update()
+            slot.update()
+            group = width_group
         else:
             group = QParallelAnimationGroup(self)
             group.addAnimation(width_group)
@@ -10611,6 +10619,8 @@ class MainWindow(QMainWindow):
                 effect.setOpacity(1.0)
                 button.setEnabled(True)
                 button.setVisible(True)
+            button.update()
+            slot.update()
             self._power_reconfigure_slot_visible = visible
             if self._power_reconfigure_anim is group:
                 self._power_reconfigure_anim = None
