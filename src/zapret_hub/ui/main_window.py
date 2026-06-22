@@ -2630,74 +2630,45 @@ def _disable_native_window_rounding(widget: QWidget) -> None:
         return
 
 
-def _enable_native_window_shadow(widget: QWidget) -> None:
-    if not sys.platform.startswith("win"):
-        return
-    try:
-        hwnd = int(widget.winId())
-
-        class MARGINS(ctypes.Structure):
-            _fields_ = [
-                ("cxLeftWidth", ctypes.c_int),
-                ("cxRightWidth", ctypes.c_int),
-                ("cyTopHeight", ctypes.c_int),
-                ("cyBottomHeight", ctypes.c_int),
-            ]
-
-        dwmapi = ctypes.windll.dwmapi  # type: ignore[attr-defined]
-        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-        DWMWA_NCRENDERING_POLICY = 2
-        DWMWA_ALLOW_NCPAINT = 4
-        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
-        DWMWA_WINDOW_CORNER_PREFERENCE = 33
-        DWMWA_BORDER_COLOR = 34
-        DWMNCRP_ENABLED = 2
-        DWMWCP_ROUND = 2
-        DWMWA_COLOR_NONE = 0xFFFFFFFE
-        GWL_STYLE = -16
-        WS_THICKFRAME = 0x00040000
-        SWP_NOSIZE = 0x0001
-        SWP_NOMOVE = 0x0002
-        SWP_NOZORDER = 0x0004
-        SWP_FRAMECHANGED = 0x0020
-
-        style = int(user32.GetWindowLongW(ctypes.c_void_p(hwnd), ctypes.c_int(GWL_STYLE)))
-        if not style & WS_THICKFRAME:
-            user32.SetWindowLongW(ctypes.c_void_p(hwnd), ctypes.c_int(GWL_STYLE), ctypes.c_int(style | WS_THICKFRAME))
-            user32.SetWindowPos(
-                ctypes.c_void_p(hwnd),
-                None,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-            )
-
-        for attr, raw_value in (
-            (DWMWA_NCRENDERING_POLICY, DWMNCRP_ENABLED),
-            (DWMWA_ALLOW_NCPAINT, 1),
-            (DWMWA_USE_IMMERSIVE_DARK_MODE, 1),
-            (DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND),
-        ):
-            value = ctypes.c_int(raw_value)
-            dwmapi.DwmSetWindowAttribute(
-                ctypes.c_void_p(hwnd),
-                ctypes.c_uint(attr),
-                ctypes.byref(value),
-                ctypes.sizeof(value),
-            )
-        border_color = ctypes.c_uint(DWMWA_COLOR_NONE)
-        dwmapi.DwmSetWindowAttribute(
-            ctypes.c_void_p(hwnd),
-            ctypes.c_uint(DWMWA_BORDER_COLOR),
-            ctypes.byref(border_color),
-            ctypes.sizeof(border_color),
+class WindowShadowWidget(QWidget):
+    def __init__(self, owner: QWidget) -> None:
+        super().__init__(
+            owner,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus,
         )
-        margins = MARGINS(1, 1, 1, 1)
-        dwmapi.DwmExtendFrameIntoClientArea(ctypes.c_void_p(hwnd), ctypes.byref(margins))
-    except Exception:
-        return
+        self._owner = owner
+        self._margin = 18
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+    def sync_to_owner(self) -> None:
+        if not self._owner.isVisible() or self._owner.isMinimized():
+            self.hide()
+            return
+        geometry = self._owner.frameGeometry().adjusted(-self._margin, -self._margin, self._margin, self._margin)
+        if self.geometry() != geometry:
+            self.setGeometry(geometry)
+        if not self.isVisible():
+            self.show()
+        self.lower()
+        self.update()
+
+    def paintEvent(self, event: QEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(self._margin, self._margin, -self._margin, -self._margin)
+        radius = 16.0
+        for index, alpha in enumerate((34, 24, 16, 10, 6), start=1):
+            spread = float(index * 3)
+            shadow_rect = rect.adjusted(-spread, -spread + 1.5, spread, spread + 3.0)
+            color = QColor(0, 0, 0, alpha)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(shadow_rect, radius + spread, radius + spread)
 
 
 def _bring_widget_to_front(widget: QWidget) -> None:
@@ -2780,7 +2751,6 @@ class AppDialog(QDialog):
         root_layout.addWidget(self.body)
         shell.addWidget(root)
         _disable_native_window_rounding(self)
-        _enable_native_window_shadow(self)
 
     def prepare_and_center(self) -> None:
         self.adjustSize()
@@ -2815,7 +2785,6 @@ class AppDialog(QDialog):
 
     def showEvent(self, event: QEvent) -> None:
         _disable_native_window_rounding(self)
-        _enable_native_window_shadow(self)
         super().showEvent(event)
         self._fade_closing = False
         if self._fade_animation is not None:
@@ -3629,6 +3598,7 @@ class MainWindow(QMainWindow):
         self._page_transition_started_at = 0.0
         self._window_opacity_animation: QPropertyAnimation | None = None
         self._window_fade_pending_action: str | None = None
+        self._window_shadow: WindowShadowWidget | None = None
         self._nav_highlight_initialized = False
         self._skip_next_show_fade = False
         self._initial_show_completed = False
@@ -3696,7 +3666,8 @@ class MainWindow(QMainWindow):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, False)
         self._build_ui()
-        QTimer.singleShot(0, lambda: _enable_native_window_shadow(self))
+        self._window_shadow = WindowShadowWidget(self)
+        QTimer.singleShot(0, self._sync_window_shadow)
         self._attach_button_animations_recursive(self.centralWidget())
         self._setup_tray()
         self._prepare_onboarding_services_stage()
@@ -4248,8 +4219,7 @@ class MainWindow(QMainWindow):
     def showEvent(self, event: QEvent) -> None:
         super().showEvent(event)
         self._sync_window_icon()
-        _disable_native_window_rounding(self)
-        _enable_native_window_shadow(self)
+        self._sync_window_shadow()
         self._sync_nav_highlight(animated=self._nav_highlight_initialized)
         if not self._nav_highlight_initialized:
             self._nav_highlight_initialized = True
@@ -4266,6 +4236,29 @@ class MainWindow(QMainWindow):
             self._skip_next_show_focus = False
             return
         QTimer.singleShot(0, lambda: _bring_widget_to_front(self))
+
+    def moveEvent(self, event: QEvent) -> None:
+        super().moveEvent(event)
+        self._sync_window_shadow()
+
+    def resizeEvent(self, event: QEvent) -> None:
+        super().resizeEvent(event)
+        self._sync_window_shadow()
+
+    def hideEvent(self, event: QEvent) -> None:
+        shadow = self._window_shadow
+        if shadow is not None:
+            shadow.hide()
+        super().hideEvent(event)
+
+    def _sync_window_shadow(self) -> None:
+        shadow = self._window_shadow
+        if shadow is None:
+            return
+        try:
+            shadow.sync_to_owner()
+        except RuntimeError:
+            self._window_shadow = None
 
     def _schedule_post_show_sync(self) -> None:
         def _sync() -> None:
@@ -6528,6 +6521,9 @@ class MainWindow(QMainWindow):
         if self._window_fade_pending_action is not None:
             event.ignore()
             return
+        shadow = self._window_shadow
+        if shadow is not None:
+            shadow.hide()
         if self._general_test_running:
             self._cancel_general_tests()
         self._commit_pending_service_selection_if_needed()
