@@ -2633,14 +2633,14 @@ def _disable_native_window_rounding(widget: QWidget) -> None:
 class WindowShadowWidget(QWidget):
     def __init__(self, owner: QWidget) -> None:
         super().__init__(
-            owner,
+            None,
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.NoDropShadowWindowHint
             | Qt.WindowType.WindowDoesNotAcceptFocus,
         )
         self._owner = owner
-        self._margin = 18
+        self._margin = 10
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
@@ -2656,15 +2656,16 @@ class WindowShadowWidget(QWidget):
             self.show()
         self.lower()
         self.update()
+        self._owner.raise_()
 
     def paintEvent(self, event: QEvent) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(self._margin, self._margin, -self._margin, -self._margin)
         radius = 16.0
-        for index, alpha in enumerate((34, 24, 16, 10, 6), start=1):
-            spread = float(index * 3)
-            shadow_rect = rect.adjusted(-spread, -spread + 1.5, spread, spread + 3.0)
+        for index, alpha in enumerate((18, 13, 8), start=1):
+            spread = float(index * 2)
+            shadow_rect = rect.adjusted(-spread, -spread + 0.8, spread, spread + 1.8)
             color = QColor(0, 0, 0, alpha)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
