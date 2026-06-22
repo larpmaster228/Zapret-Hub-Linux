@@ -36,7 +36,6 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGraphicsBlurEffect,
-    QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
@@ -2248,9 +2247,31 @@ class OnboardingFrame(QFrame):
     glowX = Property(float, _get_glow_x, _set_glow_x)
     glowY = Property(float, _get_glow_y, _set_glow_y)
 
+    def _paint_soft_window_depth(self, painter: QPainter, rect: QRectF, light: bool) -> None:
+        painter.save()
+        path = QPainterPath()
+        path.addRoundedRect(rect, 16, 16)
+        painter.setClipPath(path)
+        alpha = 18 if light else 24
+        for offset, opacity in ((1.0, alpha), (3.0, alpha // 2), (6.0, max(4, alpha // 4))):
+            pen = QPen(QColor(0, 0, 0, opacity), offset)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(offset / 2.0, offset / 2.0, -offset / 2.0, -offset / 2.0), 16, 16)
+        bottom = QLinearGradient(rect.left(), rect.bottom() - 18, rect.left(), rect.bottom())
+        bottom.setColorAt(0.0, QColor(0, 0, 0, 0))
+        bottom.setColorAt(1.0, QColor(0, 0, 0, 20 if not light else 14))
+        painter.fillRect(QRectF(rect.left(), rect.bottom() - 18, rect.width(), 18), bottom)
+        painter.restore()
+
     def paintEvent(self, event: QEvent) -> None:
         if not self._onboarding_active:
             super().paintEvent(event)
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+            if rect.width() > 0 and rect.height() > 0:
+                self._paint_soft_window_depth(painter, rect, self.palette().window().color().lightnessF() > 0.6)
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -2290,6 +2311,7 @@ class OnboardingFrame(QFrame):
         side.setColorAt(1.0, side_color)
         painter.fillRect(rect, side)
         painter.restore()
+        self._paint_soft_window_depth(painter, rect, light)
         border = QColor("#24304a" if not light else "#d2ddeb")
         painter.setPen(QPen(border, 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -3598,7 +3620,7 @@ class MainWindow(QMainWindow):
         if isinstance(startup_snapshot, dict):
             self._seed_startup_snapshot(startup_snapshot)
 
-        self.setFixedSize(880, 540)
+        self.setFixedSize(860, 520)
         self.setWindowTitle("Zapret Hub")
         self.setWindowIcon(self._runtime_window_icon())
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -4301,18 +4323,12 @@ class MainWindow(QMainWindow):
         shell = QWidget()
         shell.setObjectName("WindowShell")
         root = QVBoxLayout(shell)
-        root.setContentsMargins(10, 10, 10, 10)
+        root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(0)
 
         frame = OnboardingFrame()
         frame.setObjectName("RootFrame")
-        frame.setFixedSize(860, 520)
         self._root_frame = frame
-        shadow = QGraphicsDropShadowEffect(frame)
-        shadow.setBlurRadius(22)
-        shadow.setOffset(0, 3)
-        shadow.setColor(QColor(0, 0, 0, 72))
-        frame.setGraphicsEffect(shadow)
         root_frame = QVBoxLayout(frame)
         root_frame.setContentsMargins(0, 0, 0, 0)
         root_frame.setSpacing(0)
@@ -4330,7 +4346,7 @@ class MainWindow(QMainWindow):
         body.addWidget(sidebar)
         body.addWidget(self._build_content(), 1)
 
-        root.addWidget(frame, 0, Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(frame)
         self.setCentralWidget(shell)
         self._build_loading_overlay(shell)
 
