@@ -3456,10 +3456,13 @@ class MainWindow(QMainWindow):
         self.power_aura: PowerAuraWidget | None = None
         self.power_caption_text: QLabel | None = None
         self.power_vpn_btn: QToolButton | None = None
+        self.power_reconfigure_slot: QWidget | None = None
         self.power_reconfigure_btn: QToolButton | None = None
         self._power_reconfigure_opacity: QGraphicsOpacityEffect | None = None
         self._power_reconfigure_anim: QParallelAnimationGroup | QSequentialAnimationGroup | None = None
         self._power_reconfigure_visible = True
+        self._power_reconfigure_slot_visible = True
+        self._dashboard_page_opening = False
         self.power_caption_dots: QLabel | None = None
         self._power_caption_dots_opacity: QGraphicsOpacityEffect | None = None
         self._power_caption_dots_blur: QGraphicsBlurEffect | None = None
@@ -5414,7 +5417,19 @@ class MainWindow(QMainWindow):
         self.power_vpn_btn.setToolTip("goshkow vpn")
         self.power_vpn_btn.clicked.connect(self._handle_power_vpn_button)
         self._attach_button_animations(self.power_vpn_btn)
-        self.power_reconfigure_btn = QToolButton(self.power_caption)
+
+        self.power_reconfigure_slot = QWidget(self.power_caption)
+        self.power_reconfigure_slot.setObjectName("PowerReconfigureSlot")
+        self.power_reconfigure_slot.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.power_reconfigure_slot.setStyleSheet("#PowerReconfigureSlot { background: transparent; border: none; }")
+        self.power_reconfigure_slot.setFixedHeight(30)
+        self.power_reconfigure_slot.setMinimumWidth(30)
+        self.power_reconfigure_slot.setMaximumWidth(30)
+        reconfigure_slot_layout = QHBoxLayout(self.power_reconfigure_slot)
+        reconfigure_slot_layout.setContentsMargins(0, 0, 0, 0)
+        reconfigure_slot_layout.setSpacing(0)
+
+        self.power_reconfigure_btn = QToolButton(self.power_reconfigure_slot)
         self.power_reconfigure_btn.setObjectName("PowerReconfigureButton")
         self.power_reconfigure_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.power_reconfigure_btn.setIcon(
@@ -5427,9 +5442,7 @@ class MainWindow(QMainWindow):
             )
         )
         self.power_reconfigure_btn.setIconSize(QSize(15, 15))
-        self.power_reconfigure_btn.setMinimumSize(0, 30)
-        self.power_reconfigure_btn.setMaximumSize(30, 30)
-        self.power_reconfigure_btn.setFixedHeight(30)
+        self.power_reconfigure_btn.setFixedSize(30, 30)
         self.power_reconfigure_btn.setToolTip(self._t("Подобрать настройки", "Find settings"))
         self.power_reconfigure_btn.clicked.connect(self._restart_onboarding_from_dashboard)
         self._attach_button_animations(self.power_reconfigure_btn)
@@ -5437,6 +5450,7 @@ class MainWindow(QMainWindow):
         self._power_reconfigure_opacity.setOpacity(1.0)
         self.power_reconfigure_btn.setGraphicsEffect(self._power_reconfigure_opacity)
         self._sync_power_reconfigure_button_style()
+        reconfigure_slot_layout.addWidget(self.power_reconfigure_btn, 0, Qt.AlignmentFlag.AlignCenter)
         self.power_caption_text = QLabel("OFF")
         self.power_caption_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.power_caption_text.setProperty("class", "title")
@@ -5450,7 +5464,7 @@ class MainWindow(QMainWindow):
         caption_layout.addStretch(1)
         caption_layout.addWidget(self.power_vpn_btn, 0, Qt.AlignmentFlag.AlignCenter)
         caption_layout.addWidget(self.power_caption_text, 0, Qt.AlignmentFlag.AlignCenter)
-        caption_layout.addWidget(self.power_reconfigure_btn, 0, Qt.AlignmentFlag.AlignCenter)
+        caption_layout.addWidget(self.power_reconfigure_slot, 0, Qt.AlignmentFlag.AlignCenter)
         caption_layout.addStretch(1)
         power_block_layout.addWidget(power_stage, 0, Qt.AlignmentFlag.AlignHCenter)
         power_block_layout.addWidget(self.power_caption, 0, Qt.AlignmentFlag.AlignHCenter)
@@ -6775,8 +6789,10 @@ class MainWindow(QMainWindow):
                 except Exception as error:
                     self.context.logging.log("error", "components_refresh_request_failed", error=str(error))
             elif index == 0:
+                self._dashboard_page_opening = current_index != 0
                 self.refresh_dashboard()
                 self._sync_power_aura_geometry()
+                QTimer.singleShot(0, lambda: setattr(self, "_dashboard_page_opening", False))
             elif index == 3:
                 cached = self._page_payload_cache.get("mods")
                 if cached is not None:
@@ -9293,7 +9309,35 @@ class MainWindow(QMainWindow):
         self._submit_backend_task("rebuild_merge_runtime", action_id="__merge_rebuild__")
 
     def _check_updates_popup(self) -> None:
+        self._stop_goshkow_vpn_before_update_flow()
         self._start_update_check(manual=True)
+
+    def _stop_goshkow_vpn_before_update_flow(self) -> None:
+        try:
+            settings = self.context.settings.get()
+            enabled = {str(item) for item in list(settings.enabled_component_ids or [])}
+            had_vpn_enabled = "goshkow-vpn" in enabled
+            states = self._component_states()
+            vpn_running = bool(states.get("goshkow-vpn") and str(getattr(states["goshkow-vpn"], "status", "") or "") == "running")
+            if not had_vpn_enabled and not vpn_running:
+                return
+            enabled.discard("goshkow-vpn")
+            self.context.settings.update(enabled_component_ids=sorted(enabled), selected_runtime_mode="zapret")
+            self.context.processes.stop_component("goshkow-vpn")
+            self._set_power_vpn_switch_pending(False)
+            self._set_power_reconfigure_visible(True, animate=True)
+            self._mark_dirty("dashboard", "components", "tray")
+            self._schedule_refresh()
+        except Exception as error:
+            self._add_notification(
+                "warning",
+                self._t("Обновления", "Updates"),
+                self._t(
+                    f"Не удалось выключить VPN перед обновлением: {error}",
+                    f"Failed to stop VPN before update: {error}",
+                ),
+                source="updates",
+            )
 
     def _check_updates_on_start(self) -> None:
         if self._launch_hidden:
@@ -9583,6 +9627,7 @@ class MainWindow(QMainWindow):
         if schedule_only:
             self.context.settings.update(apply_update_on_next_launch=True)
             return
+        self._stop_goshkow_vpn_before_update_flow()
         if self.context.settings.get().apply_update_on_next_launch:
             self.context.settings.update(apply_update_on_next_launch=False)
         if self._update_prepare_dialog is not None:
@@ -10356,7 +10401,8 @@ class MainWindow(QMainWindow):
             self.power_aura.set_idle_pulse_enabled(fully_running and not self._toggle_in_progress)
             self.power_aura.set_status_glow_enabled(fully_running or self._toggle_in_progress)
         reconfigure_visible = not (vpn_display_selected or vpn_running or self._vpn_mode_switch_in_progress)
-        self._set_power_reconfigure_visible(reconfigure_visible, animate=not self._page_transition_running)
+        animate_reconfigure = not (self._page_transition_running or self._dashboard_page_opening)
+        self._set_power_reconfigure_visible(reconfigure_visible, animate=animate_reconfigure)
         if self.power_caption_dots is not None:
             self.power_caption_dots.setText("")
             self.power_caption_dots.hide()
@@ -10488,44 +10534,50 @@ class MainWindow(QMainWindow):
 
     def _set_power_reconfigure_visible(self, visible: bool, *, animate: bool = True) -> None:
         button = self.power_reconfigure_btn
+        slot = self.power_reconfigure_slot
         effect = self._power_reconfigure_opacity
-        if button is None or effect is None:
+        if button is None or slot is None or effect is None:
             return
-        if self._power_reconfigure_visible == visible and button.isVisible() == visible:
+        if self._power_reconfigure_visible == visible and self._power_reconfigure_slot_visible == visible:
             return
         self._power_reconfigure_visible = visible
+        self._power_reconfigure_slot_visible = visible
         if self._power_reconfigure_anim is not None:
             self._power_reconfigure_anim.stop()
             self._power_reconfigure_anim.deleteLater()
             self._power_reconfigure_anim = None
+        button.setFixedSize(30, 30)
         if visible:
+            slot.setVisible(True)
             button.setVisible(True)
             button.setEnabled(True)
-            start_width = 0 if int(button.maximumWidth()) <= 0 else max(0, min(30, int(button.width() or button.maximumWidth())))
+            start_width = 0 if int(slot.maximumWidth()) <= 0 else max(0, min(30, int(slot.width() or slot.maximumWidth())))
             end_width = 30
             start_opacity = 0.0 if start_width <= 0 else float(effect.opacity())
             end_opacity = 1.0
         else:
-            start_width = max(0, min(30, int(button.width() or button.maximumWidth())))
+            start_width = max(0, min(30, int(slot.width() or slot.maximumWidth())))
             end_width = 0
             start_opacity = float(effect.opacity())
             end_opacity = 0.0
             button.setEnabled(False)
         if not animate:
-            button.setMinimumWidth(end_width)
-            button.setMaximumWidth(end_width)
+            slot.setMinimumWidth(end_width)
+            slot.setMaximumWidth(end_width)
             effect.setOpacity(end_opacity)
-            button.setVisible(visible)
+            slot.setVisible(visible)
+            button.setVisible(True)
+            button.setEnabled(visible)
             return
-        button.setMinimumWidth(start_width)
-        button.setMaximumWidth(start_width)
+        slot.setMinimumWidth(start_width)
+        slot.setMaximumWidth(start_width)
         width_group = QParallelAnimationGroup(self)
-        min_width_anim = QPropertyAnimation(button, b"minimumWidth", width_group)
+        min_width_anim = QPropertyAnimation(slot, b"minimumWidth", width_group)
         min_width_anim.setDuration(260)
         min_width_anim.setStartValue(start_width)
         min_width_anim.setEndValue(end_width)
         min_width_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        width_anim = QPropertyAnimation(button, b"maximumWidth", width_group)
+        width_anim = QPropertyAnimation(slot, b"maximumWidth", width_group)
         width_anim.setDuration(260)
         width_anim.setStartValue(start_width)
         width_anim.setEndValue(end_width)
@@ -10548,14 +10600,18 @@ class MainWindow(QMainWindow):
             group.addAnimation(opacity_anim)
         def _finish() -> None:
             if not visible:
-                button.setMinimumWidth(0)
-                button.setMaximumWidth(0)
-                button.setVisible(False)
+                slot.setMinimumWidth(0)
+                slot.setMaximumWidth(0)
+                slot.setVisible(False)
+                button.setVisible(True)
             else:
-                button.setMinimumWidth(30)
-                button.setMaximumWidth(30)
+                slot.setMinimumWidth(30)
+                slot.setMaximumWidth(30)
+                slot.setVisible(True)
                 effect.setOpacity(1.0)
                 button.setEnabled(True)
+                button.setVisible(True)
+            self._power_reconfigure_slot_visible = visible
             if self._power_reconfigure_anim is group:
                 self._power_reconfigure_anim = None
             group.deleteLater()
@@ -11728,6 +11784,8 @@ class MainWindow(QMainWindow):
         if action_id == "goshkow-vpn":
             self._set_power_vpn_switch_pending(False)
             self._finish_vpn_mode_power_transition()
+            self._mark_dirty("dashboard", "components", "tray")
+            QTimer.singleShot(0, self.refresh_dashboard)
 
         if action_id == "__settings__":
             self._hide_loading_overlay()
