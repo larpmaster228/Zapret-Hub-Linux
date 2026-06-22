@@ -50,7 +50,7 @@ def _is_ru() -> bool:
 RU = _is_ru()
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ZapretHub"
 INSTALLER_LOG_PATH = Path(tempfile.gettempdir()) / "zapret_hub_installer.log"
-INSTALLER_VERSION = "2.0.2"
+INSTALLER_VERSION = "2.1.0"
 
 def tr(ru: str, en: str) -> str:
     return ru if RU else en
@@ -771,6 +771,30 @@ def _write_uninstall_registry(install_dir: Path, uninstaller_exe: Path, app_exe:
             continue
 
 
+def _copy_running_installer_to(target_path: Path) -> bool:
+    current_installer = Path(sys.executable).resolve()
+    if not current_installer.exists() or current_installer.suffix.lower() != ".exe":
+        return False
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_target = target_path.with_suffix(target_path.suffix + ".tmp")
+    try:
+        if temp_target.exists():
+            temp_target.unlink()
+    except OSError:
+        pass
+    try:
+        shutil.copyfile(current_installer, temp_target)
+        temp_target.replace(target_path)
+        return target_path.exists()
+    except Exception:
+        try:
+            if temp_target.exists():
+                temp_target.unlink()
+        except OSError:
+            pass
+        return False
+
+
 def _remove_uninstall_registry() -> None:
     if not sys.platform.startswith("win"):
         return
@@ -1274,9 +1298,7 @@ class InstallerWindow(QMainWindow):
         app_exe = self.install_path / "zapret_hub.exe"
         uninstaller_exe = self.install_path / "uninstall_zaprethub.exe"
         try:
-            current_installer = Path(sys.executable).resolve()
-            if current_installer.exists() and current_installer.suffix.lower() == ".exe":
-                shutil.copy2(current_installer, uninstaller_exe)
+            _copy_running_installer_to(uninstaller_exe)
             _write_uninstall_registry(self.install_path, uninstaller_exe, app_exe)
         except Exception:
             pass

@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import logging.handlers
 import os
+import shutil
 import socket as _socket
 import sys
 import threading
@@ -17,18 +17,76 @@ import psutil
 from proxy import __version__, get_link_host, parse_dc_ip_list, proxy_config, coerce_domain_list
 from proxy.tg_ws_proxy import _run
 from utils.default_config import default_tray_config
+from utils.diagnostics import diagnose_listen_error
+from utils.logging_setup import build_log_handler
 
 log = logging.getLogger("tg-ws-tray")
 
 APP_NAME = "TgWsProxy"
+PORTABLE_DIR_NAME = "TgWsProxy_data"
 
 
-def _app_dir() -> Path:
+def _standard_app_dir() -> Path:
     if sys.platform == "win32":
         return Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP_NAME
+
+
+def _exe_dir() -> Optional[Path]:
+    try:
+        base = getattr(sys, "frozen", False) and sys.executable or sys.argv[0]
+    except Exception:
+        return None
+    if not base:
+        return None
+    p = Path(base).resolve()
+    return p.parent if p.is_file() else p
+
+
+def _detect_portable() -> Optional[Path]:
+    exe_dir = _exe_dir()
+    if exe_dir is None:
+        return None
+    portable_dir = exe_dir / PORTABLE_DIR_NAME
+    if "--portable" in sys.argv:
+        try:
+            portable_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("Cannot create portable dir %s: %s", portable_dir, repr(exc))
+            return None
+    if portable_dir.is_dir():
+        _migrate_into_portable(portable_dir)
+        return portable_dir
+    return None
+
+
+def _migrate_into_portable(portable_dir: Path) -> None:
+    try:
+        if any(portable_dir.iterdir()):
+            return
+    except OSError:
+        return
+    std = _standard_app_dir()
+    if not std.exists():
+        return
+    try:
+        for src in std.iterdir():
+            if ".log" in src.name:
+                continue
+            dst = portable_dir / src.name
+            try:
+                if not src.is_dir():
+                    shutil.copy2(src, dst)
+            except OSError as exc:
+                log.warning("Portable migration: skip %s: %s", src.name, repr(exc))
+    except OSError as exc:
+        log.warning("Portable migration failed: %s", repr(exc))
+
+
+def _app_dir() -> Path:
+    return _detect_portable() or _standard_app_dir()
 
 
 APP_DIR = _app_dir()
@@ -155,12 +213,7 @@ def setup_logging(verbose: bool = False, log_max_mb: float = 5) -> None:
     root.setLevel(level)
     logging.getLogger('asyncio').setLevel(logging.WARNING)
 
-    fh = logging.handlers.RotatingFileHandler(
-        str(LOG_FILE),
-        maxBytes=max(32 * 1024, int(log_max_mb * 1024 * 1024)),
-        backupCount=0,
-        encoding="utf-8",
-    )
+    fh = build_log_handler(str(LOG_FILE), log_max_mb=log_max_mb, backups=1)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter(_LOG_FMT_FILE, datefmt="%Y-%m-%d %H:%M:%S"))
     root.addHandler(fh)
@@ -231,7 +284,7 @@ _proxy_thread: Optional[threading.Thread] = None
 _async_stop: Optional[Tuple[asyncio.AbstractEventLoop, asyncio.Event]] = None
 
 
-def _run_proxy_thread(on_port_busy: Callable[[str], None]) -> None:
+def _run_proxy_thread(show_error: Callable[[str], None]) -> None:
     global _async_stop
 
     loop = asyncio.new_event_loop()
@@ -243,13 +296,11 @@ def _run_proxy_thread(on_port_busy: Callable[[str], None]) -> None:
         loop.run_until_complete(_run(stop_event=stop_ev))
     except Exception as exc:
         log.error("Proxy thread crashed: %s", repr(exc))
-        if "Address already in use" in str(exc) or "10048" in str(exc):
-            on_port_busy(
-                "Не удалось запустить прокси:\n"
-                "Порт уже используется другим приложением.\n\n"
-                "Закройте приложение, использующее этот порт, "
-                "или измените порт в настройках прокси и перезапустите."
-            )
+        msg, diagnose_called = diagnose_listen_error(exc)
+        if msg:
+            show_error(msg)
+        if diagnose_called:
+            diagnose_called()
     finally:
         loop.close()
         _async_stop = None
@@ -273,6 +324,7 @@ def apply_proxy_config(cfg: dict) -> bool:
     pc.fallback_cfproxy = cfg.get("cfproxy", DEFAULT_CONFIG["cfproxy"])
     pc.cfproxy_user_domains = coerce_domain_list(cfg.get("cfproxy_user_domain", DEFAULT_CONFIG["cfproxy_user_domain"]))
     pc.cfproxy_worker_domains = coerce_domain_list(cfg.get("cfproxy_worker_domain", DEFAULT_CONFIG["cfproxy_worker_domain"]))
+    pc.ws_keepalive_interval = max(0, cfg.get("ws_keepalive_interval", DEFAULT_CONFIG["ws_keepalive_interval"]))
     return True
 
 

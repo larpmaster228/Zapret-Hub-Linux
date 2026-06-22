@@ -22,7 +22,7 @@ from zapret_hub.services.service_catalog import (
     ServicePreset,
     prioritize_generals_for_services,
 )
-from PySide6.QtCore import QCoreApplication, QEasingCurve, QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal, QPropertyAnimation, QParallelAnimationGroup, Property, QByteArray
+from PySide6.QtCore import QCoreApplication, QEasingCurve, QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal, QPropertyAnimation, QParallelAnimationGroup, QSequentialAnimationGroup, Property, QByteArray
 from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeyEvent, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGraphicsBlurEffect,
+    QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
@@ -1037,7 +1038,8 @@ class AnimatedPowerButton(QToolButton):
 
     def set_active_state(self, active: bool, *, animate: bool = True) -> None:
         self._active = active
-        self._visual_mode = "on" if active else "off"
+        if self._visual_mode != "vpn":
+            self._visual_mode = "on" if active else "off"
         target = 1.14 if active else 1.0
         if self._scale_anim is not None:
             self._scale_anim.stop()
@@ -1069,6 +1071,13 @@ class AnimatedPowerButton(QToolButton):
         anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
         anim.start()
         self._scale_anim = anim
+
+    def set_vpn_accent_state(self, enabled: bool) -> None:
+        if enabled and self._active:
+            self._visual_mode = "vpn"
+        elif self._visual_mode == "vpn":
+            self._visual_mode = "on" if self._active else "off"
+        self.update()
 
     def enterEvent(self, event: QEvent) -> None:
         self._animate_hover(1.0)
@@ -1133,6 +1142,9 @@ class AnimatedPowerButton(QToolButton):
             on_top = QColor("#7b86ff")
             on_bottom = QColor("#4c58d8")
             on_border = QColor("#7b87ff")
+            vpn_top = QColor("#b17cff")
+            vpn_bottom = QColor("#7a3be6")
+            vpn_border = QColor("#a875ff")
             loading_top = QColor("#c7d3e6")
             loading_bottom = QColor("#9ba8bd")
             loading_border = QColor("#b9c6db")
@@ -1143,6 +1155,9 @@ class AnimatedPowerButton(QToolButton):
             on_top = QColor("#7380ff")
             on_bottom = QColor("#4551cb")
             on_border = QColor("#7b87ff")
+            vpn_top = QColor("#b58cff")
+            vpn_bottom = QColor("#6d3bd8")
+            vpn_border = QColor("#a875ff")
             loading_top = QColor("#707785")
             loading_bottom = QColor("#565d69")
             loading_border = QColor("#8b94a3")
@@ -1163,6 +1178,10 @@ class AnimatedPowerButton(QToolButton):
             gradient.setColorAt(0.0, loading_top)
             gradient.setColorAt(1.0, loading_bottom)
             border = loading_border
+        elif self._visual_mode == "vpn":
+            gradient.setColorAt(0.0, vpn_top)
+            gradient.setColorAt(1.0, vpn_bottom)
+            border = vpn_border
         elif self._active:
             gradient.setColorAt(0.0, on_top)
             gradient.setColorAt(1.0, on_bottom)
@@ -1177,12 +1196,14 @@ class AnimatedPowerButton(QToolButton):
 
         if self._hover_progress > 0.001:
             if self._light_theme:
-                if self._active or self._visual_mode == "loading":
+                if self._visual_mode == "vpn":
+                    glow_color = QColor(154, 93, 255, int(76 * self._hover_progress))
+                elif self._active or self._visual_mode == "loading":
                     glow_color = QColor(232, 243, 255, int(62 * self._hover_progress))
                 else:
                     glow_color = QColor(109, 154, 255, int(34 * self._hover_progress))
             else:
-                glow_color = QColor(148, 206, 255, int(34 * self._hover_progress))
+                glow_color = QColor(190, 142, 255, int(52 * self._hover_progress)) if self._visual_mode == "vpn" else QColor(148, 206, 255, int(34 * self._hover_progress))
             dx = self._glow_pos.x() - center.x()
             dy = self._glow_pos.y() - center.y()
             distance = max(1.0, (dx * dx + dy * dy) ** 0.5)
@@ -1262,6 +1283,7 @@ class PowerAuraWidget(QWidget):
         self._status_glow_breath = 0.0
         self._status_glow_phase = 0.0
         self._status_glow_presence = 0.0
+        self._accent_mode = "default"
         self._idle_pulse_timer = QTimer(self)
         self._idle_pulse_timer.setInterval(1480)
         self._idle_pulse_timer.timeout.connect(self._play_idle_pulse)
@@ -1275,6 +1297,13 @@ class PowerAuraWidget(QWidget):
     def set_power_theme(self, theme: str) -> None:
         self._theme_name = theme
         self._light_theme = is_light_theme(theme)
+        self.update()
+
+    def set_vpn_accent_state(self, enabled: bool) -> None:
+        next_mode = "vpn" if enabled else "default"
+        if self._accent_mode == next_mode:
+            return
+        self._accent_mode = next_mode
         self.update()
 
     def set_center_point(self, point: QPointF) -> None:
@@ -1374,7 +1403,11 @@ class PowerAuraWidget(QWidget):
         if self.width() <= 0 or self.height() <= 0 or center.x() <= 1.0 or center.y() <= 1.0:
             return
         if self._status_glow_presence > 0.001:
-            if self._theme_name == "oled":
+            if self._accent_mode == "vpn":
+                aura_color = QColor(142, 84, 255, 76 if self._light_theme else 86)
+                if self._theme_name == "oled":
+                    aura_color = QColor(122, 74, 220, 82)
+            elif self._theme_name == "oled":
                 aura_color = QColor(104, 118, 210, 70)
             elif self._light_theme:
                 aura_color = QColor(19, 58, 142, 66)
@@ -1390,7 +1423,9 @@ class PowerAuraWidget(QWidget):
             aura.setColorAt(1.0, QColor(aura_color.red(), aura_color.green(), aura_color.blue(), 0))
             painter.setBrush(aura)
             painter.drawEllipse(center, radius, radius)
-        if self._theme_name == "oled":
+        if self._accent_mode == "vpn":
+            color = QColor(159, 108, 255, int((190 if self._light_theme else 178) * self._wave_strength))
+        elif self._theme_name == "oled":
             color = QColor(124, 134, 182, int(132 * self._wave_strength))
         elif self._light_theme:
             color = QColor(64, 116, 255, int(176 * self._wave_strength))
@@ -2573,6 +2608,10 @@ def _disable_native_window_rounding(widget: QWidget) -> None:
         return
 
 
+def _enable_native_window_shadow(widget: QWidget) -> None:
+    return
+
+
 def _bring_widget_to_front(widget: QWidget) -> None:
     widget.raise_()
     widget.activateWindow()
@@ -2608,7 +2647,6 @@ class AppDialog(QDialog):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setWindowFlag(Qt.WindowType.Dialog, True)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint, True)
         self.setModal(False)
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setWindowTitle(title)
@@ -2654,6 +2692,7 @@ class AppDialog(QDialog):
         root_layout.addWidget(self.body)
         shell.addWidget(root)
         _disable_native_window_rounding(self)
+        _enable_native_window_shadow(self)
 
     def prepare_and_center(self) -> None:
         self.adjustSize()
@@ -2688,6 +2727,7 @@ class AppDialog(QDialog):
 
     def showEvent(self, event: QEvent) -> None:
         _disable_native_window_rounding(self)
+        _enable_native_window_shadow(self)
         super().showEvent(event)
         self._fade_closing = False
         if self._fade_animation is not None:
@@ -2832,6 +2872,12 @@ class SettingsDialog(AppDialog):
         self.vpn_refresh_btn = QPushButton(self._t("Обновить подписку", "Refresh subscription"))
         self.vpn_refresh_btn.clicked.connect(self._refresh_vpn_subscription)
         self._vpn_refresh_default_text = self.vpn_refresh_btn.text()
+        self.check_updates_btn = QPushButton(self._t("Проверить обновления", "Check updates"))
+        self.check_updates_btn.clicked.connect(lambda: self._run_parent_action("_check_updates_popup"))
+        self.find_settings_btn = QPushButton(self._t("Подобрать настройки", "Find best settings"))
+        self.find_settings_btn.clicked.connect(lambda: self._run_parent_action("_run_settings_diagnostics_popup"))
+        self.rebuild_runtime_btn = QPushButton(self._t("Пересобрать сборку", "Rebuild runtime"))
+        self.rebuild_runtime_btn.clicked.connect(lambda: self._run_parent_action("_rebuild_runtime"))
 
         scroll = QScrollArea()
         scroll.setObjectName("SettingsScroll")
@@ -2861,6 +2907,7 @@ class SettingsDialog(AppDialog):
         app_form.addRow("", self.tray_checkbox)
         app_form.addRow("", self.auto_components_checkbox)
         app_form.addRow("", self.check_updates_checkbox)
+        app_form.addRow("", self.check_updates_btn)
 
         vpn_form = self._settings_section(canvas_layout, "goshkow vpn", "goshkow-vpn")
         self.vpn_section_frame = vpn_form.parentWidget()
@@ -2876,6 +2923,8 @@ class SettingsDialog(AppDialog):
         zapret_form.addRow("IPSet mode", self.ipset_mode_combo)
         zapret_form.addRow(self._t("Gaming mode", "Gaming mode"), self.game_mode_combo)
         zapret_form.addRow(self._t("Исключить UDP-порты", "Exclude UDP ports"), self.zapret_udp_exclude_input)
+        zapret_form.addRow("", self.find_settings_btn)
+        zapret_form.addRow("", self.rebuild_runtime_btn)
 
         tg_form = self._settings_section(canvas_layout, "TG WS Proxy", "tg-ws-proxy")
         tg_form.addRow(self._t("Хост", "Host"), self.tg_host_input)
@@ -2989,6 +3038,13 @@ class SettingsDialog(AppDialog):
         self.reject()
         if parent is not None and hasattr(parent, "_restart_onboarding_from_settings"):
             QTimer.singleShot(0, getattr(parent, "_restart_onboarding_from_settings"))
+
+    def _run_parent_action(self, method_name: str) -> None:
+        parent = self.parent()
+        if parent is None or not hasattr(parent, method_name):
+            return
+        self.accept()
+        QTimer.singleShot(0, getattr(parent, method_name))
 
     def _load(self) -> None:
         settings = self.context.settings.get()
@@ -3220,6 +3276,7 @@ class MainWindow(QMainWindow):
         self._close_btn: QToolButton | None = None
         self._toggle_in_progress = False
         self._vpn_mode_switch_in_progress = False
+        self._vpn_mode_switch_target_enabled: bool | None = None
         self._vpn_switch_power_transition = False
         self._loading_frame = 0
         self._loading_timer = QTimer(self)
@@ -3339,10 +3396,11 @@ class MainWindow(QMainWindow):
         self._onboarding_glow_orbit_phase = -0.88
         self._services_sync_timer = QTimer(self)
         self._services_sync_timer.setSingleShot(True)
-        self._services_sync_timer.timeout.connect(self._flush_selected_services_backend_sync)
+        self._services_sync_timer.timeout.connect(self._flush_deferred_component_changes)
         self._pending_selected_service_ids: list[str] | None = None
         self._pending_selected_services_revision = 0
         self._optimistic_selected_service_ids: list[str] | None = None
+        self._pending_selected_general_id = ""
         self._services_selection_revision = 0
         self._services_selection_acked_revision = 0
         self._sidebar_widget: QWidget | None = None
@@ -3361,6 +3419,7 @@ class MainWindow(QMainWindow):
         self._taskbar_important_attention = False
         self._tools_btn: QToolButton | None = None
         self._settings_btn: QToolButton | None = None
+        self._root_frame: QFrame | None = None
         self._dashboard_title_label: QLabel | None = None
         self._services_title_label: QLabel | None = None
         self._services_subtitle_label: QLabel | None = None
@@ -3376,6 +3435,9 @@ class MainWindow(QMainWindow):
         self.power_caption_text: QLabel | None = None
         self.power_vpn_btn: QToolButton | None = None
         self.power_reconfigure_btn: QToolButton | None = None
+        self._power_reconfigure_opacity: QGraphicsOpacityEffect | None = None
+        self._power_reconfigure_anim: QParallelAnimationGroup | QSequentialAnimationGroup | None = None
+        self._power_reconfigure_visible = True
         self.power_caption_dots: QLabel | None = None
         self._power_caption_dots_opacity: QGraphicsOpacityEffect | None = None
         self._power_caption_dots_blur: QGraphicsBlurEffect | None = None
@@ -3433,8 +3495,10 @@ class MainWindow(QMainWindow):
         self._settings_dialog: SettingsDialog | None = None
         self._settings_dialog_signature: tuple[str, str] | None = None
         self._pending_settings_payload: dict[str, object] | None = None
+        self._pending_settings_revision = 0
         self._settings_save_revision = 0
         self._settings_save_acked_revision = 0
+        self._vpn_import_in_progress = False
         self._loading_overlay_fade: QPropertyAnimation | None = None
         self._loading_overlay_context = ""
         self._current_file_values_cache: list[str] = []
@@ -3534,13 +3598,14 @@ class MainWindow(QMainWindow):
         if isinstance(startup_snapshot, dict):
             self._seed_startup_snapshot(startup_snapshot)
 
-        self.setFixedSize(860, 520)
+        self.setFixedSize(880, 540)
         self.setWindowTitle("Zapret Hub")
         self.setWindowIcon(self._runtime_window_icon())
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, False)
         self._build_ui()
+        QTimer.singleShot(0, lambda: _enable_native_window_shadow(self))
         self._attach_button_animations_recursive(self.centralWidget())
         self._setup_tray()
         self._prepare_onboarding_services_stage()
@@ -4093,6 +4158,7 @@ class MainWindow(QMainWindow):
         super().showEvent(event)
         self._sync_window_icon()
         _disable_native_window_rounding(self)
+        _enable_native_window_shadow(self)
         self._sync_nav_highlight(animated=self._nav_highlight_initialized)
         if not self._nav_highlight_initialized:
             self._nav_highlight_initialized = True
@@ -4235,11 +4301,18 @@ class MainWindow(QMainWindow):
         shell = QWidget()
         shell.setObjectName("WindowShell")
         root = QVBoxLayout(shell)
-        root.setContentsMargins(6, 6, 6, 6)
+        root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(0)
 
         frame = OnboardingFrame()
         frame.setObjectName("RootFrame")
+        frame.setFixedSize(860, 520)
+        self._root_frame = frame
+        shadow = QGraphicsDropShadowEffect(frame)
+        shadow.setBlurRadius(22)
+        shadow.setOffset(0, 3)
+        shadow.setColor(QColor(0, 0, 0, 72))
+        frame.setGraphicsEffect(shadow)
         root_frame = QVBoxLayout(frame)
         root_frame.setContentsMargins(0, 0, 0, 0)
         root_frame.setSpacing(0)
@@ -4257,7 +4330,7 @@ class MainWindow(QMainWindow):
         body.addWidget(sidebar)
         body.addWidget(self._build_content(), 1)
 
-        root.addWidget(frame)
+        root.addWidget(frame, 0, Qt.AlignmentFlag.AlignCenter)
         self.setCentralWidget(shell)
         self._build_loading_overlay(shell)
 
@@ -4458,16 +4531,7 @@ class MainWindow(QMainWindow):
         row.addWidget(notifications_btn)
         self._refresh_notifications_badge()
 
-        tools_btn = QToolButton()
-        tools_btn.setProperty("class", "action")
-        tools_btn.setIcon(self._icon("tool.svg"))
-        tools_btn.setIconSize(QSize(16, 16))
-        tools_btn.setToolTip(self._t("Инструменты", "Tools"))
-        tools_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        tools_btn.setMenu(self._build_tools_menu())
-        self._attach_button_animations(tools_btn)
-        self._tools_btn = tools_btn
-        row.addWidget(tools_btn)
+        self._tools_btn = None
 
         settings_btn = QToolButton()
         settings_btn.setProperty("class", "action")
@@ -4630,18 +4694,43 @@ class MainWindow(QMainWindow):
         )
 
     def _notify_zapret_restart_from_payload(self, payload: object) -> None:
-        if not isinstance(payload, dict) or not bool(payload.get("zapret_restarted")):
+        if not isinstance(payload, dict):
             return
-        self._add_notification(
-            "success",
-            self._t("Zapret перезапущен", "Zapret restarted"),
-            self._t(
-                "Zapret пересобран и запущен заново с вашими текущими настройками.",
-                "Zapret was rebuilt and started again with your current settings.",
-            ),
-            source="zapret",
-            details={"dedupe_key": "zapret-reconfigured-restarted"},
-        )
+        if bool(payload.get("zapret_restarted")):
+            self._add_notification(
+                "success",
+                self._t("Zapret перезапущен", "Zapret restarted"),
+                self._t(
+                    "Zapret пересобран и запущен заново с вашими текущими настройками.",
+                    "Zapret was rebuilt and started again with your current settings.",
+                ),
+                source="zapret",
+                details={"dedupe_key": "zapret-reconfigured-restarted"},
+            )
+        if bool(payload.get("tg_proxy_restarted")):
+            self._add_notification(
+                "success",
+                self._t("TG WS Proxy перезапущен", "TG WS Proxy restarted"),
+                self._t(
+                    "TG WS Proxy перезапущен и уже работает с новыми настройками.",
+                    "TG WS Proxy was restarted and is already using the new settings.",
+                ),
+                source="tg-ws-proxy",
+                details={"dedupe_key": "tg-ws-proxy-restarted"},
+            )
+        if bool(payload.get("vpn_restarted")):
+            self._add_notification(
+                "success",
+                self._t("goshkow vpn перезапущен", "goshkow vpn restarted"),
+                self._t(
+                    "goshkow vpn перезапущен и применил ваши новые настройки.",
+                    "goshkow vpn restarted and applied your new settings.",
+                ),
+                source="goshkow-vpn",
+                details={"dedupe_key": "goshkow-vpn-restarted"},
+            )
+        if not bool(payload.get("zapret_restarted")):
+            return
 
     def _component_display_name(self, component_id: str) -> str:
         return {"zapret": "Zapret", "tg-ws-proxy": "TG WS Proxy", "goshkow-vpn": "goshkow vpn"}.get(component_id, component_id)
@@ -5288,7 +5377,7 @@ class MainWindow(QMainWindow):
         self.power_caption = QWidget()
         self.power_caption.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.power_caption.setStyleSheet("background: transparent;")
-        self.power_caption.setFixedWidth(power_stage.width())
+        self.power_caption.setFixedWidth(304)
         caption_layout = QHBoxLayout(self.power_caption)
         caption_layout.setContentsMargins(0, 0, 0, 0)
         caption_layout.setSpacing(8)
@@ -5322,16 +5411,22 @@ class MainWindow(QMainWindow):
             )
         )
         self.power_reconfigure_btn.setIconSize(QSize(15, 15))
-        self.power_reconfigure_btn.setFixedSize(30, 30)
+        self.power_reconfigure_btn.setMinimumSize(0, 30)
+        self.power_reconfigure_btn.setMaximumSize(30, 30)
+        self.power_reconfigure_btn.setFixedHeight(30)
         self.power_reconfigure_btn.setToolTip(self._t("Подобрать настройки", "Find settings"))
         self.power_reconfigure_btn.clicked.connect(self._restart_onboarding_from_dashboard)
         self._attach_button_animations(self.power_reconfigure_btn)
+        self._power_reconfigure_opacity = QGraphicsOpacityEffect(self.power_reconfigure_btn)
+        self._power_reconfigure_opacity.setOpacity(1.0)
+        self.power_reconfigure_btn.setGraphicsEffect(self._power_reconfigure_opacity)
         self._sync_power_reconfigure_button_style()
         self.power_caption_text = QLabel("OFF")
         self.power_caption_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.power_caption_text.setProperty("class", "title")
         self.power_caption_text.setObjectName("PowerStatusPill")
         self.power_caption_text.setMinimumWidth(96)
+        self.power_caption_text.setMaximumWidth(220)
         self.power_caption_text.setFixedHeight(30)
         self.power_caption_dots = None
         self._power_caption_dots_blur = None
@@ -6304,7 +6399,13 @@ class MainWindow(QMainWindow):
                         app.removeEventFilter(self)
                     except Exception:
                         pass
-        if event.button() == Qt.MouseButton.LeftButton and event.position().y() <= 48:
+        root_frame = self._root_frame
+        title_hit = False
+        if root_frame is not None:
+            local_pos = event.position().toPoint()
+            frame_rect = root_frame.geometry()
+            title_hit = frame_rect.contains(local_pos) and frame_rect.top() <= local_pos.y() <= frame_rect.top() + 48
+        if event.button() == Qt.MouseButton.LeftButton and title_hit:
             self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
             return
@@ -6436,17 +6537,13 @@ class MainWindow(QMainWindow):
         current = self.context.settings.get().selected_zapret_general
         if general_id == current:
             return
-        self.context.settings.get().selected_zapret_general = general_id
-        states = self._component_states()
-        if states.get("zapret") and states["zapret"].status == "running":
-            self._toggle_in_progress = True
-            self._loading_action = "connect"
-            self._loading_timer.start()
-            self._advance_loading_caption()
-            self._submit_backend_task("select_general", {"selected": general_id})
-        else:
-            self._submit_backend_task("select_general", {"selected": general_id})
-            self.refresh_all()
+        self.context.settings.update(selected_zapret_general=general_id)
+        self._settings_save_revision += 1
+        self._pending_settings_revision = self._settings_save_revision
+        self._pending_selected_general_id = general_id
+        self._page_payload_cache.clear()
+        self._mark_dirty("dashboard", "components", "tray")
+        self._schedule_deferred_component_sync()
 
     def restore_from_external_launch(self) -> None:
         self._restore_from_tray()
@@ -6619,7 +6716,6 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def _switch_page(self, index: int) -> None:
-        self._commit_pending_service_selection_if_needed()
         current_index = self.pages.currentIndex()
         try:
             if self._active_emoji_popup is not None:
@@ -6903,8 +6999,10 @@ class MainWindow(QMainWindow):
         theme_changed = before_theme != next_theme
         language_changed = before_language != next_language
         self._settings_save_revision += 1
-        revision = self._settings_save_revision
-        self._pending_settings_payload = dict(effective_payload)
+        self._pending_settings_revision = self._settings_save_revision
+        merged_payload = dict(self._pending_settings_payload or {})
+        merged_payload.update(effective_payload)
+        self._pending_settings_payload = merged_payload
         self.context.settings.update(**effective_payload)
         if theme_changed:
             self._apply_theme()
@@ -6912,9 +7010,40 @@ class MainWindow(QMainWindow):
             self._retranslate_ui()
         if theme_changed or language_changed:
             self._schedule_full_locale_theme_refresh()
-        backend_payload = dict(effective_payload)
-        backend_payload["client_revision"] = revision
-        self._submit_backend_task("apply_settings", backend_payload, action_id="__settings__")
+        self._page_payload_cache.clear()
+        self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
+        self._schedule_deferred_component_sync()
+
+    def _schedule_deferred_component_sync(self) -> None:
+        self._services_sync_timer.start(10000)
+
+    def _flush_deferred_component_changes(self) -> None:
+        pending_services_raw = self._pending_selected_service_ids
+        pending_services = list(pending_services_raw or [])
+        service_revision = int(self._pending_selected_services_revision)
+        pending_settings = dict(self._pending_settings_payload or {})
+        settings_revision = int(self._pending_settings_revision or self._settings_save_revision)
+        self._pending_selected_service_ids = None
+        self._pending_selected_services_revision = 0
+        self._pending_settings_payload = None
+        self._pending_settings_revision = 0
+        if self._pending_selected_general_id:
+            pending_settings["selected_zapret_general"] = self._pending_selected_general_id
+            self._pending_selected_general_id = ""
+        if self.context.backend is None:
+            return
+        backend_payload: dict[str, object] = {
+            "client_revision": settings_revision,
+            "service_client_revision": service_revision,
+        }
+        if pending_services_raw is not None:
+            backend_payload["service_ids"] = pending_services
+        if pending_settings:
+            backend_payload["settings"] = pending_settings
+        try:
+            self._submit_backend_task("apply_deferred_changes", backend_payload, action_id="__deferred_changes__")
+        except Exception as error:
+            self._show_error(self._t("Настройки", "Settings"), str(error))
 
     def _schedule_full_locale_theme_refresh(self) -> None:
         QTimer.singleShot(0, self._refresh_ui_after_locale_theme_change)
@@ -7038,14 +7167,14 @@ class MainWindow(QMainWindow):
         payload = message.get("payload", {})
         service_response_revision = 0
         settings_response_revision = 0
-        if action == "set_selected_services" and isinstance(payload, dict):
+        if action in {"set_selected_services", "apply_deferred_changes"} and isinstance(payload, dict):
             try:
-                service_response_revision = int(payload.get("client_revision", 0) or 0)
+                service_response_revision = int(payload.get("service_client_revision", payload.get("client_revision", 0)) or 0)
             except (TypeError, ValueError):
                 service_response_revision = 0
             if service_response_revision and service_response_revision < self._services_selection_revision:
                 return
-        if action == "apply_settings" and isinstance(payload, dict):
+        if action in {"apply_settings", "apply_deferred_changes"} and isinstance(payload, dict):
             try:
                 settings_response_revision = int(payload.get("client_revision", 0) or 0)
             except (TypeError, ValueError):
@@ -7053,19 +7182,22 @@ class MainWindow(QMainWindow):
             if settings_response_revision and settings_response_revision < self._settings_save_revision:
                 return
         self.context.settings.reload()
-        if action == "set_selected_services" and service_response_revision:
+        if action in {"set_selected_services", "apply_deferred_changes"} and service_response_revision:
             self._services_selection_acked_revision = max(self._services_selection_acked_revision, service_response_revision)
-        if action == "apply_settings" and settings_response_revision:
+        if action in {"apply_settings", "apply_deferred_changes"} and settings_response_revision:
             self._settings_save_acked_revision = max(self._settings_save_acked_revision, settings_response_revision)
             if settings_response_revision >= self._settings_save_revision:
                 self._pending_settings_payload = None
+                self._pending_settings_revision = 0
                 self._settings_save_acked_revision = self._settings_save_revision
         self._restore_optimistic_settings_if_needed()
         self._restore_optimistic_service_selection_if_needed()
         self._update_runtime_snapshot_from_payload(payload)
         self._update_mods_cache_from_payload(payload)
         self._update_general_options_from_payload(payload)
-        if action in {"toggle_master_runtime", "start_enabled_components", "start_component", "select_general", "apply_settings", "load_startup_snapshot", "load_components_payload", "select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic", "refresh_xbox_dns"}:
+        if action == "import_goshkow_vpn_subscription":
+            self._vpn_import_in_progress = False
+        if action in {"toggle_master_runtime", "start_enabled_components", "start_component", "select_general", "apply_settings", "apply_deferred_changes", "load_startup_snapshot", "load_components_payload", "select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic", "refresh_xbox_dns"}:
             self._notify_component_errors_from_payload(payload)
         self._notify_telegram_proxy_status_from_payload(payload)
         self._notify_zapret_restart_from_payload(payload)
@@ -7088,7 +7220,7 @@ class MainWindow(QMainWindow):
             }
             self._mark_dirty("dashboard", "services", "components", "mods", "files", "tray")
             return
-        if action == "apply_settings":
+        if action in {"apply_settings", "apply_deferred_changes"}:
             desired_autostart = bool(self.context.settings.get().autostart_windows)
             actual_autostart = self.context.autostart.is_enabled()
             if bool(payload.get("autostart_changed")) or desired_autostart != actual_autostart:
@@ -7124,6 +7256,8 @@ class MainWindow(QMainWindow):
             return
         if action in {"select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic", "refresh_xbox_dns"}:
             self._mark_dirty("dashboard", "components", "tray")
+            if action == "toggle_goshkow_vpn_mode":
+                self._vpn_mode_switch_target_enabled = None
             if action_id == "__settings_vpn_refresh__":
                 self._finish_settings_vpn_refresh(success=True)
             self._ui_signals.component_action_done.emit(action_id)
@@ -7134,7 +7268,7 @@ class MainWindow(QMainWindow):
         if action == "restore_general_autotest_runtime":
             self._mark_dirty("dashboard", "components", "tray")
             return
-        if action == "apply_settings":
+        if action in {"apply_settings", "apply_deferred_changes"}:
             self._ui_signals.component_action_done.emit("__settings__")
             return
         if action == "toggle_component_enabled":
@@ -7237,6 +7371,8 @@ class MainWindow(QMainWindow):
         source = self._backend_error_source(action, str(message.get("source", "") or ""))
         raw_error = str(message.get("error", self._t("Неизвестная ошибка.", "Unknown error.")))
         error = self._friendly_backend_error(raw_error, source=source, action=action)
+        if action == "import_goshkow_vpn_subscription":
+            self._vpn_import_in_progress = False
         if action == "load_startup_snapshot":
             self.context.logging.log("error", "startup_snapshot_failed", error=error)
             self._ensure_local_runtime_snapshot()
@@ -7247,9 +7383,11 @@ class MainWindow(QMainWindow):
             self._ui_signals.toggle_done.emit()
             if action == "select_general":
                 self._ui_signals.component_action_done.emit("__general__")
-        if action == "apply_settings":
+        if action in {"apply_settings", "apply_deferred_changes"}:
             self._ui_signals.component_action_done.emit("__settings__")
         if action in {"toggle_component_enabled", "toggle_component_autostart", "start_component", "stop_component", "toggle_goshkow_vpn_mode", "refresh_xbox_dns"}:
+            if action == "toggle_goshkow_vpn_mode":
+                self._vpn_mode_switch_target_enabled = None
             self._ui_signals.component_action_done.emit(action_id)
         if action_id == "__settings_vpn_refresh__":
             self._finish_settings_vpn_refresh(success=False)
@@ -10156,8 +10294,10 @@ class MainWindow(QMainWindow):
             if isinstance(self.power_button, AnimatedPowerButton):
                 self.power_button.set_loading_state(True, animate=not self._page_transition_running)
             if self.power_aura is not None:
+                self.power_aura.set_vpn_accent_state(False)
                 self.power_aura.set_idle_pulse_enabled(False)
                 self.power_aura.set_status_glow_enabled(True)
+            self._set_power_reconfigure_visible(True, animate=False)
             if self.power_caption_dots is not None:
                 self.power_caption_dots.setText("")
                 self.power_caption_dots.hide()
@@ -10180,6 +10320,13 @@ class MainWindow(QMainWindow):
         running_ids = {cid for cid in active_ids if states.get(cid) and states[cid].status == "running"}
         any_running = len(running_ids) > 0
         fully_running = bool(active_ids) and set(active_ids) == running_ids
+        vpn_state = states.get("goshkow-vpn")
+        vpn_running = bool(vpn_state and str(getattr(vpn_state, "status", "") or "") == "running")
+        vpn_display_selected = "goshkow-vpn" in {str(item) for item in list(settings.enabled_component_ids or [])}
+        if self._vpn_mode_switch_target_enabled is not None:
+            vpn_display_selected = bool(self._vpn_mode_switch_target_enabled)
+            if not vpn_display_selected:
+                vpn_running = False
 
         self.power_button.setProperty("state", "on" if fully_running else "off")
         self._update_power_icon()
@@ -10187,9 +10334,13 @@ class MainWindow(QMainWindow):
         if isinstance(self.power_button, AnimatedPowerButton):
             animate_power = not self._page_transition_running
             self.power_button.set_active_state(fully_running, animate=animate_power)
+            self.power_button.set_vpn_accent_state(vpn_running and fully_running)
         if self.power_aura is not None:
+            self.power_aura.set_vpn_accent_state(vpn_running and fully_running)
             self.power_aura.set_idle_pulse_enabled(fully_running and not self._toggle_in_progress)
             self.power_aura.set_status_glow_enabled(fully_running or self._toggle_in_progress)
+        reconfigure_visible = not (vpn_display_selected or vpn_running or self._vpn_mode_switch_in_progress)
+        self._set_power_reconfigure_visible(reconfigure_visible, animate=not self._page_transition_running)
         if self.power_caption_dots is not None:
             self.power_caption_dots.setText("")
             self.power_caption_dots.hide()
@@ -10199,18 +10350,21 @@ class MainWindow(QMainWindow):
                 self._set_power_status_pill(self._t("Нет компонентов", "No components"), "off")
                 self._power_caption_base_text = self._t("НЕТ КОМПОНЕНТОВ", "NO COMPONENTS")
         else:
-            target_caption = self._t("Включено", "On") if fully_running else (self._t("Частично", "Partial") if any_running else self._t("Выключено", "Off"))
+            if fully_running and vpn_running:
+                location = self._current_goshkow_vpn_location_label()
+                target_caption = f"{self._t('Подключено', 'Connected')} · {location}" if location else self._t("Подключено", "Connected")
+                target_state = "vpn"
+            else:
+                target_caption = self._t("Включено", "On") if fully_running else (self._t("Частично", "Partial") if any_running else self._t("Выключено", "Off"))
+                target_state = "on" if fully_running else ("partial" if any_running else "off")
             if self.power_caption_text is not None:
-                self._set_power_status_pill(target_caption, "on" if fully_running else ("partial" if any_running else "off"))
+                self._set_power_status_pill(target_caption, target_state)
                 self._power_caption_base_text = target_caption
 
         enabled_mods = list(settings.enabled_mod_ids or [])
 
         self._set_badge("app", self._t("Работает", "Running") if fully_running else (self._t("Частично", "Partial") if any_running else self._t("Ожидание", "Idle")), "status_ok.svg" if fully_running else ("status_warn.svg" if any_running else "status_off.svg"))
-        vpn_state = states.get("goshkow-vpn")
-        vpn_running = bool(vpn_state and str(getattr(vpn_state, "status", "") or "") == "running")
-        vpn_enabled = "goshkow-vpn" in {str(item) for item in list(settings.enabled_component_ids or [])}
-        show_vpn_badge = vpn_enabled or vpn_running
+        show_vpn_badge = vpn_display_selected or vpn_running
         if show_vpn_badge:
             zapret_text, zapret_icon = self._component_badge_state(components.get("goshkow-vpn"), vpn_state, any_running)
             self._set_badge_title("zapret", self._t("VPN", "VPN"))
@@ -10232,6 +10386,11 @@ class MainWindow(QMainWindow):
         border.setAlpha(96 if state != "off" else 56)
         fill = QColor(accent)
         fill.setAlpha(alpha)
+        metrics = self.power_caption_text.fontMetrics()
+        max_width = 220 if state == "vpn" else 150
+        target_width = max(96, min(max_width, metrics.horizontalAdvance(text) + 34))
+        self.power_caption_text.setMinimumWidth(target_width)
+        self.power_caption_text.setMaximumWidth(target_width)
         self.power_caption_text.setText(text)
         self.power_caption_text.setStyleSheet(
             "QLabel#PowerStatusPill {"
@@ -10252,9 +10411,25 @@ class MainWindow(QMainWindow):
             "on": ("#132447" if light else "#dce5ff", "#1f4fbf" if light else "#6e8fff", 26),
             "partial": ("#3d2b08" if light else "#ffe1a0", "#c77908" if light else "#f0a020", 24),
             "loading": ("#132447" if light else "#dce5ff", "#1f4fbf" if light else "#4fbfe8", 22),
+            "vpn": ("#3a1467" if light else "#f2e8ff", "#7c3aed" if light else "#a875ff", 28),
             "off": ("#334155" if light else "#b4bfcd", "#526071" if light else "#8793a4", 14),
         }
         return colors.get(state, colors["off"])
+
+    def _current_goshkow_vpn_location_label(self) -> str:
+        try:
+            state = self.context.vpn.state()
+        except Exception:
+            return ""
+        selected_id = str(state.get("selected_server_id", "") or "")
+        if selected_id == "auto":
+            name = str(state.get("last_auto_server_name", "") or "")
+            if name:
+                return self._display_goshkow_vpn_country_name({"name": name})
+        for server in list(state.get("servers", []) or []):
+            if isinstance(server, dict) and str(server.get("id", "") or "") == selected_id:
+                return self._display_goshkow_vpn_country_name(server)
+        return ""
 
     def _inactive_control_style_values(self) -> tuple[str, QColor, QColor]:
         text_color, accent, alpha = self._power_status_palette("off")
@@ -10294,6 +10469,83 @@ class MainWindow(QMainWindow):
             f"background: {hover.name(QColor.NameFormat.HexArgb)};"
             "}"
         )
+
+    def _set_power_reconfigure_visible(self, visible: bool, *, animate: bool = True) -> None:
+        button = self.power_reconfigure_btn
+        effect = self._power_reconfigure_opacity
+        if button is None or effect is None:
+            return
+        if self._power_reconfigure_visible == visible and button.isVisible() == visible:
+            return
+        self._power_reconfigure_visible = visible
+        if self._power_reconfigure_anim is not None:
+            self._power_reconfigure_anim.stop()
+            self._power_reconfigure_anim.deleteLater()
+            self._power_reconfigure_anim = None
+        if visible:
+            button.setVisible(True)
+            button.setEnabled(True)
+            start_width = 0 if int(button.maximumWidth()) <= 0 else max(0, min(30, int(button.width() or button.maximumWidth())))
+            end_width = 30
+            start_opacity = 0.0 if start_width <= 0 else float(effect.opacity())
+            end_opacity = 1.0
+        else:
+            start_width = max(0, min(30, int(button.width() or button.maximumWidth())))
+            end_width = 0
+            start_opacity = float(effect.opacity())
+            end_opacity = 0.0
+            button.setEnabled(False)
+        if not animate:
+            button.setMinimumWidth(end_width)
+            button.setMaximumWidth(end_width)
+            effect.setOpacity(end_opacity)
+            button.setVisible(visible)
+            return
+        button.setMinimumWidth(start_width)
+        button.setMaximumWidth(start_width)
+        width_group = QParallelAnimationGroup(self)
+        min_width_anim = QPropertyAnimation(button, b"minimumWidth", width_group)
+        min_width_anim.setDuration(260)
+        min_width_anim.setStartValue(start_width)
+        min_width_anim.setEndValue(end_width)
+        min_width_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        width_anim = QPropertyAnimation(button, b"maximumWidth", width_group)
+        width_anim.setDuration(260)
+        width_anim.setStartValue(start_width)
+        width_anim.setEndValue(end_width)
+        width_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        opacity_anim = QPropertyAnimation(effect, b"opacity")
+        opacity_anim.setDuration(150 if visible else 210)
+        opacity_anim.setStartValue(start_opacity)
+        opacity_anim.setEndValue(end_opacity)
+        opacity_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        width_group.addAnimation(min_width_anim)
+        width_group.addAnimation(width_anim)
+        if visible:
+            effect.setOpacity(0.0)
+            group = QSequentialAnimationGroup(self)
+            group.addAnimation(width_group)
+            group.addAnimation(opacity_anim)
+        else:
+            group = QParallelAnimationGroup(self)
+            group.addAnimation(width_group)
+            group.addAnimation(opacity_anim)
+        def _finish() -> None:
+            if not visible:
+                button.setMinimumWidth(0)
+                button.setMaximumWidth(0)
+                button.setVisible(False)
+            else:
+                button.setMinimumWidth(30)
+                button.setMaximumWidth(30)
+                effect.setOpacity(1.0)
+                button.setEnabled(True)
+            if self._power_reconfigure_anim is group:
+                self._power_reconfigure_anim = None
+            group.deleteLater()
+        group.finished.connect(_finish)
+        self._power_reconfigure_anim = group
+        group.start()
 
     def _sync_power_vpn_button_style(self) -> None:
         button = self.power_vpn_btn
@@ -10371,7 +10623,9 @@ class MainWindow(QMainWindow):
             if zapret_enabled_before:
                 enabled.add("zapret")
         self.context.settings.update(enabled_component_ids=sorted(enabled))
+        self._vpn_mode_switch_target_enabled = target_enabled
         self._set_power_vpn_switch_pending(True)
+        self._set_power_reconfigure_visible(False, animate=True)
         if self._master_runtime_has_running_components():
             self._begin_vpn_mode_power_transition()
         self._mark_dirty("dashboard", "components", "tray")
@@ -10539,20 +10793,13 @@ class MainWindow(QMainWindow):
         current = self.context.settings.get().selected_zapret_general
         if selected == current:
             return
-        self.context.settings.get().selected_zapret_general = selected
-        states = self._component_states()
-        zapret_running = states.get("zapret") and states["zapret"].status == "running"
-        if zapret_running:
-            self._loading_action = "connect"
-            self._toggle_in_progress = True
-            self.power_button.setEnabled(False)
-            self._loading_frame = 0
-            self._loading_timer.start()
-            self._advance_loading_caption()
-            self._submit_backend_task("select_general", {"selected": selected}, action_id="__general__")
-        else:
-            self._submit_backend_task("select_general", {"selected": selected}, action_id="__general__")
-            self._mark_dirty("dashboard", "components", "tray")
+        self.context.settings.update(selected_zapret_general=str(selected))
+        self._settings_save_revision += 1
+        self._pending_settings_revision = self._settings_save_revision
+        self._pending_selected_general_id = str(selected)
+        self._page_payload_cache.clear()
+        self._mark_dirty("dashboard", "components", "tray")
+        self._schedule_deferred_component_sync()
 
     def _on_general_selected_from_components(self, selected: str, combo: QComboBox, status_label: QLabel) -> None:
         if not selected:
@@ -10560,17 +10807,15 @@ class MainWindow(QMainWindow):
         current = self.context.settings.get().selected_zapret_general
         if selected == current:
             return
-        if self._general_loading_combo is not None:
-            return
-        self._general_loading_combo = combo
-        self._general_loading_label = status_label
-        combo.setEnabled(False)
-        status_label.show()
-        self._component_loading_frame = 0
-        if not self._component_loading_timer.isActive():
-            self._component_loading_timer.start()
-        self._advance_component_loading()
-        self._submit_backend_task("select_general", {"selected": selected}, action_id="__general__")
+        self.context.settings.update(selected_zapret_general=str(selected))
+        self._settings_save_revision += 1
+        self._pending_settings_revision = self._settings_save_revision
+        self._pending_selected_general_id = str(selected)
+        combo.setEnabled(True)
+        status_label.hide()
+        self._page_payload_cache.clear()
+        self._mark_dirty("dashboard", "components", "tray")
+        self._schedule_deferred_component_sync()
 
     def _apply_general_selection_worker(self, selected: str) -> None:
         self.context.settings.get().selected_zapret_general = selected
@@ -10609,7 +10854,12 @@ class MainWindow(QMainWindow):
         self._submit_backend_task("set_favorite_generals", {"favorites": favorites}, action_id="__favorite__")
 
     def _master_active_components(self) -> list[str]:
-        return [c.id for c in self._component_defs().values() if c.enabled]
+        active = [c.id for c in self._component_defs().values() if c.enabled]
+        active_set = set(active)
+        if "goshkow-vpn" in active_set:
+            active_set.discard("zapret")
+            active_set.discard("xbox-dns")
+        return [component_id for component_id in active if component_id in active_set]
 
     def _maybe_run_first_general_autotest(self) -> None:
         settings = self.context.settings.get()
@@ -11345,16 +11595,21 @@ class MainWindow(QMainWindow):
         self._pending_selected_service_ids = list(normalized)
         self._pending_selected_services_revision = int(revision)
         self._optimistic_selected_service_ids = list(normalized)
-        self._services_sync_timer.start(140)
+        self._schedule_deferred_component_sync()
 
     def _commit_pending_service_selection_if_needed(self) -> None:
-        if self._pending_selected_service_ids is None and not self._services_sync_timer.isActive():
+        has_pending = (
+            self._pending_selected_service_ids is not None
+            or self._pending_settings_payload is not None
+            or bool(self._pending_selected_general_id)
+        )
+        if not has_pending and not self._services_sync_timer.isActive():
             return
         try:
             self._services_sync_timer.stop()
         except Exception:
             pass
-        self._flush_selected_services_backend_sync()
+        self._flush_deferred_component_changes()
 
     def _restore_optimistic_service_selection_if_needed(self) -> None:
         if self._optimistic_selected_service_ids is None:
@@ -11366,22 +11621,6 @@ class MainWindow(QMainWindow):
         if normalized != self._selected_service_ids():
             self.context.settings.update(selected_service_ids=normalized)
             self._apply_service_preferences_locally(normalized)
-
-    def _flush_selected_services_backend_sync(self) -> None:
-        pending = list(self._pending_selected_service_ids or [])
-        revision = int(self._pending_selected_services_revision)
-        self._pending_selected_service_ids = None
-        self._pending_selected_services_revision = 0
-        if self.context.backend is None:
-            return
-        try:
-            self._submit_backend_task(
-                "set_selected_services",
-                {"service_ids": pending, "client_revision": revision},
-                action_id="__services_selection__",
-            )
-        except Exception as error:
-            self._show_error(self._t("Сервисы", "Services"), str(error))
 
     def _set_selected_service_ids(self, service_ids: list[str] | tuple[str, ...] | set[str]) -> None:
         current = self._selected_service_ids()
@@ -12402,7 +12641,7 @@ class MainWindow(QMainWindow):
         configured = subscription_state == "valid" or running
         invalid = subscription_state == "invalid"
 
-        if not configured:
+        if not configured and not self._vpn_import_in_progress:
             access_btn = QPushButton(self._t("10 дней бесплатно", "10 days free"))
             access_btn.setProperty("class", "primary")
             access_btn.clicked.connect(lambda: self._open_external_url("https://vpn.goshkow.ru"))
@@ -12410,18 +12649,23 @@ class MainWindow(QMainWindow):
             layout.addWidget(access_btn)
 
         if not configured:
-            sub_row = QHBoxLayout()
-            sub_row.setContentsMargins(0, 0, 0, 0)
-            sub_row.setSpacing(8)
-            sub_input = QLineEdit()
-            sub_input.setPlaceholderText("https://vpn.goshkow.ru/sub/...")
-            sub_input.setText(str(vpn_state.get("subscription_url", "") or ""))
-            import_btn = QPushButton(self._t("Импорт", "Import"))
-            import_btn.clicked.connect(lambda _=False, field=sub_input: self._import_goshkow_vpn_subscription(field.text()))
-            self._attach_button_animations(import_btn)
-            sub_row.addWidget(sub_input, 1)
-            sub_row.addWidget(import_btn, 0)
-            layout.addLayout(sub_row)
+            if self._vpn_import_in_progress:
+                loading_btn = QPushButton(self._t("Получение конфигураций...", "Fetching configurations..."))
+                loading_btn.setEnabled(False)
+                layout.addWidget(loading_btn)
+            else:
+                sub_row = QHBoxLayout()
+                sub_row.setContentsMargins(0, 0, 0, 0)
+                sub_row.setSpacing(8)
+                sub_input = QLineEdit()
+                sub_input.setPlaceholderText("https://vpn.goshkow.ru/sub/...")
+                sub_input.setText(str(vpn_state.get("subscription_url", "") or ""))
+                import_btn = QPushButton(self._t("Импорт", "Import"))
+                import_btn.clicked.connect(lambda _=False, field=sub_input: self._import_goshkow_vpn_subscription(field.text()))
+                self._attach_button_animations(import_btn)
+                sub_row.addWidget(sub_input, 1)
+                sub_row.addWidget(import_btn, 0)
+                layout.addLayout(sub_row)
 
         if invalid:
             invalid_label = QLabel(str(vpn_state.get("last_error", "") or self._t("Ссылка подписки невалидна.", "Subscription link is invalid.")))
@@ -12436,6 +12680,7 @@ class MainWindow(QMainWindow):
         server_combo = ClickSelectComboBox()
         selected_server = str(vpn_state.get("selected_server_id", "") or "")
         if servers:
+            server_combo.addItem(self._t("Автоматически", "Automatic"), "auto")
             for server in servers:
                 server_combo.addItem(self._display_goshkow_vpn_server_name(server), str(server.get("id", "") or ""))
             for index in range(server_combo.count()):
@@ -12459,6 +12704,33 @@ class MainWindow(QMainWindow):
         cleaned = " ".join(cleaned.split()).strip(" -–—")
         return cleaned or str(server.get("host", "") or "goshkow vpn")
 
+    def _display_goshkow_vpn_country_name(self, server: dict[str, object]) -> str:
+        cleaned = self._display_goshkow_vpn_server_name(server)
+        cleaned = re.sub(r"\s*\([^)]*\)\s*", " ", cleaned)
+        cleaned = re.split(r"\s+[-/|]\s+|,\s*", cleaned, maxsplit=1)[0]
+        cleaned = re.sub(r"\bобход\b.*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bbackup\b.*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bserver\b.*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\d+.*$", "", cleaned)
+        parts = cleaned.split()
+        if not parts:
+            return self._display_goshkow_vpn_server_name(server)
+        known_two_word = {
+            ("саудовская", "аравия"),
+            ("южная", "корея"),
+            ("северная", "корея"),
+            ("новая", "зеландия"),
+            ("чешская", "республика"),
+            ("united", "kingdom"),
+            ("united", "states"),
+            ("south", "korea"),
+            ("new", "zealand"),
+        }
+        first_two = tuple(part.lower() for part in parts[:2])
+        if len(parts) >= 2 and first_two in known_two_word:
+            return " ".join(parts[:2])
+        return parts[0]
+
     def _format_bytes(self, value: int) -> str:
         size = float(max(0, int(value)))
         for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
@@ -12474,7 +12746,12 @@ class MainWindow(QMainWindow):
                 return
 
     def _import_goshkow_vpn_subscription(self, url: str) -> None:
-        self._submit_backend_task("import_goshkow_vpn_subscription", {"url": url})
+        normalized = str(url or "").strip()
+        if not normalized:
+            return
+        self._vpn_import_in_progress = True
+        self._mark_dirty("components")
+        self._submit_backend_task("import_goshkow_vpn_subscription", {"url": normalized})
 
     def _update_goshkow_vpn_settings(self, payload: dict[str, object]) -> None:
         self._submit_backend_task("update_goshkow_vpn_settings", payload)
