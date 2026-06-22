@@ -1141,9 +1141,9 @@ class AnimatedPowerButton(QToolButton):
             on_top = QColor("#7b86ff")
             on_bottom = QColor("#4c58d8")
             on_border = QColor("#7b87ff")
-            vpn_top = QColor("#b17cff")
-            vpn_bottom = QColor("#7a3be6")
-            vpn_border = QColor("#a875ff")
+            vpn_top = QColor("#9264ff")
+            vpn_bottom = QColor("#5b2fe0")
+            vpn_border = QColor("#8064ff")
             loading_top = QColor("#c7d3e6")
             loading_bottom = QColor("#9ba8bd")
             loading_border = QColor("#b9c6db")
@@ -1154,9 +1154,9 @@ class AnimatedPowerButton(QToolButton):
             on_top = QColor("#7380ff")
             on_bottom = QColor("#4551cb")
             on_border = QColor("#7b87ff")
-            vpn_top = QColor("#b58cff")
-            vpn_bottom = QColor("#6d3bd8")
-            vpn_border = QColor("#a875ff")
+            vpn_top = QColor("#9b72ff")
+            vpn_bottom = QColor("#542bd6")
+            vpn_border = QColor("#8064ff")
             loading_top = QColor("#707785")
             loading_bottom = QColor("#565d69")
             loading_border = QColor("#8b94a3")
@@ -1196,13 +1196,13 @@ class AnimatedPowerButton(QToolButton):
         if self._hover_progress > 0.001:
             if self._light_theme:
                 if self._visual_mode == "vpn":
-                    glow_color = QColor(154, 93, 255, int(76 * self._hover_progress))
+                    glow_color = QColor(118, 80, 255, int(76 * self._hover_progress))
                 elif self._active or self._visual_mode == "loading":
                     glow_color = QColor(232, 243, 255, int(62 * self._hover_progress))
                 else:
                     glow_color = QColor(109, 154, 255, int(34 * self._hover_progress))
             else:
-                glow_color = QColor(190, 142, 255, int(52 * self._hover_progress)) if self._visual_mode == "vpn" else QColor(148, 206, 255, int(34 * self._hover_progress))
+                glow_color = QColor(150, 112, 255, int(52 * self._hover_progress)) if self._visual_mode == "vpn" else QColor(148, 206, 255, int(34 * self._hover_progress))
             dx = self._glow_pos.x() - center.x()
             dy = self._glow_pos.y() - center.y()
             distance = max(1.0, (dx * dx + dy * dy) ** 0.5)
@@ -1403,9 +1403,9 @@ class PowerAuraWidget(QWidget):
             return
         if self._status_glow_presence > 0.001:
             if self._accent_mode == "vpn":
-                aura_color = QColor(142, 84, 255, 76 if self._light_theme else 86)
+                aura_color = QColor(106, 74, 255, 76 if self._light_theme else 86)
                 if self._theme_name == "oled":
-                    aura_color = QColor(122, 74, 220, 82)
+                    aura_color = QColor(92, 64, 214, 82)
             elif self._theme_name == "oled":
                 aura_color = QColor(104, 118, 210, 70)
             elif self._light_theme:
@@ -1423,7 +1423,7 @@ class PowerAuraWidget(QWidget):
             painter.setBrush(aura)
             painter.drawEllipse(center, radius, radius)
         if self._accent_mode == "vpn":
-            color = QColor(159, 108, 255, int((190 if self._light_theme else 178) * self._wave_strength))
+            color = QColor(116, 86, 255, int((190 if self._light_theme else 178) * self._wave_strength))
         elif self._theme_name == "oled":
             color = QColor(124, 134, 182, int(132 * self._wave_strength))
         elif self._light_theme:
@@ -2631,7 +2631,73 @@ def _disable_native_window_rounding(widget: QWidget) -> None:
 
 
 def _enable_native_window_shadow(widget: QWidget) -> None:
-    return
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        hwnd = int(widget.winId())
+
+        class MARGINS(ctypes.Structure):
+            _fields_ = [
+                ("cxLeftWidth", ctypes.c_int),
+                ("cxRightWidth", ctypes.c_int),
+                ("cyTopHeight", ctypes.c_int),
+                ("cyBottomHeight", ctypes.c_int),
+            ]
+
+        dwmapi = ctypes.windll.dwmapi  # type: ignore[attr-defined]
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        DWMWA_NCRENDERING_POLICY = 2
+        DWMWA_ALLOW_NCPAINT = 4
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        DWMWA_BORDER_COLOR = 34
+        DWMNCRP_ENABLED = 2
+        DWMWCP_ROUND = 2
+        DWMWA_COLOR_NONE = 0xFFFFFFFE
+        GWL_STYLE = -16
+        WS_THICKFRAME = 0x00040000
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_FRAMECHANGED = 0x0020
+
+        style = int(user32.GetWindowLongW(ctypes.c_void_p(hwnd), ctypes.c_int(GWL_STYLE)))
+        if not style & WS_THICKFRAME:
+            user32.SetWindowLongW(ctypes.c_void_p(hwnd), ctypes.c_int(GWL_STYLE), ctypes.c_int(style | WS_THICKFRAME))
+            user32.SetWindowPos(
+                ctypes.c_void_p(hwnd),
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            )
+
+        for attr, raw_value in (
+            (DWMWA_NCRENDERING_POLICY, DWMNCRP_ENABLED),
+            (DWMWA_ALLOW_NCPAINT, 1),
+            (DWMWA_USE_IMMERSIVE_DARK_MODE, 1),
+            (DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND),
+        ):
+            value = ctypes.c_int(raw_value)
+            dwmapi.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd),
+                ctypes.c_uint(attr),
+                ctypes.byref(value),
+                ctypes.sizeof(value),
+            )
+        border_color = ctypes.c_uint(DWMWA_COLOR_NONE)
+        dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd),
+            ctypes.c_uint(DWMWA_BORDER_COLOR),
+            ctypes.byref(border_color),
+            ctypes.sizeof(border_color),
+        )
+        margins = MARGINS(1, 1, 1, 1)
+        dwmapi.DwmExtendFrameIntoClientArea(ctypes.c_void_p(hwnd), ctypes.byref(margins))
+    except Exception:
+        return
 
 
 def _bring_widget_to_front(widget: QWidget) -> None:
@@ -9327,7 +9393,9 @@ class MainWindow(QMainWindow):
             self._set_power_vpn_switch_pending(False)
             self._set_power_reconfigure_visible(True, animate=True)
             self._mark_dirty("dashboard", "components", "tray")
-            self._schedule_refresh()
+            QTimer.singleShot(0, self.refresh_dashboard)
+            QTimer.singleShot(0, self.refresh_components)
+            self._rebuild_tray_menu()
         except Exception as error:
             self._add_notification(
                 "warning",
@@ -10473,7 +10541,7 @@ class MainWindow(QMainWindow):
             "on": ("#132447" if light else "#dce5ff", "#1f4fbf" if light else "#6e8fff", 26),
             "partial": ("#3d2b08" if light else "#ffe1a0", "#c77908" if light else "#f0a020", 24),
             "loading": ("#132447" if light else "#dce5ff", "#1f4fbf" if light else "#4fbfe8", 22),
-            "vpn": ("#3a1467" if light else "#f2e8ff", "#7c3aed" if light else "#a875ff", 28),
+            "vpn": ("#24106f" if light else "#ede9ff", "#5b3df5" if light else "#8064ff", 28),
             "off": ("#334155" if light else "#b4bfcd", "#526071" if light else "#8793a4", 14),
         }
         return colors.get(state, colors["off"])
