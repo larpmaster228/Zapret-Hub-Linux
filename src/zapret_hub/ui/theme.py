@@ -116,6 +116,10 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         border: 1px solid #2e4269;
         border-radius: 12px;
     }
+    QFrame[class="notificationCard"][read="true"] {
+        background: #111821;
+        border: 1px solid #263241;
+    }
     QScrollArea#NotificationsScroll, QWidget#NotificationsCanvas {
         background: transparent;
         border: none;
@@ -619,6 +623,10 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         background: #f8fbff;
         border: 1px solid #d3e0ef;
         border-radius: 12px;
+    }
+    QFrame[class="notificationCard"][read="true"] {
+        background: #f1f3f6;
+        border: 1px solid #d7dde6;
     }
     QScrollArea#NotificationsScroll, QWidget#NotificationsCanvas {
         background: transparent;

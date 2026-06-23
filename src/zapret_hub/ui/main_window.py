@@ -36,7 +36,6 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGraphicsBlurEffect,
-    QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
@@ -553,6 +552,7 @@ class GitHubSidebarButton(QToolButton):
         anim.start()
 
     def paintEvent(self, event: QEvent) -> None:
+        super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -3423,7 +3423,6 @@ class MainWindow(QMainWindow):
         self._tools_btn: QToolButton | None = None
         self._settings_btn: QToolButton | None = None
         self._root_frame: QFrame | None = None
-        self._root_shadow_effect: QGraphicsDropShadowEffect | None = None
         self._dashboard_title_label: QLabel | None = None
         self._services_title_label: QLabel | None = None
         self._services_subtitle_label: QLabel | None = None
@@ -4190,6 +4189,23 @@ class MainWindow(QMainWindow):
     def hideEvent(self, event: QEvent) -> None:
         super().hideEvent(event)
 
+    def paintEvent(self, event: QEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        root = self._root_frame
+        if root is not None:
+            top_left = root.mapTo(self, QPoint(0, 0))
+            rect = QRectF(top_left, QSizeF(root.width(), root.height()))
+            inner_path = QPainterPath()
+            inner_path.addRoundedRect(rect, 16, 16)
+            painter.setPen(Qt.PenStyle.NoPen)
+            for spread, offset_y, alpha in ((1.0, 0.4, 42), (2.0, 0.8, 28), (3.5, 1.4, 16), (5.2, 2.0, 8)):
+                outer_rect = rect.adjusted(-spread, -spread + offset_y, spread, spread + offset_y)
+                outer_path = QPainterPath()
+                outer_path.addRoundedRect(outer_rect, 16 + spread, 16 + spread)
+                painter.fillPath(outer_path.subtracted(inner_path), QColor(0, 0, 0, alpha))
+        painter.end()
+
     def _schedule_post_show_sync(self) -> None:
         def _sync() -> None:
             self._sync_power_aura_geometry()
@@ -4321,7 +4337,6 @@ class MainWindow(QMainWindow):
         frame = OnboardingFrame()
         frame.setObjectName("RootFrame")
         self._root_frame = frame
-        self._apply_root_shadow()
         root_frame = QVBoxLayout(frame)
         root_frame.setContentsMargins(0, 0, 0, 0)
         root_frame.setSpacing(0)
@@ -4865,6 +4880,7 @@ class MainWindow(QMainWindow):
     def _build_notification_item(self, entry: NotificationEntry) -> QWidget:
         card = QFrame()
         card.setProperty("class", "notificationCard")
+        card.setProperty("read", bool(entry.read))
         row = QHBoxLayout(card)
         row.setContentsMargins(10, 9, 10, 9)
         row.setSpacing(9)
@@ -7654,7 +7670,6 @@ class MainWindow(QMainWindow):
         chevron = str((self._icons_dir / "chevron_down.svg").resolve())
         check = str((self._icons_dir / "check.svg").resolve())
         self.setStyleSheet(build_stylesheet(theme, chevron_icon=chevron, check_icon=check))
-        self._apply_root_shadow(theme)
         self._update_power_icon()
         if isinstance(self.power_button, AnimatedPowerButton):
             self.power_button.set_power_theme(theme)
@@ -7708,19 +7723,6 @@ class MainWindow(QMainWindow):
                 self.refresh_mods()
             except Exception:
                 pass
-
-    def _apply_root_shadow(self, theme: str | None = None) -> None:
-        if self._root_frame is None:
-            return
-        theme_name = theme or self.context.settings.get().theme
-        if self._root_shadow_effect is None:
-            effect = QGraphicsDropShadowEffect(self._root_frame)
-            self._root_frame.setGraphicsEffect(effect)
-            self._root_shadow_effect = effect
-        light = is_light_theme(theme_name)
-        self._root_shadow_effect.setBlurRadius(18 if light else 16)
-        self._root_shadow_effect.setOffset(0, 2)
-        self._root_shadow_effect.setColor(QColor(0, 0, 0, 86 if light else 118))
 
     def _apply_onboarding_style(self) -> None:
         if self._content_surface is None:
