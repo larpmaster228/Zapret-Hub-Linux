@@ -3545,6 +3545,7 @@ class MainWindow(QMainWindow):
         self._page_transition_started_at = 0.0
         self._window_opacity_animation: QPropertyAnimation | None = None
         self._window_fade_pending_action: str | None = None
+        self._last_window_show_fade_at = 0.0
         self._nav_highlight_initialized = False
         self._skip_next_show_fade = False
         self._initial_show_completed = False
@@ -6928,6 +6929,19 @@ class MainWindow(QMainWindow):
         return
 
     def _animate_window_fade(self, *, showing: bool, action: str | None = None) -> None:
+        if showing:
+            now = time.monotonic()
+            current_animation = self._window_opacity_animation
+            if (
+                current_animation is not None
+                and current_animation.state() == QPropertyAnimation.State.Running
+                and self._window_fade_pending_action is None
+            ):
+                return
+            if now - self._last_window_show_fade_at < 0.45 and self.windowOpacity() >= 0.95:
+                self.setWindowOpacity(1.0)
+                return
+            self._last_window_show_fade_at = now
         if self._window_opacity_animation is not None:
             self._window_opacity_animation.stop()
         animation = QPropertyAnimation(self, QByteArray(b"windowOpacity"), self)
