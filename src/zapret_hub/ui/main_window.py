@@ -2663,13 +2663,14 @@ class WindowShadowWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(self._margin, self._margin, -self._margin, -self._margin)
         radius = 16.0
-        for index, alpha in enumerate((18, 13, 8), start=1):
-            spread = float(index * 2)
-            shadow_rect = rect.adjusted(-spread, -spread + 0.8, spread, spread + 1.8)
-            color = QColor(0, 0, 0, alpha)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(color)
-            painter.drawRoundedRect(shadow_rect, radius + spread, radius + spread)
+        inner_path = QPainterPath()
+        inner_path.addRoundedRect(rect, radius, radius)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for spread, offset_y, alpha in ((2.0, 0.8, 18), (4.0, 1.3, 12), (7.0, 1.9, 7), (9.0, 2.3, 4)):
+            outer_rect = rect.adjusted(-spread, -spread + offset_y, spread, spread + offset_y)
+            outer_path = QPainterPath()
+            outer_path.addRoundedRect(outer_rect, radius + spread, radius + spread)
+            painter.fillPath(outer_path.subtracted(inner_path), QColor(0, 0, 0, alpha))
 
 
 def _bring_widget_to_front(widget: QWidget) -> None:
@@ -6636,7 +6637,7 @@ class MainWindow(QMainWindow):
         self._pending_selected_general_id = general_id
         self._page_payload_cache.clear()
         self._mark_dirty("dashboard", "components", "tray")
-        self._schedule_deferred_component_sync()
+        self._schedule_deferred_component_sync(delay_ms=450)
 
     def restore_from_external_launch(self) -> None:
         self._restore_from_tray()
@@ -7109,8 +7110,8 @@ class MainWindow(QMainWindow):
         self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
         self._schedule_deferred_component_sync()
 
-    def _schedule_deferred_component_sync(self) -> None:
-        self._services_sync_timer.start(10000)
+    def _schedule_deferred_component_sync(self, *, delay_ms: int = 10000) -> None:
+        self._services_sync_timer.start(max(100, int(delay_ms)))
 
     def _flush_deferred_component_changes(self) -> None:
         pending_services_raw = self._pending_selected_service_ids
@@ -10946,7 +10947,7 @@ class MainWindow(QMainWindow):
         self._pending_selected_general_id = str(selected)
         self._page_payload_cache.clear()
         self._mark_dirty("dashboard", "components", "tray")
-        self._schedule_deferred_component_sync()
+        self._schedule_deferred_component_sync(delay_ms=450)
 
     def _on_general_selected_from_components(self, selected: str, combo: QComboBox, status_label: QLabel) -> None:
         if not selected:
@@ -10962,7 +10963,7 @@ class MainWindow(QMainWindow):
         status_label.hide()
         self._page_payload_cache.clear()
         self._mark_dirty("dashboard", "components", "tray")
-        self._schedule_deferred_component_sync()
+        self._schedule_deferred_component_sync(delay_ms=450)
 
     def _apply_general_selection_worker(self, selected: str) -> None:
         self.context.settings.get().selected_zapret_general = selected
