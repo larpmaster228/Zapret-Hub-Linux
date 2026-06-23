@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGraphicsBlurEffect,
+    QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
@@ -2248,21 +2249,7 @@ class OnboardingFrame(QFrame):
     glowY = Property(float, _get_glow_y, _set_glow_y)
 
     def _paint_soft_window_depth(self, painter: QPainter, rect: QRectF, light: bool) -> None:
-        painter.save()
-        path = QPainterPath()
-        path.addRoundedRect(rect, 16, 16)
-        painter.setClipPath(path)
-        alpha = 18 if light else 24
-        for offset, opacity in ((1.0, alpha), (3.0, alpha // 2), (6.0, max(4, alpha // 4))):
-            pen = QPen(QColor(0, 0, 0, opacity), offset)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(rect.adjusted(offset / 2.0, offset / 2.0, -offset / 2.0, -offset / 2.0), 16, 16)
-        bottom = QLinearGradient(rect.left(), rect.bottom() - 18, rect.left(), rect.bottom())
-        bottom.setColorAt(0.0, QColor(0, 0, 0, 0))
-        bottom.setColorAt(1.0, QColor(0, 0, 0, 20 if not light else 14))
-        painter.fillRect(QRectF(rect.left(), rect.bottom() - 18, rect.width(), 18), bottom)
-        painter.restore()
+        return
 
     def paintEvent(self, event: QEvent) -> None:
         if not self._onboarding_active:
@@ -2628,49 +2615,6 @@ def _disable_native_window_rounding(widget: QWidget) -> None:
         )
     except Exception:
         return
-
-
-class WindowShadowWidget(QWidget):
-    def __init__(self, owner: QWidget) -> None:
-        super().__init__(
-            None,
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.NoDropShadowWindowHint
-            | Qt.WindowType.WindowDoesNotAcceptFocus,
-        )
-        self._owner = owner
-        self._margin = 10
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-
-    def sync_to_owner(self) -> None:
-        if not self._owner.isVisible() or self._owner.isMinimized():
-            self.hide()
-            return
-        geometry = self._owner.frameGeometry().adjusted(-self._margin, -self._margin, self._margin, self._margin)
-        if self.geometry() != geometry:
-            self.setGeometry(geometry)
-        if not self.isVisible():
-            self.show()
-        self.lower()
-        self.update()
-        self._owner.raise_()
-
-    def paintEvent(self, event: QEvent) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = QRectF(self.rect()).adjusted(self._margin, self._margin, -self._margin, -self._margin)
-        radius = 16.0
-        inner_path = QPainterPath()
-        inner_path.addRoundedRect(rect, radius, radius)
-        painter.setPen(Qt.PenStyle.NoPen)
-        for spread, offset_y, alpha in ((2.0, 0.8, 18), (4.0, 1.3, 12), (7.0, 1.9, 7), (9.0, 2.3, 4)):
-            outer_rect = rect.adjusted(-spread, -spread + offset_y, spread, spread + offset_y)
-            outer_path = QPainterPath()
-            outer_path.addRoundedRect(outer_rect, radius + spread, radius + spread)
-            painter.fillPath(outer_path.subtracted(inner_path), QColor(0, 0, 0, alpha))
 
 
 def _bring_widget_to_front(widget: QWidget) -> None:
@@ -3479,6 +3423,7 @@ class MainWindow(QMainWindow):
         self._tools_btn: QToolButton | None = None
         self._settings_btn: QToolButton | None = None
         self._root_frame: QFrame | None = None
+        self._root_shadow_effect: QGraphicsDropShadowEffect | None = None
         self._dashboard_title_label: QLabel | None = None
         self._services_title_label: QLabel | None = None
         self._services_subtitle_label: QLabel | None = None
@@ -3600,7 +3545,6 @@ class MainWindow(QMainWindow):
         self._page_transition_started_at = 0.0
         self._window_opacity_animation: QPropertyAnimation | None = None
         self._window_fade_pending_action: str | None = None
-        self._window_shadow: WindowShadowWidget | None = None
         self._nav_highlight_initialized = False
         self._skip_next_show_fade = False
         self._initial_show_completed = False
@@ -3668,8 +3612,6 @@ class MainWindow(QMainWindow):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, False)
         self._build_ui()
-        self._window_shadow = WindowShadowWidget(self)
-        QTimer.singleShot(0, self._sync_window_shadow)
         self._attach_button_animations_recursive(self.centralWidget())
         self._setup_tray()
         self._prepare_onboarding_services_stage()
@@ -4221,7 +4163,6 @@ class MainWindow(QMainWindow):
     def showEvent(self, event: QEvent) -> None:
         super().showEvent(event)
         self._sync_window_icon()
-        self._sync_window_shadow()
         self._sync_nav_highlight(animated=self._nav_highlight_initialized)
         if not self._nav_highlight_initialized:
             self._nav_highlight_initialized = True
@@ -4241,26 +4182,12 @@ class MainWindow(QMainWindow):
 
     def moveEvent(self, event: QEvent) -> None:
         super().moveEvent(event)
-        self._sync_window_shadow()
 
     def resizeEvent(self, event: QEvent) -> None:
         super().resizeEvent(event)
-        self._sync_window_shadow()
 
     def hideEvent(self, event: QEvent) -> None:
-        shadow = self._window_shadow
-        if shadow is not None:
-            shadow.hide()
         super().hideEvent(event)
-
-    def _sync_window_shadow(self) -> None:
-        shadow = self._window_shadow
-        if shadow is None:
-            return
-        try:
-            shadow.sync_to_owner()
-        except RuntimeError:
-            self._window_shadow = None
 
     def _schedule_post_show_sync(self) -> None:
         def _sync() -> None:
@@ -4393,6 +4320,7 @@ class MainWindow(QMainWindow):
         frame = OnboardingFrame()
         frame.setObjectName("RootFrame")
         self._root_frame = frame
+        self._apply_root_shadow()
         root_frame = QVBoxLayout(frame)
         root_frame.setContentsMargins(0, 0, 0, 0)
         root_frame.setSpacing(0)
@@ -6523,9 +6451,6 @@ class MainWindow(QMainWindow):
         if self._window_fade_pending_action is not None:
             event.ignore()
             return
-        shadow = self._window_shadow
-        if shadow is not None:
-            shadow.hide()
         if self._general_test_running:
             self._cancel_general_tests()
         self._commit_pending_service_selection_if_needed()
@@ -7715,6 +7640,7 @@ class MainWindow(QMainWindow):
         chevron = str((self._icons_dir / "chevron_down.svg").resolve())
         check = str((self._icons_dir / "check.svg").resolve())
         self.setStyleSheet(build_stylesheet(theme, chevron_icon=chevron, check_icon=check))
+        self._apply_root_shadow(theme)
         self._update_power_icon()
         if isinstance(self.power_button, AnimatedPowerButton):
             self.power_button.set_power_theme(theme)
@@ -7768,6 +7694,19 @@ class MainWindow(QMainWindow):
                 self.refresh_mods()
             except Exception:
                 pass
+
+    def _apply_root_shadow(self, theme: str | None = None) -> None:
+        if self._root_frame is None:
+            return
+        theme_name = theme or self.context.settings.get().theme
+        if self._root_shadow_effect is None:
+            effect = QGraphicsDropShadowEffect(self._root_frame)
+            self._root_frame.setGraphicsEffect(effect)
+            self._root_shadow_effect = effect
+        light = is_light_theme(theme_name)
+        self._root_shadow_effect.setBlurRadius(18 if light else 16)
+        self._root_shadow_effect.setOffset(0, 2)
+        self._root_shadow_effect.setColor(QColor(0, 0, 0, 86 if light else 118))
 
     def _apply_onboarding_style(self) -> None:
         if self._content_surface is None:
