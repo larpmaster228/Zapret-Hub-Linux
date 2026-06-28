@@ -16,7 +16,6 @@ from pathlib import Path
 from zapret_hub import __version__
 from zapret_hub.domain import ComponentDefinition, ComponentState, FileRecord, NotificationEntry
 from zapret_hub.services.service_catalog import (
-    FORTNITE_GENERAL_PRIORITY,
     SERVICE_PRESETS,
     ServicePreset,
     prioritize_generals_for_services,
@@ -611,6 +610,7 @@ class ModCardFrame(QFrame):
 
 class ServiceCardFrame(QFrame):
     toggled = Signal(str, bool)
+    _CONTRAST_ACCENT_IDS = {"epic-games", "x-twitter", "github"}
 
     def __init__(self, preset: ServicePreset, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -763,7 +763,7 @@ class ServiceCardFrame(QFrame):
         glow_pad = 6.0 if self._visual_scope == "onboarding" else 0.0
         rect = QRectF(self.rect()).adjusted(0.5 + glow_pad + shrink, 0.5 + glow_pad + shrink, -0.5 - glow_pad - shrink, -0.5 - glow_pad - shrink)
         card_radius = 12.0
-        accent = QColor(self.preset.accent)
+        accent = self._accent_color()
         light = is_light_theme(self._theme)
         base_fill = QColor("#ffffff") if light else QColor("#141922" if self._theme == "night" else "#171b20")
         if self._theme == "oled":
@@ -839,7 +839,7 @@ class ServiceCardFrame(QFrame):
         painter.restore()
 
     def _sync_style(self) -> None:
-        accent = QColor(self.preset.accent)
+        accent = self._accent_color()
         selected = bool(self._selected)
         text_color = "#142033" if is_light_theme(self._theme) else ("#f2f6ff" if selected else "#d2d9e5")
         muted_color = "#5f6f86" if is_light_theme(self._theme) else ("#c0ccdc" if selected else "#8d99aa")
@@ -876,6 +876,16 @@ class ServiceCardFrame(QFrame):
             self._selected_label.setText("")
             self._selected_label.setPixmap(QPixmap())
             self._selected_label.setStyleSheet("background: transparent;")
+
+    def _accent_color(self) -> QColor:
+        if self.preset.id in self._CONTRAST_ACCENT_IDS and is_light_theme(self._theme):
+            return QColor("#111827")
+        return QColor(self.preset.accent)
+
+    def check_icon_color(self) -> QColor:
+        if self.preset.id not in self._CONTRAST_ACCENT_IDS:
+            return QColor("#ffffff")
+        return QColor("#ffffff" if is_light_theme(self._theme) else "#111827")
 
     def _play_select_feedback(self) -> None:
         if self._press_anim is not None:
@@ -3431,6 +3441,7 @@ class MainWindow(QMainWindow):
         self._services_count_label: QLabel | None = None
         self._services_grid: ServiceGridPanel | None = None
         self._services_scroll: QScrollArea | None = None
+        self._services_select_all_btn: QPushButton | None = None
         self._components_title_label: QLabel | None = None
         self._mods_title_label: QLabel | None = None
         self._mods_subtitle_label: QLabel | None = None
@@ -4212,8 +4223,8 @@ class MainWindow(QMainWindow):
             return
         if self.isMinimized() or not self.isVisible() or not self._taskbar_restore_fade_waiting:
             return
-        self._taskbar_restore_fade_waiting = False
-        QTimer.singleShot(0, lambda: self._animate_window_fade(showing=True))
+        self._request_single_show_fade("taskbar")
+        QTimer.singleShot(0, self._play_pending_show_fade_if_visible)
 
     def moveEvent(self, event: QEvent) -> None:
         super().moveEvent(event)
@@ -5620,13 +5631,21 @@ class MainWindow(QMainWindow):
         canvas.setObjectName("ServicesCanvas")
         canvas.setProperty("class", "pageCanvas")
         canvas_layout = QVBoxLayout(canvas)
-        canvas_layout.setContentsMargins(1, 0, 1, 14)
-        canvas_layout.setSpacing(0)
+        canvas_layout.setContentsMargins(1, 0, 1, 1)
+        canvas_layout.setSpacing(12)
         grid = ServiceGridPanel(base_columns=4, min_card_width=166, offset_pattern=(0,), horizontal_spacing=12, vertical_spacing=12)
         grid.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         grid.set_cards(self._create_service_cards(scope="main"))
         self._services_grid = grid
         canvas_layout.addWidget(grid)
+        select_all_btn = QPushButton(self._t("Выбрать все", "Select all"))
+        select_all_btn.setObjectName("ServicesSelectAllButton")
+        select_all_btn.setProperty("class", "secondary")
+        select_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        select_all_btn.clicked.connect(self._select_all_services)
+        self._attach_button_animations(select_all_btn)
+        self._services_select_all_btn = select_all_btn
+        canvas_layout.addWidget(select_all_btn, 0, Qt.AlignmentFlag.AlignHCenter)
         scroll.setWidget(canvas)
         self._register_scroll_fade(scroll, surface_color=_content_surface_color(self.context.settings.get().theme))
         self._register_smooth_scroll(scroll, duration=250, angle_divisor=3.0)
@@ -5687,8 +5706,8 @@ class MainWindow(QMainWindow):
             is_selected = preset.id in selected
             card.set_texts(title, description)
             card.set_icon_pixmap(self._service_icon_pixmap(preset, 34, selected=is_selected))
-            card.set_check_pixmap(self._service_check_pixmap(10))
             card.set_theme(theme)
+            card.set_check_pixmap(self._service_check_pixmap(10, color=card.check_icon_color()))
             card.set_selected(is_selected)
             card.setProperty("serviceScope", scope)
             card.toggled.connect(self._on_service_card_toggled)
@@ -5748,7 +5767,7 @@ class MainWindow(QMainWindow):
 
     def _service_icon_pixmap(self, preset: ServicePreset, size: int, *, selected: bool) -> QPixmap:
         theme = self.context.settings.get().theme
-        tint = QColor(preset.accent) if selected else (QColor("#6f7a8c") if not is_light_theme(theme) else QColor("#7b8798"))
+        tint = self._service_selected_accent(preset, theme) if selected else (QColor("#6f7a8c") if not is_light_theme(theme) else QColor("#7b8798"))
         dpr = self._service_icon_device_ratio()
         cache_key = f"{preset.icon_file}|{size}|{dpr:.2f}|{tint.name(QColor.NameFormat.HexArgb)}"
         cached = self._service_icon_cache.get(cache_key)
@@ -5768,13 +5787,15 @@ class MainWindow(QMainWindow):
                     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
                     renderer.render(painter, QRectF(0, 0, physical_px, physical_px))
                     painter.end()
-                    image = self._trim_transparent_bounds(image, padding=max(2, physical_px // 10))
+                    trim_padding = max(1, physical_px // 18) if preset.id == "ubisoft" else max(2, physical_px // 10)
+                    image = self._trim_transparent_bounds(image, padding=trim_padding)
                     pixmap = QPixmap.fromImage(image)
                     pixmap.setDevicePixelRatio(dpr)
             if pixmap.isNull():
                 image = QImage(str(icon_path))
                 if not image.isNull():
-                    image = self._trim_transparent_bounds(image, padding=max(2, physical_px // 10))
+                    trim_padding = max(1, physical_px // 18) if preset.id == "ubisoft" else max(2, physical_px // 10)
+                    image = self._trim_transparent_bounds(image, padding=trim_padding)
                     scaled = image.scaled(
                         physical_px,
                         physical_px,
@@ -5804,7 +5825,7 @@ class MainWindow(QMainWindow):
             )
             target_width = float(source_size.width())
             target_height = float(source_size.height())
-            max_box = float(size) * 0.84
+            max_box = float(size) * (0.98 if preset.id == "ubisoft" else 0.84)
             if target_width > 0.0 and target_height > 0.0:
                 scale = min(max_box / target_width, max_box / target_height, 1.0)
                 target_width *= scale
@@ -5831,10 +5852,16 @@ class MainWindow(QMainWindow):
         self._service_icon_cache[cache_key] = pixmap
         return pixmap
 
-    def _service_check_pixmap(self, size: int) -> QPixmap:
+    def _service_selected_accent(self, preset: ServicePreset, theme: str) -> QColor:
+        if preset.id in ServiceCardFrame._CONTRAST_ACCENT_IDS and is_light_theme(theme):
+            return QColor("#111827")
+        return QColor(preset.accent)
+
+    def _service_check_pixmap(self, size: int, *, color: QColor | None = None) -> QPixmap:
         theme = self.context.settings.get().theme
         dpr = self._service_icon_device_ratio()
-        cache_key = f"{size}|{theme}|{dpr:.2f}"
+        icon_color = color or QColor("#ffffff")
+        cache_key = f"{size}|{theme}|{dpr:.2f}|{icon_color.name(QColor.NameFormat.HexArgb)}"
         cached = self._service_check_cache.get(cache_key)
         if cached is not None and not cached.isNull():
             return cached
@@ -5856,6 +5883,18 @@ class MainWindow(QMainWindow):
                 image = self._trim_transparent_bounds(image, padding=max(2, physical_px // 7))
                 pixmap = QPixmap.fromImage(image)
                 pixmap.setDevicePixelRatio(dpr)
+        if not pixmap.isNull():
+            tinted = QPixmap(pixmap.size())
+            tinted.fill(Qt.GlobalColor.transparent)
+            tinted.setDevicePixelRatio(dpr)
+            painter = QPainter(tinted)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.drawPixmap(0, 0, pixmap)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            painter.fillRect(tinted.rect(), icon_color)
+            painter.end()
+            pixmap = tinted
         self._service_check_cache[cache_key] = pixmap
         return pixmap
 
@@ -8064,12 +8103,14 @@ class MainWindow(QMainWindow):
                 )
             )
         if self._services_hint_label is not None:
-                self._services_hint_label.setText(
-                    self._t(
-                        "Приложение автоматически настраивает свою работу для обеспечения доступа к выбранным сервисам.",
-                        "The app automatically adjusts its behavior to provide access to the selected services.",
-                    )
+            self._services_hint_label.setText(
+                self._t(
+                    "Приложение автоматически настраивает свою работу для обеспечения доступа к выбранным сервисам.",
+                    "The app automatically adjusts its behavior to provide access to the selected services.",
                 )
+            )
+        if self._services_select_all_btn is not None:
+            self._services_select_all_btn.setText(self._t("Выбрать все", "Select all"))
         if self._components_title_label is not None:
             self._components_title_label.setText(self._t("Компоненты", "Components"))
         if self._mods_title_label is not None:
@@ -8190,6 +8231,8 @@ class MainWindow(QMainWindow):
         favorite = str(option.get("id", "")) in self._favorite_general_ids()
         bundle = (option.get("bundle") or "").strip()
         name = option.get("name", "").strip()
+        if str(option.get("bundle_id", "")) == "unified-general" and name.lower() == "general (ubisoft).bat":
+            bundle = ""
         label = name if not bundle else f"({bundle}) {name}"
         return f"★ {label}" if favorite else label
 
@@ -8373,7 +8416,7 @@ class MainWindow(QMainWindow):
             options,
             key=lambda item: (
                 0 if item["id"] in favorites else 1,
-                0 if str(item.get("bundle_id", "")) == "unified-general" else 2 if str(item.get("bundle_id", "")) == "base" else 1,
+                1 if str(item.get("bundle_id", "")) == "unified-general" else 0 if str(item.get("bundle_id", "")) == "base" else 2,
                 installed_order.get(str(item.get("bundle_id", "")), 9999),
                 -general_number(str(item.get("name", ""))),
                 (item.get("name") or "").lower(),
@@ -11678,28 +11721,14 @@ class MainWindow(QMainWindow):
                 ordered.append(preset.id)
         return ordered
 
-    def _preferred_service_general_id(self, priority: tuple[str, ...]) -> str:
-        options = self._general_options_for_current_service_tests(self._sorted_general_options())
-        for wanted in priority:
-            match = next((option for option in options if str(option.get("name", "")).strip().lower() == wanted.lower()), None)
-            if match is not None and str(match.get("id", "")).strip():
-                return str(match["id"])
-        return ""
-
     def _apply_service_preferences_locally(self, normalized: list[str]) -> None:
         changes: dict[str, str] = {}
         if "gaming" in normalized:
             changes["zapret_game_filter_mode"] = "tcpudp"
-        if "ubisoft" in normalized:
-            general_id = self._preferred_service_general_id(UBISOFT_GENERAL_PRIORITY)
-            if general_id:
-                changes["selected_zapret_general"] = general_id
-        elif "fortnite" in normalized:
+            changes["zapret_ipset_mode"] = "loaded"
+        if "fortnite" in normalized:
             changes["zapret_ipset_mode"] = "any"
             changes["zapret_game_filter_mode"] = "tcpudp"
-            general_id = self._preferred_service_general_id(FORTNITE_GENERAL_PRIORITY)
-            if general_id:
-                changes["selected_zapret_general"] = general_id
         if not changes:
             return
         self.context.settings.update(**changes)
@@ -11727,8 +11756,9 @@ class MainWindow(QMainWindow):
             for card in self._service_cards_by_id.get(service_id, []):
                 try:
                     card.blockSignals(True)
+                    card.set_theme(active_theme)
                     card.set_icon_pixmap(self._service_icon_pixmap(preset, 34, selected=is_selected))
-                    card.set_check_pixmap(self._service_check_pixmap(10))
+                    card.set_check_pixmap(self._service_check_pixmap(10, color=card.check_icon_color()))
                     card.set_selected(is_selected)
                 finally:
                     try:
@@ -11780,8 +11810,21 @@ class MainWindow(QMainWindow):
             self._refresh_service_cards_subset(changed)
             self._update_service_selection_summary()
             self._schedule_selected_services_backend_sync(normalized, revision)
+            if changed and changed.issubset({"telegram-desktop", "ai"}):
+                QTimer.singleShot(0, self._flush_deferred_component_changes)
             return
         self._update_service_selection_summary()
+
+    def _select_all_services(self) -> None:
+        self._set_selected_service_ids([preset.id for preset in SERVICE_PRESETS])
+        self.context.settings.update(zapret_ipset_mode="any", zapret_game_filter_mode="tcpudp")
+        pending = dict(self._pending_settings_payload or {})
+        pending.update({"zapret_ipset_mode": "any", "zapret_game_filter_mode": "tcpudp"})
+        self._pending_settings_payload = pending
+        self._settings_save_revision += 1
+        self._pending_settings_revision = self._settings_save_revision
+        self._page_payload_cache.clear()
+        self._mark_dirty("dashboard", "components", "tray")
 
     def _update_service_selection_summary(self) -> None:
         count = len(self._selected_service_ids())
@@ -11835,7 +11878,7 @@ class MainWindow(QMainWindow):
                     card.set_theme(theme)
                     card.set_texts(title, description)
                     card.set_icon_pixmap(self._service_icon_pixmap(preset, 34, selected=is_selected))
-                    card.set_check_pixmap(self._service_check_pixmap(10))
+                    card.set_check_pixmap(self._service_check_pixmap(10, color=card.check_icon_color()))
                     card.set_selected(is_selected)
                 finally:
                     try:
