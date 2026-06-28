@@ -21,9 +21,10 @@ from zapret_hub.services.service_catalog import (
     SERVICE_PRESETS,
     ServicePreset,
     prioritize_generals_for_services,
+    UBISOFT_GENERAL_PRIORITY,
 )
 from PySide6.QtCore import QCoreApplication, QEasingCurve, QEvent, QEventLoop, QObject, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt, QTimer, Signal, QPropertyAnimation, QParallelAnimationGroup, QSequentialAnimationGroup, Property, QByteArray
-from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeyEvent, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QRegion, QTextCharFormat, QTextCursor, QTextDocument
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeyEvent, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -3404,6 +3405,7 @@ class MainWindow(QMainWindow):
         self._pending_selected_services_revision = 0
         self._optimistic_selected_service_ids: list[str] | None = None
         self._pending_selected_general_id = ""
+        self._pending_mod_enabled_states: dict[str, bool] = {}
         self._services_selection_revision = 0
         self._services_selection_acked_revision = 0
         self._sidebar_widget: QWidget | None = None
@@ -3545,6 +3547,8 @@ class MainWindow(QMainWindow):
         self._window_opacity_animation: QPropertyAnimation | None = None
         self._window_fade_pending_action: str | None = None
         self._last_window_show_fade_at = 0.0
+        self._pending_show_fade_reason = ""
+        self._taskbar_restore_fade_waiting = False
         self._nav_highlight_initialized = False
         self._skip_next_show_fade = False
         self._initial_show_completed = False
@@ -3562,6 +3566,9 @@ class MainWindow(QMainWindow):
         self._files_editor_stack: QStackedWidget | None = None
         self._file_content_refresh_token = 0
         self._pending_file_content_path = ""
+        self._file_loaded_path = ""
+        self._file_loaded_content = ""
+        self._file_editor_dirty = False
         self._preferred_file_path = ""
         self._file_search_shell: QWidget | None = None
         self._file_search_panel: QWidget | None = None
@@ -4169,8 +4176,21 @@ class MainWindow(QMainWindow):
         if self._skip_next_show_fade:
             self._skip_next_show_fade = False
             self.setWindowOpacity(1.0)
-        else:
+        elif not self._initial_show_completed:
             self._animate_window_fade(showing=True)
+        elif self._taskbar_restore_fade_waiting:
+            self._taskbar_restore_fade_waiting = False
+            self._animate_window_fade(showing=True)
+        elif self._consume_pending_show_fade():
+            self._animate_window_fade(showing=True)
+        else:
+            current_animation = self._window_opacity_animation
+            if not (
+                current_animation is not None
+                and current_animation.state() == QPropertyAnimation.State.Running
+                and self._window_fade_pending_action is None
+            ):
+                self.setWindowOpacity(1.0)
         self._schedule_post_show_sync()
         if not self._initial_show_completed:
             self._initial_show_completed = True
@@ -4179,6 +4199,22 @@ class MainWindow(QMainWindow):
             self._skip_next_show_focus = False
             return
         QTimer.singleShot(0, lambda: _bring_widget_to_front(self))
+
+    def changeEvent(self, event: QEvent) -> None:
+        old_state = Qt.WindowState.WindowNoState
+        try:
+            old_state = event.oldState()  # type: ignore[attr-defined]
+        except Exception:
+            old_state = Qt.WindowState.WindowNoState
+        super().changeEvent(event)
+        if event.type() != QEvent.Type.WindowStateChange:
+            return
+        if not (old_state & Qt.WindowState.WindowMinimized):
+            return
+        if self.isMinimized() or not self.isVisible() or not self._taskbar_restore_fade_waiting:
+            return
+        self._taskbar_restore_fade_waiting = False
+        QTimer.singleShot(0, lambda: self._animate_window_fade(showing=True))
 
     def moveEvent(self, event: QEvent) -> None:
         super().moveEvent(event)
@@ -4729,7 +4765,7 @@ class MainWindow(QMainWindow):
                     "Zapret was rebuilt and started again with your current settings.",
                 ),
                 source="zapret",
-                details={"dedupe_key": "zapret-reconfigured-restarted"},
+                details={"dedupe_key": f"zapret-reconfigured-restarted:{int(time.time() // 2)}"},
             )
         if bool(payload.get("tg_proxy_restarted")):
             self._add_notification(
@@ -4740,7 +4776,7 @@ class MainWindow(QMainWindow):
                     "TG WS Proxy was restarted and is already using the new settings.",
                 ),
                 source="tg-ws-proxy",
-                details={"dedupe_key": "tg-ws-proxy-restarted"},
+                details={"dedupe_key": f"tg-ws-proxy-restarted:{int(time.time() // 2)}"},
             )
         if bool(payload.get("vpn_restarted")):
             self._add_notification(
@@ -4751,7 +4787,7 @@ class MainWindow(QMainWindow):
                     "goshkow vpn restarted and applied your new settings.",
                 ),
                 source="goshkow-vpn",
-                details={"dedupe_key": "goshkow-vpn-restarted"},
+                details={"dedupe_key": f"goshkow-vpn-restarted:{int(time.time() // 2)}"},
             )
         if not bool(payload.get("zapret_restarted")):
             return
@@ -5686,7 +5722,7 @@ class MainWindow(QMainWindow):
             "gaming": ("gaming", "game", "steam", "epic", "roblox", "riot", "league", "fortnite", "battle", "blizzard"),
             "clouds": ("clouds", "cloudfront", "amazon", "aws", "bunny", "ovh", "fastly", "akamai"),
             "ai": ("ai", "chatgpt", "claude", "gemini", "copilot"),
-            "instagram": ("instagram",),
+            "ubisoft": ("ubisoft", "ubi", "uplay"),
             "epic-games": ("epic",),
             "battle-net": ("battle", "blizzard"),
             "fortnite": ("fortnite", "epic", "unreal", "launcher", "hcaptcha"),
@@ -6537,20 +6573,38 @@ class MainWindow(QMainWindow):
                 continue
         self._mark_dirty("dashboard", "components", "tray")
 
+    def _request_single_show_fade(self, reason: str) -> None:
+        self._pending_show_fade_reason = str(reason or "restore")
+
+    def _consume_pending_show_fade(self) -> bool:
+        if not self._pending_show_fade_reason:
+            return False
+        self._pending_show_fade_reason = ""
+        return True
+
+    def _play_pending_show_fade_if_visible(self) -> None:
+        if not self.isVisible() or self.isMinimized():
+            return
+        if self._consume_pending_show_fade():
+            self._animate_window_fade(showing=True)
+
     def _restore_from_tray(self) -> None:
         self._sync_window_icon()
         if self._window_opacity_animation is not None:
             self._window_opacity_animation.stop()
         self._window_fade_pending_action = None
-        self._skip_next_show_fade = True
+        self._skip_next_show_fade = False
+        self._taskbar_restore_fade_waiting = False
+        self._request_single_show_fade("tray")
         self._skip_next_show_focus = False
-        self.setWindowOpacity(1.0)
+        self.setWindowOpacity(0.0)
         if self.isMinimized():
             self.showNormal()
         else:
             self.show()
         self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
         self._schedule_post_show_sync()
+        QTimer.singleShot(0, self._play_pending_show_fade_if_visible)
         QTimer.singleShot(0, lambda: _bring_widget_to_front(self))
 
     def _tray_toggle_master_runtime(self) -> None:
@@ -6754,6 +6808,10 @@ class MainWindow(QMainWindow):
     def _switch_page(self, index: int) -> None:
         current_index = self.pages.currentIndex()
         try:
+            if current_index == 4 and index != current_index:
+                self._save_dirty_file_if_needed()
+            if current_index in {1, 3, 4} and index != current_index:
+                self._commit_pending_service_selection_if_needed()
             if self._active_emoji_popup is not None:
                 try:
                     self._active_emoji_popup.close()
@@ -6979,10 +7037,14 @@ class MainWindow(QMainWindow):
                 if pending == "tray":
                     self.setWindowOpacity(1.0)
                     self.hide()
+                    self._taskbar_restore_fade_waiting = False
+                    self._pending_show_fade_reason = ""
                     if not self._tray_notifications_shown:
                         self.tray_icon.showMessage("Zapret Hub", self._t("Приложение свернуто в трей.", "Minimized to tray."), QSystemTrayIcon.MessageIcon.Information, 2200)
                         self._tray_notifications_shown = True
                 elif pending == "minimize":
+                    self._taskbar_restore_fade_waiting = True
+                    self._pending_show_fade_reason = ""
                     self.showMinimized()
                     QTimer.singleShot(0, lambda: self.setWindowOpacity(1.0))
                 elif pending in {"exit", "exit-fast"}:
@@ -7063,9 +7125,9 @@ class MainWindow(QMainWindow):
             self._schedule_full_locale_theme_refresh()
         self._page_payload_cache.clear()
         self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
-        self._schedule_deferred_component_sync()
+        QTimer.singleShot(0, self._flush_deferred_component_changes)
 
-    def _schedule_deferred_component_sync(self, *, delay_ms: int = 10000) -> None:
+    def _schedule_deferred_component_sync(self, *, delay_ms: int = 5000) -> None:
         self._services_sync_timer.start(max(100, int(delay_ms)))
 
     def _flush_deferred_component_changes(self) -> None:
@@ -7074,14 +7136,18 @@ class MainWindow(QMainWindow):
         service_revision = int(self._pending_selected_services_revision)
         pending_settings = dict(self._pending_settings_payload or {})
         settings_revision = int(self._pending_settings_revision or self._settings_save_revision)
+        pending_mods = dict(self._pending_mod_enabled_states)
         self._pending_selected_service_ids = None
         self._pending_selected_services_revision = 0
         self._pending_settings_payload = None
         self._pending_settings_revision = 0
+        self._pending_mod_enabled_states = {}
         if self._pending_selected_general_id:
             pending_settings["selected_zapret_general"] = self._pending_selected_general_id
             self._pending_selected_general_id = ""
         if self.context.backend is None:
+            return
+        if pending_services_raw is None and not pending_settings and not pending_mods:
             return
         backend_payload: dict[str, object] = {
             "client_revision": settings_revision,
@@ -7091,6 +7157,8 @@ class MainWindow(QMainWindow):
             backend_payload["service_ids"] = pending_services
         if pending_settings:
             backend_payload["settings"] = pending_settings
+        if pending_mods:
+            backend_payload["mods"] = pending_mods
         try:
             self._submit_backend_task("apply_deferred_changes", backend_payload, action_id="__deferred_changes__")
         except Exception as error:
@@ -8468,6 +8536,8 @@ class MainWindow(QMainWindow):
     def _open_files_mode(self, mode: str) -> None:
         if self._file_mode_stack is None:
             return
+        if self._file_mode_stack.currentIndex() == 2:
+            self._save_dirty_file_if_needed()
         if mode == "home":
             self._cancel_file_tag_render()
             self._current_file_list_filter = "all"
@@ -8973,54 +9043,11 @@ class MainWindow(QMainWindow):
             self.power_aura.set_status_glow_enabled(True)
         self._update_power_icon()
 
-    def _start_selected_component(self) -> None:
-        component_id = self._selected_component_id()
-        if component_id:
-            self._submit_backend_task("start_component", {"component_id": component_id}, action_id=component_id)
-
-    def _stop_selected_component(self) -> None:
-        component_id = self._selected_component_id()
-        if component_id:
-            self._submit_backend_task("stop_component", {"component_id": component_id}, action_id=component_id)
-
-    def _toggle_selected_component_enabled(self) -> None:
-        component_id = self._selected_component_id()
-        if component_id:
-            self._submit_backend_task("toggle_component_enabled", {"component_id": component_id}, action_id=component_id)
-
-    def _toggle_selected_component_autostart(self) -> None:
-        component_id = self._selected_component_id()
-        if component_id:
-            self._submit_backend_task("toggle_component_autostart", {"component_id": component_id}, action_id=component_id)
-
     def _toggle_component_card(self, component_id: str, button: QPushButton) -> None:
         if component_id in self._component_loading_buttons:
             return
         self._start_component_loading(component_id, button, button.text())
         self._submit_backend_task("toggle_component_enabled", {"component_id": component_id}, action_id=component_id)
-
-    def _toggle_component_card_worker(self, component_id: str) -> None:
-        self._submit_backend_task("toggle_component_enabled", {"component_id": component_id}, action_id=component_id)
-
-    def _install_selected_mod(self) -> None:
-        mod_id = self._selected_mod_id()
-        if mod_id:
-            self._submit_backend_task("install_mod", {"mod_id": mod_id}, action_id=f"mod-install:{mod_id}")
-
-    def _toggle_selected_mod(self) -> None:
-        mod_id = self._selected_mod_id()
-        if not mod_id:
-            return
-        installed = dict(self._mods_installed_cache)
-        if mod_id not in installed:
-            self._show_info(self._t("Модификация", "Mod"), self._t("Сначала установите модификацию, затем включайте её.", "Install selected mod before enabling it."))
-            return
-        self._submit_backend_task("toggle_mod", {"mod_id": mod_id}, action_id=f"mod:{mod_id}")
-
-    def _remove_selected_mod(self) -> None:
-        mod_id = self._selected_mod_id()
-        if mod_id:
-            self._submit_backend_task("remove_mod", {"mod_id": mod_id}, action_id=f"mod-remove:{mod_id}")
 
     def _import_mod_any(self) -> None:
         previous_selected_general = str(self.context.settings.get().selected_zapret_general or "")
@@ -9305,24 +9332,6 @@ class MainWindow(QMainWindow):
         dialog.exec()
         if modified["value"]:
             self._request_page_refresh("mods")
-
-    def _import_mod_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select mod folder")
-        if not path:
-            return
-        try:
-            self._submit_backend_task("import_mod_from_path", {"path": path}, action_id="__mods_import__")
-        except Exception as error:
-            self._show_error(self._t("Модификации", "Mods"), f"{self._t('Не удалось импортировать папку', 'Failed to import folder')}:\n{error}")
-
-    def _import_mod_archive(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Select mod archive", filter="ZIP archive (*.zip)")
-        if not path:
-            return
-        try:
-            self._submit_backend_task("import_mod_from_path", {"path": path}, action_id="__mods_import__")
-        except Exception as error:
-            self._show_error(self._t("Модификации", "Mods"), f"{self._t('Не удалось импортировать архив', 'Failed to import archive')}:\n{error}")
 
     def _rebuild_runtime(self) -> None:
         self._submit_backend_task("rebuild_merge_runtime", action_id="__merge_rebuild__")
@@ -9713,6 +9722,7 @@ class MainWindow(QMainWindow):
         self._show_info(self._t("Диагностика", "Diagnostics"), text or self._t("Нет данных диагностики.", "No diagnostics data."))
 
     def _load_selected_file(self, *_args: object) -> None:
+        self._save_dirty_file_if_needed()
         full_path = self._selected_file_path()
         if not full_path:
             return
@@ -9723,14 +9733,36 @@ class MainWindow(QMainWindow):
             self.rename_file_btn.setEnabled(Path(full_path) != self.context.files.local_hosts_path())
         self._request_file_content(full_path)
 
+    def _save_dirty_file_if_needed(self) -> None:
+        if not self._file_editor_dirty:
+            return
+        full_path = self._file_loaded_path or (self._selected_file_path() or "")
+        if not full_path:
+            return
+        content = self.file_editor.toPlainText()
+        if content == self._file_loaded_content:
+            self._file_editor_dirty = False
+            return
+        self._file_loaded_content = content
+        self._file_editor_dirty = False
+        self._submit_backend_task(
+            "write_file_text",
+            {"path": full_path, "content": content},
+            action_id="__file_saved__",
+        )
+
     def _save_current_file(self) -> None:
         full_path = self._selected_file_path()
         if not full_path:
             self._show_info(self._t("Файлы", "Files"), self._t("Выберите файл перед сохранением.", "Select a file before saving."))
             return
+        content = self.file_editor.toPlainText()
+        self._file_loaded_path = full_path
+        self._file_loaded_content = content
+        self._file_editor_dirty = False
         self._submit_backend_task(
             "write_file_text",
-            {"path": full_path, "content": self.file_editor.toPlainText()},
+            {"path": full_path, "content": content},
             action_id="__file_saved__",
         )
 
@@ -9923,6 +9955,11 @@ class MainWindow(QMainWindow):
         self._refresh_file_search_matches()
 
     def _on_file_editor_text_changed(self) -> None:
+        if not self._pending_file_content_path:
+            current_path = self._selected_file_path() or self._file_loaded_path
+            if current_path:
+                self._file_loaded_path = str(current_path)
+                self._file_editor_dirty = self.file_editor.toPlainText() != self._file_loaded_content
         if self._file_search_expanded and self._file_search_input is not None and self._file_search_input.text().strip():
             self._refresh_file_search_matches()
 
@@ -10328,7 +10365,14 @@ class MainWindow(QMainWindow):
                 return
             if str(payload.get("path", "") or "") != self._pending_file_content_path:
                 return
-            self.file_editor.setPlainText(str(payload.get("content", "") or ""))
+            content = str(payload.get("content", "") or "")
+            self.file_editor.blockSignals(True)
+            self.file_editor.setPlainText(content)
+            self.file_editor.blockSignals(False)
+            self._file_loaded_path = str(payload.get("path", "") or "")
+            self._file_loaded_content = content
+            self._file_editor_dirty = False
+            self._pending_file_content_path = ""
             self._refresh_file_search_matches()
             self._set_file_editor_loading(False)
             return
@@ -10897,12 +10941,10 @@ class MainWindow(QMainWindow):
         if selected == current:
             return
         self.context.settings.update(selected_zapret_general=str(selected))
-        self._settings_save_revision += 1
-        self._pending_settings_revision = self._settings_save_revision
-        self._pending_selected_general_id = str(selected)
+        self._pending_selected_general_id = ""
         self._page_payload_cache.clear()
         self._mark_dirty("dashboard", "components", "tray")
-        self._schedule_deferred_component_sync(delay_ms=450)
+        self._submit_backend_task("select_general", {"selected": str(selected)}, action_id="__general__")
 
     def _on_general_selected_from_components(self, selected: str, combo: QComboBox, status_label: QLabel) -> None:
         if not selected:
@@ -10911,14 +10953,12 @@ class MainWindow(QMainWindow):
         if selected == current:
             return
         self.context.settings.update(selected_zapret_general=str(selected))
-        self._settings_save_revision += 1
-        self._pending_settings_revision = self._settings_save_revision
-        self._pending_selected_general_id = str(selected)
+        self._pending_selected_general_id = ""
         combo.setEnabled(True)
         status_label.hide()
         self._page_payload_cache.clear()
         self._mark_dirty("dashboard", "components", "tray")
-        self._schedule_deferred_component_sync(delay_ms=450)
+        self._submit_backend_task("select_general", {"selected": str(selected)}, action_id="__general__")
 
     def _apply_general_selection_worker(self, selected: str) -> None:
         self.context.settings.get().selected_zapret_general = selected
@@ -11652,6 +11692,10 @@ class MainWindow(QMainWindow):
             general_id = self._preferred_service_general_id(GAMING_GENERAL_PRIORITY)
             if general_id:
                 changes["selected_zapret_general"] = general_id
+        elif "ubisoft" in normalized:
+            general_id = self._preferred_service_general_id(UBISOFT_GENERAL_PRIORITY)
+            if general_id:
+                changes["selected_zapret_general"] = general_id
         elif "fortnite" in normalized:
             changes["zapret_ipset_mode"] = "any"
             changes["zapret_game_filter_mode"] = "tcpudp"
@@ -11705,6 +11749,7 @@ class MainWindow(QMainWindow):
             self._pending_selected_service_ids is not None
             or self._pending_settings_payload is not None
             or bool(self._pending_selected_general_id)
+            or bool(self._pending_mod_enabled_states)
         )
         if not has_pending and not self._services_sync_timer.isActive():
             return
@@ -12989,67 +13034,18 @@ class MainWindow(QMainWindow):
         self.mods_canvas.updateGeometry()
         self.mods_scroll.viewport().update()
 
-    def _refresh_mods_legacy(self) -> None:
-        index = self.context.mods.fetch_index()
-        installed = {item.id: item for item in self.context.mods.list_installed()}
-        combined: list[tuple[str, str, str, str, str, str]] = []
-        seen: set[str] = set()
-        for item in index:
-            seen.add(item.id)
-            state = "not installed"
-            if item.id in installed:
-                state = "enabled" if installed[item.id].enabled else "installed"
-            combined.append(
-                (
-                    item.id,
-                    item.name,
-                    item.description,
-                    f"{self._t('Автор', 'Author')}: {item.author} | {self._t('Версия', 'Version')}: {item.version} | {self._t('Статус', 'Status')}: {state}",
-                    f"{self._t('Категория', 'Category')}: {item.category}",
-                    state,
-                )
-            )
-
-        for mod_id, item in installed.items():
-            if mod_id in seen:
-                continue
-            state = "enabled" if item.enabled else "installed"
-            source_type = "zapret bundle" if item.source_type == "zapret_bundle" else item.source_type
-            combined.append(
-                (
-                    mod_id,
-                    mod_id,
-                    self._t("Локальная модификация без пользовательского описания.", "Local modification without user description."),
-                    f"{self._t('Локальный импорт', 'Local import')} | {self._t('Версия', 'Version')}: {item.version} | {self._t('Статус', 'Status')}: {state}",
-                    f"{self._t('Тип', 'Type')}: {source_type}",
-                    state,
-                )
-            )
-
-        selected = self._selected_mod_id()
-        self.mods_list.clear()
-        for mod_id, name, description, subtitle, tags, _state in combined:
-            row_item = QListWidgetItem(f"{name}\n{description}\n{subtitle}\n{tags}")
-            row_item.setData(Qt.ItemDataRole.UserRole, mod_id)
-            row_item.setSizeHint(QSize(200, 88))
-            self.mods_list.addItem(row_item)
-        if selected:
-            for i in range(self.mods_list.count()):
-                it = self.mods_list.item(i)
-                if it.data(Qt.ItemDataRole.UserRole) == selected:
-                    self.mods_list.setCurrentItem(it)
-                    break
-
     def _toggle_mod_by_id(self, mod_id: str) -> None:
         try:
             installed = dict(self._mods_installed_cache)
             target = installed.get(mod_id)
             if target is not None:
                 target.enabled = not bool(target.enabled)
+                self._pending_mod_enabled_states[str(mod_id)] = bool(target.enabled)
                 self.refresh_mods({"index": list(self._mods_index_cache), "installed": installed})
         except Exception:
-            pass
-        self._submit_backend_task("toggle_mod", {"mod_id": mod_id}, action_id=f"mod:{mod_id}")
+            self._submit_backend_task("toggle_mod", {"mod_id": mod_id}, action_id=f"mod:{mod_id}")
+            return
+        self._schedule_deferred_component_sync()
 
     def _mod_circle_action_style(self, role: str, *, active: bool) -> str:
         theme = self.context.settings.get().theme

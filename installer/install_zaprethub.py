@@ -50,7 +50,7 @@ def _is_ru() -> bool:
 RU = _is_ru()
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ZapretHub"
 INSTALLER_LOG_PATH = Path(tempfile.gettempdir()) / "zapret_hub_installer.log"
-INSTALLER_VERSION = "2.1.0"
+INSTALLER_VERSION = "2.1.1"
 
 def tr(ru: str, en: str) -> str:
     return ru if RU else en
