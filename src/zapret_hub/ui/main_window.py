@@ -242,6 +242,88 @@ class _UiSignals(QObject):
     page_payload_ready = Signal(str, object)
 
 
+def _blurred_widget_backdrop(widget: QWidget, radius: float = 16.0) -> QPixmap:
+    if widget.width() <= 1 or widget.height() <= 1:
+        return QPixmap()
+    screen = widget.window().screen() or QApplication.primaryScreen()
+    if screen is None:
+        return QPixmap()
+    top_left = widget.mapToGlobal(QPoint(0, 0))
+    dpr = max(1.0, float(screen.devicePixelRatio()))
+    pixmap = screen.grabWindow(0, top_left.x(), top_left.y(), widget.width(), widget.height())
+    if pixmap.isNull():
+        return QPixmap()
+    small_w = max(1, int(widget.width() / max(2.0, radius * 0.35)))
+    small_h = max(1, int(widget.height() / max(2.0, radius * 0.35)))
+    small = pixmap.scaled(small_w, small_h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    blurred = small.scaled(widget.width(), widget.height(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    blurred.setDevicePixelRatio(dpr)
+    return blurred
+
+
+def _paint_frosted_glass(
+    widget: QWidget,
+    painter: QPainter,
+    *,
+    theme: str,
+    radius: float = 0.0,
+    top_left: bool = False,
+    top_right: bool = False,
+    bottom_left: bool = False,
+    bottom_right: bool = False,
+) -> None:
+    rect = QRectF(widget.rect())
+    if rect.width() <= 0 or rect.height() <= 0:
+        return
+    path = QPainterPath()
+    if any((top_left, top_right, bottom_left, bottom_right)):
+        path.addRoundedRect(rect, radius, radius)
+        clip = QPainterPath()
+        if not top_left:
+            clip.addRect(rect.left(), rect.top(), radius + 1, radius + 1)
+        if not top_right:
+            clip.addRect(rect.right() - radius - 1, rect.top(), radius + 1, radius + 1)
+        if not bottom_left:
+            clip.addRect(rect.left(), rect.bottom() - radius - 1, radius + 1, radius + 1)
+        if not bottom_right:
+            clip.addRect(rect.right() - radius - 1, rect.bottom() - radius - 1, radius + 1, radius + 1)
+        path = path.united(clip)
+    else:
+        path.addRect(rect)
+    painter.save()
+    painter.setClipPath(path)
+    backdrop = _blurred_widget_backdrop(widget)
+    if not backdrop.isNull():
+        painter.drawPixmap(0, 0, backdrop)
+    light = is_light_theme(theme)
+    veil = QColor(246, 249, 255, 122) if light else QColor(12, 18, 29, 118)
+    painter.fillRect(rect, veil)
+    tint = QColor(255, 255, 255, 42) if light else QColor(115, 145, 205, 24)
+    painter.fillRect(rect, tint)
+    painter.restore()
+
+
+class GlassFrame(QFrame):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._glass_enabled = False
+        self._glass_theme = "night"
+
+    def set_glass_enabled(self, enabled: bool, theme: str) -> None:
+        self._glass_enabled = bool(enabled)
+        self._glass_theme = theme
+        self.update()
+
+    def paintEvent(self, event: QEvent) -> None:
+        if self._glass_enabled:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            _paint_frosted_glass(self, painter, theme=self._glass_theme, radius=16, top_left=True, top_right=True)
+            painter.end()
+            return
+        super().paintEvent(event)
+
+
 class SidebarPanel(QFrame):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -251,6 +333,13 @@ class SidebarPanel(QFrame):
         self._highlight_fill = QColor(69, 81, 109, 72)
         self._highlight_border = QColor("#4f73b3")
         self._highlight_animation: QPropertyAnimation | None = None
+        self._glass_enabled = False
+        self._glass_theme = "night"
+
+    def set_glass_enabled(self, enabled: bool, theme: str) -> None:
+        self._glass_enabled = bool(enabled)
+        self._glass_theme = theme
+        self.update()
 
     def set_theme(self, theme: str) -> None:
         light = is_light_theme(theme)
@@ -269,13 +358,19 @@ class SidebarPanel(QFrame):
         self.update()
 
     def paintEvent(self, event: QEvent) -> None:
-        super().paintEvent(event)
-        if not self._highlight_rect.isNull():
+        if self._glass_enabled:
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            _paint_frosted_glass(self, painter, theme=self._glass_theme, radius=16, bottom_left=True)
+        else:
+            super().paintEvent(event)
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if not self._highlight_rect.isNull():
             painter.setPen(QPen(self._highlight_border, 1))
             painter.setBrush(self._highlight_fill)
             painter.drawRoundedRect(QRectF(self._highlight_rect), 12, 12)
+        painter.end()
 
     def _get_highlight_rect(self) -> QRect:
         return QRect(self._highlight_rect)
@@ -950,6 +1045,7 @@ class ServiceGridPanel(QWidget):
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._grid.setHorizontalSpacing(max(6, horizontal_spacing))
         self._grid.setVerticalSpacing(max(0, vertical_spacing))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_cards(self, cards: list[ServiceCardFrame]) -> None:
         self._cards = list(cards)
@@ -1017,9 +1113,10 @@ class ServiceGridPanel(QWidget):
             ]
             row_heights.append(card_height + max(row_offsets, default=0))
         self._last_minimum_height = sum(row_heights) + max(0, rows - 1) * self._grid.verticalSpacing()
-        self.setMinimumHeight(self._last_minimum_height)
+        self.setFixedHeight(self._last_minimum_height)
+        for row in range(rows + 2):
+            self._grid.setRowStretch(row, 0)
         self.updateGeometry()
-        self._grid.setRowStretch(rows, 1)
 
 class AnimatedPowerButton(QToolButton):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -2860,6 +2957,7 @@ class SettingsDialog(AppDialog):
         self.tray_checkbox = QCheckBox(self._t("Стартовать в трее", "Start in tray"))
         self.auto_components_checkbox = QCheckBox(self._t("Автозапуск компонентов", "Auto-run components"))
         self.check_updates_checkbox = QCheckBox(self._t("Проверять наличие обновлений", "Check for updates"))
+        self.experimental_appearance_checkbox = QCheckBox(self._t("Экспериментальный внешний вид", "Experimental appearance"))
         self.vpn_subscription_input = QLineEdit()
         self.vpn_subscription_input.setPlaceholderText("https://vpn.goshkow.ru/sub/...")
         self.vpn_tun_checkbox = QCheckBox(self._t("Использовать TUN-режим", "Use TUN mode"))
@@ -2921,6 +3019,7 @@ class SettingsDialog(AppDialog):
         app_form.addRow("", self.auto_components_checkbox)
         app_form.addRow("", self.check_updates_checkbox)
         app_form.addRow("", self.check_updates_btn)
+        app_form.addRow("", self.experimental_appearance_checkbox)
 
         vpn_form = self._settings_section(canvas_layout, "goshkow vpn", "goshkow-vpn")
         self.vpn_section_frame = vpn_form.parentWidget()
@@ -3085,6 +3184,7 @@ class SettingsDialog(AppDialog):
         self.tray_checkbox.setChecked(settings.start_in_tray)
         self.auto_components_checkbox.setChecked(settings.auto_run_components)
         self.check_updates_checkbox.setChecked(settings.check_updates_on_start)
+        self.experimental_appearance_checkbox.setChecked(bool(getattr(settings, "experimental_appearance", False)))
         self.vpn_subscription_input.setText(
             str(vpn_state.get("subscription_url", "") or settings.goshkow_vpn_subscription_url)
         )
@@ -3135,6 +3235,7 @@ class SettingsDialog(AppDialog):
         self.tray_checkbox.setChecked(bool(payload.get("start_in_tray", self.context.settings.get().start_in_tray)))
         self.auto_components_checkbox.setChecked(bool(payload.get("auto_run_components", self.context.settings.get().auto_run_components)))
         self.check_updates_checkbox.setChecked(bool(payload.get("check_updates_on_start", self.context.settings.get().check_updates_on_start)))
+        self.experimental_appearance_checkbox.setChecked(bool(payload.get("experimental_appearance", getattr(self.context.settings.get(), "experimental_appearance", False))))
         self.vpn_subscription_input.setText(
             str(payload.get("goshkow_vpn_subscription_url", self.vpn_subscription_input.text()))
         )
@@ -3192,6 +3293,7 @@ class SettingsDialog(AppDialog):
             "start_in_tray": self.tray_checkbox.isChecked(),
             "auto_run_components": self.auto_components_checkbox.isChecked(),
             "check_updates_on_start": self.check_updates_checkbox.isChecked(),
+            "experimental_appearance": self.experimental_appearance_checkbox.isChecked(),
             "goshkow_vpn_subscription_url": self.vpn_subscription_input.text().strip(),
             "goshkow_vpn_tun_enabled": self.vpn_tun_checkbox.isChecked(),
             "goshkow_vpn_routing_mode": self.vpn_routing_combo.currentData() or "global",
@@ -3433,6 +3535,12 @@ class MainWindow(QMainWindow):
         self._taskbar_important_attention = False
         self._tools_btn: QToolButton | None = None
         self._settings_btn: QToolButton | None = None
+        self._apply_status_label: QLabel | None = None
+        self._apply_status_opacity: QGraphicsOpacityEffect | None = None
+        self._apply_status_anim: QPropertyAnimation | None = None
+        self._apply_status_hide_timer = QTimer(self)
+        self._apply_status_hide_timer.setSingleShot(True)
+        self._apply_status_hide_timer.timeout.connect(self._hide_apply_status)
         self._root_frame: QFrame | None = None
         self._dashboard_title_label: QLabel | None = None
         self._services_title_label: QLabel | None = None
@@ -3511,7 +3619,7 @@ class MainWindow(QMainWindow):
         self._page_refresh_in_progress: set[str] = set()
         self._page_payload_cache: dict[str, object] = {}
         self._settings_dialog: SettingsDialog | None = None
-        self._settings_dialog_signature: tuple[str, str] | None = None
+        self._settings_dialog_signature: tuple[str, str, bool] | None = None
         self._pending_settings_payload: dict[str, object] | None = None
         self._pending_settings_revision = 0
         self._settings_save_revision = 0
@@ -3671,12 +3779,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self._submit_backend_task("load_startup_snapshot", action_id="__startup_snapshot__"))
 
     def _themed_icon_color(self, filename: str) -> QColor | None:
-        if filename not in {"power.svg", "share.svg", "trash.svg", "search.svg", "refresh.svg", "external.svg", "vpn.svg", "vpn.png"}:
+        if filename not in {"power.svg", "share.svg", "trash.svg", "search.svg", "refresh.svg", "external.svg", "vpn.svg", "vpn.png", "bell.svg", "settings.svg"}:
             return None
         theme = self.context.settings.get().theme
         if is_light_theme(theme):
-            return QColor("#2d3c57")
-        return QColor("#f3f7ff")
+            return QColor("#1f2a3d")
+        return QColor("#e7edf9")
 
     def _compose_icon_slot_pixmap(
         self,
@@ -4571,7 +4679,7 @@ class MainWindow(QMainWindow):
         self._loading_overlay_context = ""
 
     def _build_title_bar(self) -> QWidget:
-        bar = QFrame()
+        bar = GlassFrame()
         bar.setObjectName("TitleBar")
         bar.setFixedHeight(52)
         row = QHBoxLayout(bar)
@@ -4591,6 +4699,19 @@ class MainWindow(QMainWindow):
         author.setContentsMargins(0, 2, 0, 0)
         row.addWidget(author)
         row.addStretch(1)
+
+        apply_status = QLabel("")
+        apply_status.setObjectName("ApplyStatusBadge")
+        apply_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        apply_status.setMinimumHeight(28)
+        apply_status.setMinimumWidth(176)
+        apply_status.hide()
+        apply_status_opacity = QGraphicsOpacityEffect(apply_status)
+        apply_status_opacity.setOpacity(0.0)
+        apply_status.setGraphicsEffect(apply_status_opacity)
+        self._apply_status_label = apply_status
+        self._apply_status_opacity = apply_status_opacity
+        row.addWidget(apply_status, 0, Qt.AlignmentFlag.AlignVCenter)
 
         notifications_btn = NotificationBellButton()
         notifications_btn.setProperty("class", "action")
@@ -5631,10 +5752,11 @@ class MainWindow(QMainWindow):
         canvas.setObjectName("ServicesCanvas")
         canvas.setProperty("class", "pageCanvas")
         canvas_layout = QVBoxLayout(canvas)
-        canvas_layout.setContentsMargins(1, 0, 1, 1)
+        canvas_layout.setContentsMargins(1, 0, 1, 12)
         canvas_layout.setSpacing(12)
+        canvas_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         grid = ServiceGridPanel(base_columns=4, min_card_width=166, offset_pattern=(0,), horizontal_spacing=12, vertical_spacing=12)
-        grid.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        grid.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         grid.set_cards(self._create_service_cards(scope="main"))
         self._services_grid = grid
         canvas_layout.addWidget(grid)
@@ -5642,10 +5764,13 @@ class MainWindow(QMainWindow):
         select_all_btn.setObjectName("ServicesSelectAllButton")
         select_all_btn.setProperty("class", "secondary")
         select_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        select_all_btn.setMinimumWidth(320)
+        select_all_btn.setMinimumHeight(40)
+        select_all_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         select_all_btn.clicked.connect(self._select_all_services)
         self._attach_button_animations(select_all_btn)
         self._services_select_all_btn = select_all_btn
-        canvas_layout.addWidget(select_all_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        canvas_layout.addWidget(select_all_btn)
         scroll.setWidget(canvas)
         self._register_scroll_fade(scroll, surface_color=_content_surface_color(self.context.settings.get().theme))
         self._register_smooth_scroll(scroll, duration=250, angle_divisor=3.0)
@@ -6893,6 +7018,7 @@ class MainWindow(QMainWindow):
                     self.context.logging.log("error", "components_refresh_request_failed", error=str(error))
             elif index == 0:
                 self._dashboard_page_opening = current_index != 0
+                self._prime_dashboard_reconfigure_button()
                 self.refresh_dashboard()
                 self._sync_power_aura_geometry()
                 QTimer.singleShot(0, lambda: setattr(self, "_dashboard_page_opening", False))
@@ -7099,7 +7225,11 @@ class MainWindow(QMainWindow):
 
 
     def _open_settings_dialog(self, target_component_id: str = "") -> None:
-        signature = (self.context.settings.get().theme, self.context.settings.get().language)
+        signature = (
+            self.context.settings.get().theme,
+            self.context.settings.get().language,
+            bool(getattr(self.context.settings.get(), "experimental_appearance", False)),
+        )
         if self._settings_dialog is None or self._settings_dialog_signature != signature:
             if self._settings_dialog is not None:
                 self._settings_dialog.deleteLater()
@@ -7116,7 +7246,11 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             before = self.context.settings.get()
             payload = dialog.payload()
-            if signature != (str(payload["theme"]), str(payload["language"])):
+            if signature != (
+                str(payload["theme"]),
+                str(payload["language"]),
+                bool(payload.get("experimental_appearance", getattr(before, "experimental_appearance", False))),
+            ):
                 self._settings_dialog = None
                 self._settings_dialog_signature = None
             QTimer.singleShot(0, lambda p=payload, b=before: self._apply_settings_payload(b, p))
@@ -7146,27 +7280,31 @@ class MainWindow(QMainWindow):
         effective_payload = dict(payload)
         before_theme = str(getattr(before, "theme", self.context.settings.get().theme))
         before_language = str(getattr(before, "language", self.context.settings.get().language))
+        before_experimental = bool(getattr(before, "experimental_appearance", getattr(self.context.settings.get(), "experimental_appearance", False)))
         next_theme = str(effective_payload.get("theme", before_theme))
         next_language = str(effective_payload.get("language", before_language))
+        next_experimental = bool(effective_payload.get("experimental_appearance", before_experimental))
         theme_changed = before_theme != next_theme
         language_changed = before_language != next_language
+        experimental_changed = before_experimental != next_experimental
         self._settings_save_revision += 1
         self._pending_settings_revision = self._settings_save_revision
         merged_payload = dict(self._pending_settings_payload or {})
         merged_payload.update(effective_payload)
         self._pending_settings_payload = merged_payload
         self.context.settings.update(**effective_payload)
-        if theme_changed:
+        if theme_changed or experimental_changed:
             self._apply_theme()
         if language_changed:
             self._retranslate_ui()
-        if theme_changed or language_changed:
+        if theme_changed or language_changed or experimental_changed:
             self._schedule_full_locale_theme_refresh()
         self._page_payload_cache.clear()
         self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
         QTimer.singleShot(0, self._flush_deferred_component_changes)
 
     def _schedule_deferred_component_sync(self, *, delay_ms: int = 5000) -> None:
+        self._set_apply_status("pending")
         self._services_sync_timer.start(max(100, int(delay_ms)))
 
     def _flush_deferred_component_changes(self) -> None:
@@ -7306,7 +7444,11 @@ class MainWindow(QMainWindow):
     def _prime_cached_dialogs(self) -> None:
         if self._launch_hidden:
             return
-        signature = (self.context.settings.get().theme, self.context.settings.get().language)
+        signature = (
+            self.context.settings.get().theme,
+            self.context.settings.get().language,
+            bool(getattr(self.context.settings.get(), "experimental_appearance", False)),
+        )
         if self._settings_dialog is None or self._settings_dialog_signature != signature:
             self._settings_dialog = SettingsDialog(self, self.context)
             self._settings_dialog_signature = signature
@@ -7314,6 +7456,8 @@ class MainWindow(QMainWindow):
     def _submit_backend_task(self, action: str, payload: dict[str, object] | None = None, *, action_id: str | None = None) -> str:
         if self.context.backend is None:
             raise RuntimeError("Backend worker is not available")
+        if action in {"apply_settings", "apply_deferred_changes", "set_selected_services", "select_general"}:
+            self._set_apply_status("pending")
         task_id = self.context.backend.submit(action, payload or {})
         self._backend_tasks[task_id] = action_id or action
         return task_id
@@ -7395,18 +7539,20 @@ class MainWindow(QMainWindow):
                         source="settings",
                         details={"dedupe_key": "settings-autostart-failed"},
                     )
-            if bool(payload.get("theme_changed")):
+            if bool(payload.get("theme_changed")) or bool(payload.get("experimental_appearance_changed")):
                 self._apply_theme()
             if bool(payload.get("language_changed")):
                 self._retranslate_ui()
-            if bool(payload.get("theme_changed")) or bool(payload.get("language_changed")):
+            if bool(payload.get("theme_changed")) or bool(payload.get("language_changed")) or bool(payload.get("experimental_appearance_changed")):
                 self._schedule_full_locale_theme_refresh()
             self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
+            self._set_apply_status("done")
         if action in {"toggle_master_runtime", "start_enabled_components", "select_general"}:
             self._mark_dirty("dashboard", "components", "tray")
             self._ui_signals.toggle_done.emit()
             if action == "select_general":
                 self._ui_signals.component_action_done.emit("__general__")
+                self._set_apply_status("done")
             return
         if action in {"start_component", "stop_component"}:
             self._mark_dirty("dashboard", "components", "tray")
@@ -7439,6 +7585,7 @@ class MainWindow(QMainWindow):
             return
         if action == "set_selected_services":
             self._mark_dirty("dashboard", "services", "components", "files", "tray")
+            self._set_apply_status("done")
             return
         if action == "toggle_mod":
             self._mark_dirty("dashboard", "mods", "files", "logs", "tray")
@@ -7529,6 +7676,8 @@ class MainWindow(QMainWindow):
         source = self._backend_error_source(action, str(message.get("source", "") or ""))
         raw_error = str(message.get("error", self._t("Неизвестная ошибка.", "Unknown error.")))
         error = self._friendly_backend_error(raw_error, source=source, action=action)
+        if action in {"apply_settings", "apply_deferred_changes", "set_selected_services", "select_general"}:
+            self._set_apply_status("error")
         if action == "import_goshkow_vpn_subscription":
             self._vpn_import_in_progress = False
         if action == "load_startup_snapshot":
@@ -7777,6 +7926,7 @@ class MainWindow(QMainWindow):
         chevron = str((self._icons_dir / "chevron_down.svg").resolve())
         check = str((self._icons_dir / "check.svg").resolve())
         self.setStyleSheet(build_stylesheet(theme, chevron_icon=chevron, check_icon=check))
+        self._sync_apply_status_style()
         self._update_power_icon()
         if isinstance(self.power_button, AnimatedPowerButton):
             self.power_button.set_power_theme(theme)
@@ -7821,6 +7971,7 @@ class MainWindow(QMainWindow):
         self._sync_onboarding_back_button_style()
         self._refresh_notifications_badge()
         self._apply_onboarding_style()
+        self._apply_experimental_appearance()
         self._apply_file_search_style()
         if self._file_search_toggle is not None:
             self._file_search_toggle.setIcon(self._icon("search.svg"))
@@ -7830,6 +7981,147 @@ class MainWindow(QMainWindow):
                 self.refresh_mods()
             except Exception:
                 pass
+
+    def _apply_experimental_appearance(self) -> None:
+        settings = self.context.settings.get()
+        theme = settings.theme
+        enabled = bool(getattr(settings, "experimental_appearance", False))
+        root = self.findChild(OnboardingFrame, "RootFrame")
+        title_bar = self.findChild(GlassFrame, "TitleBar")
+        sidebar = self.findChild(SidebarPanel, "Sidebar")
+        if self._onboarding_active:
+            if title_bar is not None:
+                title_bar.set_glass_enabled(False, theme)
+            if sidebar is not None:
+                sidebar.set_glass_enabled(False, theme)
+            if self._apply_status_label is not None and self._apply_status_opacity is not None:
+                self._apply_status_label.hide()
+                self._apply_status_opacity.setOpacity(0.0)
+            return
+        if not enabled:
+            if root is not None:
+                root.setStyleSheet("")
+            if title_bar is not None:
+                title_bar.set_glass_enabled(False, theme)
+                title_bar.setStyleSheet("")
+            if sidebar is not None:
+                sidebar.set_glass_enabled(False, theme)
+                sidebar.setStyleSheet("")
+            return
+        light = is_light_theme(theme)
+        if light:
+            text = "#172033"
+        else:
+            text = "#f6f8fc"
+        if root is not None:
+            root.setStyleSheet("")
+        if title_bar is not None:
+            title_bar.set_glass_enabled(True, theme)
+            title_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            title_bar.setStyleSheet(
+                "QFrame#TitleBar {"
+                "background: transparent;"
+                "border: none;"
+                "border-top-left-radius: 16px;"
+                "border-top-right-radius: 16px;"
+                "}"
+                "QFrame#TitleBar QLabel, QFrame#TitleBar QToolButton {"
+                "background: transparent;"
+                f"color: {text};"
+                "}"
+            )
+        if sidebar is not None:
+            sidebar.set_glass_enabled(True, theme)
+            sidebar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            sidebar.setStyleSheet(
+                "QFrame#Sidebar {"
+                "background: transparent;"
+                "border: none;"
+                "border-bottom-left-radius: 16px;"
+                "}"
+            )
+
+    def _sync_apply_status_style(self, state: str | None = None) -> None:
+        label = self._apply_status_label
+        if label is None:
+            return
+        state = state or str(label.property("state") or "pending")
+        theme = self.context.settings.get().theme
+        light = is_light_theme(theme)
+        if state == "done":
+            border = "#2fbf72" if not light else "#1f9d5b"
+            fg = "#bff7d2" if not light else "#0d5f36"
+            bg = "rgba(35, 152, 87, 24)" if not light else "rgba(31, 157, 91, 26)"
+        elif state == "error":
+            border = "#ff5f67" if not light else "#dc2626"
+            fg = "#ffd2d5" if not light else "#7f1d1d"
+            bg = "rgba(239, 68, 68, 24)" if not light else "rgba(220, 38, 38, 24)"
+        else:
+            border = "#f5a524" if not light else "#d97706"
+            fg = "#ffe4ac" if not light else "#7c3d00"
+            bg = "rgba(245, 158, 11, 24)" if not light else "rgba(217, 119, 6, 24)"
+        label.setStyleSheet(
+            "QLabel#ApplyStatusBadge {"
+            f"background: {bg};"
+            f"border: 1px solid {border};"
+            "border-radius: 12px;"
+            "padding: 4px 12px;"
+            f"color: {fg};"
+            "font-weight: 650;"
+            "}"
+        )
+
+    def _set_apply_status(self, state: str) -> None:
+        label = self._apply_status_label
+        effect = self._apply_status_opacity
+        if label is None or effect is None:
+            return
+        if self._onboarding_active:
+            label.hide()
+            effect.setOpacity(0.0)
+            return
+        self._apply_status_hide_timer.stop()
+        if self._apply_status_anim is not None:
+            self._apply_status_anim.stop()
+        if state == "done":
+            text = self._t("Изменения применены", "Changes applied")
+        elif state == "error":
+            text = self._t("Не удалось применить", "Could not apply")
+        else:
+            text = self._t("Применение изменений...", "Applying changes...")
+        label.setText(text)
+        label.setProperty("state", state)
+        self._sync_apply_status_style(state)
+        label.show()
+        animation = QPropertyAnimation(effect, b"opacity", label)
+        animation.setDuration(160)
+        animation.setStartValue(float(effect.opacity()))
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.start()
+        self._apply_status_anim = animation
+        if state in {"done", "error"}:
+            self._apply_status_hide_timer.start(2000)
+
+    def _hide_apply_status(self) -> None:
+        label = self._apply_status_label
+        effect = self._apply_status_opacity
+        if label is None or effect is None:
+            return
+        if self._apply_status_anim is not None:
+            self._apply_status_anim.stop()
+        animation = QPropertyAnimation(effect, b"opacity", label)
+        animation.setDuration(220)
+        animation.setStartValue(float(effect.opacity()))
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+        def _finish() -> None:
+            label.hide()
+
+        animation.finished.connect(_finish)
+        animation.start()
+        self._apply_status_anim = animation
 
     def _apply_onboarding_style(self) -> None:
         if self._content_surface is None:
@@ -7941,6 +8233,16 @@ class MainWindow(QMainWindow):
             )
 
     def _apply_onboarding_chrome(self, theme: str, onboarding_active: bool) -> None:
+        title_glass = self.findChild(GlassFrame, "TitleBar")
+        sidebar_glass = self.findChild(SidebarPanel, "Sidebar")
+        if onboarding_active:
+            if title_glass is not None:
+                title_glass.set_glass_enabled(False, theme)
+            if sidebar_glass is not None:
+                sidebar_glass.set_glass_enabled(False, theme)
+            if self._apply_status_label is not None and self._apply_status_opacity is not None:
+                self._apply_status_label.hide()
+                self._apply_status_opacity.setOpacity(0.0)
         if not onboarding_active:
             self._content_surface.setStyleSheet("")
             root_frame = self.findChild(OnboardingFrame, "RootFrame")
@@ -10447,6 +10749,21 @@ class MainWindow(QMainWindow):
         if self._loading_overlay_context == f"page:{section}":
             self._hide_loading_overlay()
 
+    def _prime_dashboard_reconfigure_button(self) -> None:
+        if self.power_reconfigure_btn is None or self.power_reconfigure_slot is None:
+            return
+        settings = self.context.settings.get()
+        states = self._component_states()
+        vpn_state = states.get("goshkow-vpn")
+        vpn_running = bool(vpn_state and str(getattr(vpn_state, "status", "") or "") == "running")
+        vpn_selected = "goshkow-vpn" in {str(item) for item in list(settings.enabled_component_ids or [])}
+        if self._vpn_mode_switch_target_enabled is not None:
+            vpn_selected = bool(self._vpn_mode_switch_target_enabled)
+            if not vpn_selected:
+                vpn_running = False
+        visible = not (vpn_selected or vpn_running or self._vpn_mode_switch_in_progress)
+        self._set_power_reconfigure_visible(visible, animate=False)
+
     def refresh_dashboard(self) -> None:
         if self._page_transition_running and (
             self.pages.currentIndex() == 0 or getattr(self, "_page_transition_target", -1) == 0
@@ -11119,6 +11436,7 @@ class MainWindow(QMainWindow):
             self._onboarding_back_btn.hide()
         if not visible:
             self._apply_onboarding_chrome(self.context.settings.get().theme, False)
+            self._apply_experimental_appearance()
         elif not self._onboarding_quick_restart:
             self._apply_onboarding_style()
         self._relayout_onboarding_content()
