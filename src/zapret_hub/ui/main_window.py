@@ -11688,6 +11688,8 @@ class MainWindow(QMainWindow):
 
     def _apply_service_preferences_locally(self, normalized: list[str]) -> None:
         changes: dict[str, str] = {}
+        if "gaming" in normalized:
+            changes["zapret_game_filter_mode"] = "tcpudp"
         if "ubisoft" in normalized:
             general_id = self._preferred_service_general_id(UBISOFT_GENERAL_PRIORITY)
             if general_id:
