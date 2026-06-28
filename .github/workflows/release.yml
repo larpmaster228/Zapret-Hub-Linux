@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag or release version (for example v2.1.1)"
+        description: "Git tag or release version (for example v2.1.2)"
         required: true
-        default: "v2.1.1"
+        default: "v2.1.2"
       release_name:
         description: "Release title"
         required: true
-        default: "Zapret Hub 2.1.1"
+        default: "Zapret Hub 2.1.2"
       changelog:
         description: "Release changelog"
         required: false
@@ -166,7 +166,7 @@ jobs:
         run: |
           $tag = "${{ inputs.tag || github.ref_name }}"
           if (-not $tag) {
-            $tag = "v2.1.1"
+            $tag = "v2.1.2"
           }
           $version = $tag.TrimStart("v")
           $name = "${{ inputs.release_name }}"

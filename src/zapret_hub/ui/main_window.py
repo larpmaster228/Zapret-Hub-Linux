@@ -17,7 +17,6 @@ from zapret_hub import __version__
 from zapret_hub.domain import ComponentDefinition, ComponentState, FileRecord, NotificationEntry
 from zapret_hub.services.service_catalog import (
     FORTNITE_GENERAL_PRIORITY,
-    GAMING_GENERAL_PRIORITY,
     SERVICE_PRESETS,
     ServicePreset,
     prioritize_generals_for_services,
@@ -11689,11 +11688,7 @@ class MainWindow(QMainWindow):
 
     def _apply_service_preferences_locally(self, normalized: list[str]) -> None:
         changes: dict[str, str] = {}
-        if "gaming" in normalized:
-            general_id = self._preferred_service_general_id(GAMING_GENERAL_PRIORITY)
-            if general_id:
-                changes["selected_zapret_general"] = general_id
-        elif "ubisoft" in normalized:
+        if "ubisoft" in normalized:
             general_id = self._preferred_service_general_id(UBISOFT_GENERAL_PRIORITY)
             if general_id:
                 changes["selected_zapret_general"] = general_id
