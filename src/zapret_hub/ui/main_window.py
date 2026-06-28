@@ -4233,9 +4233,10 @@ class MainWindow(QMainWindow):
             top_left = root.mapTo(self, QPoint(0, 0))
             rect = QRectF(top_left, QSizeF(root.width(), root.height()))
             inner_path = QPainterPath()
-            inner_path.addRoundedRect(rect, 16, 16)
+            inner_cutout = rect.adjusted(0.55, 0.55, -0.55, -0.55)
+            inner_path.addRoundedRect(inner_cutout, 15.5, 15.5)
             painter.setPen(Qt.PenStyle.NoPen)
-            for spread, offset_y, alpha in ((1.0, 0.4, 42), (2.0, 0.8, 28), (3.5, 1.4, 16), (5.2, 2.0, 8)):
+            for spread, offset_y, alpha in ((1.0, 0.4, 22), (2.0, 0.8, 14), (3.5, 1.4, 8), (5.2, 2.0, 4)):
                 outer_rect = rect.adjusted(-spread, -spread + offset_y, spread, spread + offset_y)
                 outer_path = QPainterPath()
                 outer_path.addRoundedRect(outer_rect, 16 + spread, 16 + spread)
