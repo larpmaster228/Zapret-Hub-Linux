@@ -274,26 +274,8 @@ def _paint_frosted_glass(
     painter.save()
     painter.setClipPath(path)
     light = is_light_theme(theme)
-    veil = QColor(246, 249, 255, 154) if light else QColor(12, 18, 29, 150)
+    veil = QColor(246, 249, 255, 70) if light else QColor(12, 18, 29, 64)
     painter.fillRect(rect, veil)
-    glow = QRadialGradient(rect.left() + rect.width() * 0.18, rect.top() + rect.height() * 0.12, max(rect.width(), rect.height()) * 0.9)
-    if light:
-        glow.setColorAt(0.0, QColor(255, 255, 255, 58))
-        glow.setColorAt(0.55, QColor(224, 235, 252, 22))
-    else:
-        glow.setColorAt(0.0, QColor(112, 145, 214, 34))
-        glow.setColorAt(0.55, QColor(51, 76, 125, 16))
-    glow.setColorAt(1.0, QColor(0, 0, 0, 0))
-    painter.fillRect(rect, glow)
-    sheen = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
-    if light:
-        sheen.setColorAt(0.0, QColor(255, 255, 255, 34))
-        sheen.setColorAt(0.42, QColor(255, 255, 255, 10))
-    else:
-        sheen.setColorAt(0.0, QColor(255, 255, 255, 18))
-        sheen.setColorAt(0.42, QColor(255, 255, 255, 5))
-    sheen.setColorAt(1.0, QColor(0, 0, 0, 0))
-    painter.fillRect(rect, sheen)
     painter.restore()
 
 
@@ -2714,6 +2696,56 @@ def _disable_native_window_rounding(widget: QWidget) -> None:
             ctypes.byref(value),
             ctypes.sizeof(value),
         )
+    except Exception:
+        return
+
+
+def _set_window_acrylic_blur(widget: QWidget, enabled: bool, theme: str) -> None:
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        hwnd = int(widget.winId())
+
+        class ACCENT_POLICY(ctypes.Structure):
+            _fields_ = [
+                ("AccentState", ctypes.c_int),
+                ("AccentFlags", ctypes.c_int),
+                ("GradientColor", ctypes.c_uint),
+                ("AnimationId", ctypes.c_int),
+            ]
+
+        class WINDOWCOMPOSITIONATTRIBDATA(ctypes.Structure):
+            _fields_ = [
+                ("Attribute", ctypes.c_int),
+                ("Data", ctypes.c_void_p),
+                ("SizeOfData", ctypes.c_size_t),
+            ]
+
+        def rgba_to_abgr(color: QColor) -> int:
+            return (
+                (max(0, min(255, color.alpha())) << 24)
+                | (max(0, min(255, color.blue())) << 16)
+                | (max(0, min(255, color.green())) << 8)
+                | max(0, min(255, color.red()))
+            )
+
+        ACCENT_DISABLED = 0
+        ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
+        WCA_ACCENT_POLICY = 19
+        light = is_light_theme(theme)
+        tint = QColor(246, 249, 255, 74) if light else QColor(10, 15, 25, 92)
+        policy = ACCENT_POLICY(
+            ACCENT_ENABLE_ACRYLICBLURBEHIND if enabled else ACCENT_DISABLED,
+            0x20 if enabled else 0,
+            rgba_to_abgr(tint) if enabled else 0,
+            0,
+        )
+        data = WINDOWCOMPOSITIONATTRIBDATA(
+            WCA_ACCENT_POLICY,
+            ctypes.cast(ctypes.pointer(policy), ctypes.c_void_p),
+            ctypes.sizeof(policy),
+        )
+        ctypes.windll.user32.SetWindowCompositionAttribute(ctypes.c_void_p(hwnd), ctypes.byref(data))  # type: ignore[attr-defined]
     except Exception:
         return
 
@@ -7984,6 +8016,7 @@ class MainWindow(QMainWindow):
         title_bar = self.findChild(GlassFrame, "TitleBar")
         sidebar = self.findChild(SidebarPanel, "Sidebar")
         if self._onboarding_active:
+            _set_window_acrylic_blur(self, False, theme)
             if title_bar is not None:
                 title_bar.set_glass_enabled(False, theme)
             if sidebar is not None:
@@ -7993,6 +8026,7 @@ class MainWindow(QMainWindow):
                 self._apply_status_opacity.setOpacity(0.0)
             return
         if not enabled:
+            _set_window_acrylic_blur(self, False, theme)
             if root is not None:
                 root.setStyleSheet("")
             if title_bar is not None:
@@ -8008,7 +8042,14 @@ class MainWindow(QMainWindow):
         else:
             text = "#f6f8fc"
         if root is not None:
-            root.setStyleSheet("")
+            root.setStyleSheet(
+                "QFrame#RootFrame {"
+                "background: transparent;"
+                "border: 1px solid rgba(103, 127, 170, 0.42);"
+                "border-radius: 16px;"
+                "}"
+            )
+        _set_window_acrylic_blur(self, True, theme)
         if title_bar is not None:
             title_bar.set_glass_enabled(True, theme)
             title_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
