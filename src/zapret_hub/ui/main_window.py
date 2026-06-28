@@ -242,25 +242,6 @@ class _UiSignals(QObject):
     page_payload_ready = Signal(str, object)
 
 
-def _blurred_widget_backdrop(widget: QWidget, radius: float = 16.0) -> QPixmap:
-    if widget.width() <= 1 or widget.height() <= 1:
-        return QPixmap()
-    screen = widget.window().screen() or QApplication.primaryScreen()
-    if screen is None:
-        return QPixmap()
-    top_left = widget.mapToGlobal(QPoint(0, 0))
-    dpr = max(1.0, float(screen.devicePixelRatio()))
-    pixmap = screen.grabWindow(0, top_left.x(), top_left.y(), widget.width(), widget.height())
-    if pixmap.isNull():
-        return QPixmap()
-    small_w = max(1, int(widget.width() / max(2.0, radius * 0.35)))
-    small_h = max(1, int(widget.height() / max(2.0, radius * 0.35)))
-    small = pixmap.scaled(small_w, small_h, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
-    blurred = small.scaled(widget.width(), widget.height(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
-    blurred.setDevicePixelRatio(dpr)
-    return blurred
-
-
 def _paint_frosted_glass(
     widget: QWidget,
     painter: QPainter,
@@ -292,14 +273,27 @@ def _paint_frosted_glass(
         path.addRect(rect)
     painter.save()
     painter.setClipPath(path)
-    backdrop = _blurred_widget_backdrop(widget)
-    if not backdrop.isNull():
-        painter.drawPixmap(0, 0, backdrop)
     light = is_light_theme(theme)
-    veil = QColor(246, 249, 255, 122) if light else QColor(12, 18, 29, 118)
+    veil = QColor(246, 249, 255, 154) if light else QColor(12, 18, 29, 150)
     painter.fillRect(rect, veil)
-    tint = QColor(255, 255, 255, 42) if light else QColor(115, 145, 205, 24)
-    painter.fillRect(rect, tint)
+    glow = QRadialGradient(rect.left() + rect.width() * 0.18, rect.top() + rect.height() * 0.12, max(rect.width(), rect.height()) * 0.9)
+    if light:
+        glow.setColorAt(0.0, QColor(255, 255, 255, 58))
+        glow.setColorAt(0.55, QColor(224, 235, 252, 22))
+    else:
+        glow.setColorAt(0.0, QColor(112, 145, 214, 34))
+        glow.setColorAt(0.55, QColor(51, 76, 125, 16))
+    glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+    painter.fillRect(rect, glow)
+    sheen = QLinearGradient(rect.left(), rect.top(), rect.right(), rect.bottom())
+    if light:
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 34))
+        sheen.setColorAt(0.42, QColor(255, 255, 255, 10))
+    else:
+        sheen.setColorAt(0.0, QColor(255, 255, 255, 18))
+        sheen.setColorAt(0.42, QColor(255, 255, 255, 5))
+    sheen.setColorAt(1.0, QColor(0, 0, 0, 0))
+    painter.fillRect(rect, sheen)
     painter.restore()
 
 
