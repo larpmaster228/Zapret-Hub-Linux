@@ -301,6 +301,66 @@ def default_install_dir() -> Path:
     return Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Zapret Hub"
 
 
+def _normalized_path_text(path: Path) -> str:
+    try:
+        return str(path.resolve()).rstrip("\\/").lower()
+    except Exception:
+        return str(path).rstrip("\\/").lower()
+
+
+def _is_drive_root(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    return bool(resolved.anchor) and str(resolved).rstrip("\\/").lower() == resolved.anchor.rstrip("\\/").lower()
+
+
+def _is_dangerous_install_dir(path: Path) -> bool:
+    if _is_drive_root(path):
+        return True
+    dangerous: list[Path] = []
+    for value in (
+        os.environ.get("SystemRoot", r"C:\Windows"),
+        os.environ.get("WINDIR", r"C:\Windows"),
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.environ.get("ProgramData", r"C:\ProgramData"),
+        os.environ.get("USERPROFILE", ""),
+        os.environ.get("PUBLIC", r"C:\Users\Public"),
+    ):
+        if value:
+            dangerous.append(Path(value))
+    target = _normalized_path_text(path)
+    return any(target == _normalized_path_text(candidate) for candidate in dangerous)
+
+
+def _looks_like_zapret_hub_dir(path: Path) -> bool:
+    if not path.exists():
+        return False
+    return (path / "zapret_hub.exe").exists()
+
+
+def _suggest_empty_install_dir(path: Path) -> Path:
+    base = path / "Zapret Hub"
+    if not base.exists() or not any(base.iterdir()):
+        return base
+    for index in range(2, 100):
+        candidate = path / f"Zapret Hub {index}"
+        if not candidate.exists() or not any(candidate.iterdir()):
+            return candidate
+    return path / f"Zapret Hub {int(time.time())}"
+
+
+def _suggest_safe_install_dir(path: Path) -> Path:
+    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    if _is_drive_root(path):
+        return _suggest_empty_install_dir(path)
+    if _normalized_path_text(path) == _normalized_path_text(program_files):
+        return _suggest_empty_install_dir(path)
+    return default_install_dir()
+
+
 def _native_windows_machine() -> str:
     if not sys.platform.startswith("win"):
         return platform.machine().lower()
@@ -701,30 +761,38 @@ def _wipe_install_dir(install_dir: Path) -> None:
     raise PermissionError(f"cannot replace: {remaining}")
 
 
-def _overlay_tree(source: Path, target: Path, install_dir: Path, preserve_names: set[str] | None = None) -> None:
+def _overlay_tree(
+    source: Path,
+    target: Path,
+    install_dir: Path,
+    preserve_names: set[str] | None = None,
+    *,
+    remove_extra: bool = False,
+) -> None:
     if not _is_within_path(target, install_dir):
         raise PermissionError(f"write target escaped install dir: {target}")
     preserve_names = preserve_names or set()
     target.mkdir(parents=True, exist_ok=True)
     source_names = {item.name for item in source.iterdir()}
-    for existing in list(target.iterdir()):
-        if existing.name in preserve_names:
-            continue
-        if existing.name in source_names:
-            continue
-        try:
-            _safe_remove_item(existing, install_dir)
-        except Exception:
-            if not _quarantine_item(existing):
-                if existing.is_dir() and not _is_preserved_user_root(existing, install_dir):
-                    continue
-                raise
+    if remove_extra:
+        for existing in list(target.iterdir()):
+            if existing.name in preserve_names:
+                continue
+            if existing.name in source_names:
+                continue
+            try:
+                _safe_remove_item(existing, install_dir)
+            except Exception:
+                if not _quarantine_item(existing):
+                    if existing.is_dir() and not _is_preserved_user_root(existing, install_dir):
+                        continue
+                    raise
     for item in source.iterdir():
         if item.name in preserve_names:
             continue
         dst = target / item.name
         if item.is_dir():
-            _overlay_tree(item, dst, install_dir)
+            _overlay_tree(item, dst, install_dir, preserve_names, remove_extra=remove_extra)
             continue
         if dst.exists():
             try:
@@ -993,10 +1061,11 @@ class InstallerWorker(QThread):
     progress = Signal(int)
     done = Signal(bool, str)
 
-    def __init__(self, target_dir: Path, preserve_data: bool) -> None:
+    def __init__(self, target_dir: Path, preserve_data: bool, *, clean_target: bool = False) -> None:
         super().__init__()
         self.target_dir = target_dir
         self.preserve_data = preserve_data
+        self.clean_target = clean_target
 
     def run(self) -> None:
         try:
@@ -1006,7 +1075,10 @@ class InstallerWorker(QThread):
                 executable=str(sys.executable),
                 target_dir=str(self.target_dir),
                 preserve_data=bool(self.preserve_data),
+                clean_target=bool(self.clean_target),
             )
+            if _is_dangerous_install_dir(self.target_dir):
+                raise PermissionError("Unsafe install folder. Please choose an empty subfolder for Zapret Hub.")
             root = payload_root()
             payload_name = detect_payload_name()
             payload_zip = root / "installer_payload" / payload_name
@@ -1021,6 +1093,8 @@ class InstallerWorker(QThread):
             self.progress.emit(8)
             _terminate_running_instances(self.target_dir)
             self.target_dir.mkdir(parents=True, exist_ok=True)
+            if self.clean_target:
+                _wipe_install_dir(self.target_dir)
             staging = Path(tempfile.mkdtemp(prefix="zapret_hub_install_"))
             _installer_log("staging_created", staging=str(staging))
             self.progress.emit(18)
@@ -1050,7 +1124,7 @@ class InstallerWorker(QThread):
                         _quarantine_item(runtime_dir)
 
             self.progress.emit(70)
-            _overlay_tree(source_root, self.target_dir, self.target_dir, preserved_names)
+            _overlay_tree(source_root, self.target_dir, self.target_dir, preserved_names, remove_extra=self.clean_target)
             _installer_log("overlay_done", target_dir=str(self.target_dir))
 
             shutil.rmtree(staging, ignore_errors=True)
@@ -1069,6 +1143,8 @@ class InstallerWindow(QMainWindow):
         self.worker: InstallerWorker | None = None
         self.install_path = default_install_dir()
         self.preserve_existing_data = True
+        self.clean_target = False
+        self.install_mode_locked = False
         self.setWindowTitle("Zapret Hub Installer")
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -1238,17 +1314,54 @@ class InstallerWindow(QMainWindow):
         if not self.install_path.is_absolute():
             self.install_path = (Path.cwd() / self.install_path).resolve()
         _installer_log("ui_start_install", selected_path=raw_path, normalized_target=str(self.install_path))
-        if self.install_path.exists():
-            existing_items = [item for item in self.install_path.iterdir()]
-        else:
-            existing_items = []
-        if existing_items:
-            choice = self._ask_existing_install_mode()
-            if choice == "cancel":
+        if not self.install_mode_locked:
+            if _is_dangerous_install_dir(self.install_path):
+                choice = self._ask_unsafe_install_dir()
+                if choice != "folder":
+                    return
+                self.install_path = _suggest_safe_install_dir(self.install_path)
+                self.path_edit.setText(str(self.install_path))
+            try:
+                existing_items = [item for item in self.install_path.iterdir()] if self.install_path.exists() else []
+            except Exception as error:
+                InstallerDialog("Error", str(error), parent=self).exec()
                 return
-            self.preserve_existing_data = choice == "preserve"
+            if existing_items:
+                if _looks_like_zapret_hub_dir(self.install_path):
+                    choice = self._ask_existing_install_mode()
+                    if choice == "cancel":
+                        return
+                    self.preserve_existing_data = choice == "preserve"
+                    self.clean_target = choice == "clean"
+                else:
+                    choice = self._ask_foreign_install_dir()
+                    if choice == "cancel":
+                        return
+                    if choice == "folder":
+                        self.install_path = _suggest_empty_install_dir(self.install_path)
+                        self.path_edit.setText(str(self.install_path))
+                        self.preserve_existing_data = True
+                        self.clean_target = False
+                    else:
+                        self.preserve_existing_data = False
+                        self.clean_target = True
+            else:
+                self.preserve_existing_data = True
+                self.clean_target = False
         else:
+            if _is_dangerous_install_dir(self.install_path):
+                InstallerDialog(
+                    "Error",
+                    tr(
+                        "Нельзя устанавливать Zapret Hub в корень диска или системную папку. Выберите пустую подпапку.",
+                        "Zapret Hub cannot be installed into a drive root or system folder. Please choose an empty subfolder.",
+                    ),
+                    parent=self,
+                ).exec()
+                return
+        if not self.install_path.exists():
             self.preserve_existing_data = True
+            self.clean_target = False
         if sys.platform.startswith("win") and getattr(sys, "frozen", False) and not is_admin():
             args = [
                 "--elevated-install",
@@ -1256,16 +1369,56 @@ class InstallerWindow(QMainWindow):
                 str(self.install_path),
                 "--preserve-data" if self.preserve_existing_data else "--clean-install",
             ]
+            if self.clean_target:
+                args.append("--clean-target")
             if relaunch_with_elevation(args):
                 self.close()
                 return
             InstallerDialog("Error", tr("Не удалось запросить права администратора.", "Failed to request administrator privileges."), parent=self).exec()
             return
         self.stack.setCurrentWidget(self.page_progress)
-        self.worker = InstallerWorker(self.install_path, preserve_data=self.preserve_existing_data)
+        self.worker = InstallerWorker(self.install_path, preserve_data=self.preserve_existing_data, clean_target=self.clean_target)
         self.worker.progress.connect(self.bar.setValue)
         self.worker.done.connect(self._on_done)
         self.worker.start()
+
+    def _ask_unsafe_install_dir(self) -> str:
+        dialog = InstallerDialog(
+            tr("Небезопасная папка установки", "Unsafe install folder"),
+            tr(
+                "Нельзя устанавливать Zapret Hub в корень диска или системную папку. Создайте отдельную пустую папку для приложения.",
+                "Zapret Hub cannot be installed into a drive root or system folder. Create a dedicated empty folder for the app.",
+            ),
+            with_yes_no=True,
+            parent=self,
+            yes_text=tr("Создать папку", "Create folder"),
+            no_text=tr("Отмена", "Cancel"),
+        )
+        dialog.exec()
+        if dialog.result_mode == "yes":
+            return "folder"
+        return "cancel"
+
+    def _ask_foreign_install_dir(self) -> str:
+        dialog = InstallerDialog(
+            tr("Папка не пуста", "Folder is not empty"),
+            tr(
+                "В выбранной папке нет zapret_hub.exe, поэтому она не похожа на старую папку приложения.\n\n"
+                "Если продолжить, папка будет очищена перед установкой. Чтобы ничего не удалить, создайте пустую папку и установите Zapret Hub в нее.",
+                "The selected folder does not contain zapret_hub.exe, so it does not look like an existing app folder.\n\n"
+                "If you continue, the folder will be cleaned before installation. To avoid deleting anything, create an empty folder and install Zapret Hub there.",
+            ),
+            with_yes_no=True,
+            parent=self,
+            yes_text=tr("Продолжить", "Continue"),
+            no_text=tr("Создать папку", "Create folder"),
+        )
+        dialog.exec()
+        if dialog.result_mode == "yes":
+            return "continue"
+        if dialog.result_mode == "no":
+            return "folder"
+        return "cancel"
 
     def _ask_existing_install_mode(self) -> str:
         dialog = InstallerDialog(
@@ -1430,6 +1583,8 @@ def main() -> int:
         if "--clean-install" in sys.argv:
             preserve_data = False
         window.preserve_existing_data = preserve_data
+        window.clean_target = "--clean-target" in sys.argv
+        window.install_mode_locked = True
         QTimer.singleShot(0, window._start_install)
     return app.exec()
 
