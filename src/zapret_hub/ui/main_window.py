@@ -2700,56 +2700,6 @@ def _disable_native_window_rounding(widget: QWidget) -> None:
         return
 
 
-def _set_window_acrylic_blur(widget: QWidget, enabled: bool, theme: str) -> None:
-    if not sys.platform.startswith("win"):
-        return
-    try:
-        hwnd = int(widget.winId())
-
-        class ACCENT_POLICY(ctypes.Structure):
-            _fields_ = [
-                ("AccentState", ctypes.c_int),
-                ("AccentFlags", ctypes.c_int),
-                ("GradientColor", ctypes.c_uint),
-                ("AnimationId", ctypes.c_int),
-            ]
-
-        class WINDOWCOMPOSITIONATTRIBDATA(ctypes.Structure):
-            _fields_ = [
-                ("Attribute", ctypes.c_int),
-                ("Data", ctypes.c_void_p),
-                ("SizeOfData", ctypes.c_size_t),
-            ]
-
-        def rgba_to_abgr(color: QColor) -> int:
-            return (
-                (max(0, min(255, color.alpha())) << 24)
-                | (max(0, min(255, color.blue())) << 16)
-                | (max(0, min(255, color.green())) << 8)
-                | max(0, min(255, color.red()))
-            )
-
-        ACCENT_DISABLED = 0
-        ACCENT_ENABLE_ACRYLICBLURBEHIND = 4
-        WCA_ACCENT_POLICY = 19
-        light = is_light_theme(theme)
-        tint = QColor(246, 249, 255, 74) if light else QColor(10, 15, 25, 92)
-        policy = ACCENT_POLICY(
-            ACCENT_ENABLE_ACRYLICBLURBEHIND if enabled else ACCENT_DISABLED,
-            0x20 if enabled else 0,
-            rgba_to_abgr(tint) if enabled else 0,
-            0,
-        )
-        data = WINDOWCOMPOSITIONATTRIBDATA(
-            WCA_ACCENT_POLICY,
-            ctypes.cast(ctypes.pointer(policy), ctypes.c_void_p),
-            ctypes.sizeof(policy),
-        )
-        ctypes.windll.user32.SetWindowCompositionAttribute(ctypes.c_void_p(hwnd), ctypes.byref(data))  # type: ignore[attr-defined]
-    except Exception:
-        return
-
-
 def _bring_widget_to_front(widget: QWidget) -> None:
     widget.raise_()
     widget.activateWindow()
@@ -2962,6 +2912,7 @@ class SettingsDialog(AppDialog):
         self.tg_media_mode_combo.addItem("Media fix", "media_fix")
         self.tg_media_mode_combo.addItem(self._t("Без DC override", "No DC override"), "empty")
         self.tg_dc_ip_input = QTextEdit()
+        self.tg_dc_ip_input.setAcceptRichText(False)
         self.tg_dc_ip_input.setFixedHeight(72)
         self.tg_cfproxy_checkbox = QCheckBox(self._t("Cloudflare fallback", "Cloudflare fallback"))
         self.tg_cfproxy_priority_checkbox = QCheckBox(self._t("Пробовать Cloudflare первым", "Try Cloudflare first"))
@@ -2979,11 +2930,19 @@ class SettingsDialog(AppDialog):
         self.game_mode_combo.addItem(self._t("tcp + udp", "tcp + udp"), "tcpudp")
         self.game_mode_combo.addItem(self._t("только tcp", "tcp only"), "tcp")
         self.game_mode_combo.addItem(self._t("только udp", "udp only"), "udp")
+        self.gaming_set_combo = ClickSelectComboBox()
+        self.gaming_set_combo.addItem("Base", "base")
+        self.gaming_set_combo.addItem("STUN · Wide · Base", "stun-wide-base")
+        self.gaming_set_combo.addItem("STUN · Wide · Base + local exclude", "stun-wide-base-local-exclude")
+        self.gaming_set_combo.addItem("Wide · STUN · Base", "wide-stun-base")
+        self.gaming_set_combo.addItem("Base · Wide · STUN", "base-wide-stun")
+        self.gaming_set_combo.addItem("UDP first", "udp-first")
+        self.gaming_set_combo.addItem("TCP first", "tcp-first")
+        self.gaming_set_combo.addItem("STUN between", "stun-between")
         self.autostart_checkbox = QCheckBox(self._t("Запускать вместе с Windows", "Run with Windows"))
         self.tray_checkbox = QCheckBox(self._t("Стартовать в трее", "Start in tray"))
         self.auto_components_checkbox = QCheckBox(self._t("Автозапуск компонентов", "Auto-run components"))
         self.check_updates_checkbox = QCheckBox(self._t("Проверять наличие обновлений", "Check for updates"))
-        self.experimental_appearance_checkbox = QCheckBox(self._t("Экспериментальный внешний вид", "Experimental appearance"))
         self.vpn_subscription_input = QLineEdit()
         self.vpn_subscription_input.setPlaceholderText("https://vpn.goshkow.ru/sub/...")
         self.vpn_tun_checkbox = QCheckBox(self._t("Использовать TUN-режим", "Use TUN mode"))
@@ -3045,7 +3004,6 @@ class SettingsDialog(AppDialog):
         app_form.addRow("", self.auto_components_checkbox)
         app_form.addRow("", self.check_updates_checkbox)
         app_form.addRow("", self.check_updates_btn)
-        app_form.addRow("", self.experimental_appearance_checkbox)
 
         vpn_form = self._settings_section(canvas_layout, "goshkow vpn", "goshkow-vpn")
         self.vpn_section_frame = vpn_form.parentWidget()
@@ -3060,6 +3018,7 @@ class SettingsDialog(AppDialog):
         zapret_form = self._settings_section(canvas_layout, "Zapret", "zapret")
         zapret_form.addRow("IPSet mode", self.ipset_mode_combo)
         zapret_form.addRow(self._t("Gaming mode", "Gaming mode"), self.game_mode_combo)
+        zapret_form.addRow("Gaming Set", self.gaming_set_combo)
         zapret_form.addRow(self._t("Исключить UDP-порты", "Exclude UDP ports"), self.zapret_udp_exclude_input)
         zapret_form.addRow("", self.find_settings_btn)
         zapret_form.addRow("", self.rebuild_runtime_btn)
@@ -3205,12 +3164,12 @@ class SettingsDialog(AppDialog):
         self.ipset_mode_combo.setCurrentIndex(ipset_idx if ipset_idx >= 0 else 0)
         game_idx = self.game_mode_combo.findData(settings.zapret_game_filter_mode)
         self.game_mode_combo.setCurrentIndex(game_idx if game_idx >= 0 else 0)
+        self._select_combo_value(self.gaming_set_combo, str(getattr(settings, "zapret_gaming_set", "stun-wide-base") or "stun-wide-base"))
         self.zapret_udp_exclude_input.setText(settings.zapret_udp_exclude_ports)
         self.autostart_checkbox.setChecked(self.context.autostart.is_enabled())
         self.tray_checkbox.setChecked(settings.start_in_tray)
         self.auto_components_checkbox.setChecked(settings.auto_run_components)
         self.check_updates_checkbox.setChecked(settings.check_updates_on_start)
-        self.experimental_appearance_checkbox.setChecked(bool(getattr(settings, "experimental_appearance", False)))
         self.vpn_subscription_input.setText(
             str(vpn_state.get("subscription_url", "") or settings.goshkow_vpn_subscription_url)
         )
@@ -3256,12 +3215,15 @@ class SettingsDialog(AppDialog):
         self.ipset_mode_combo.setCurrentIndex(ipset_idx if ipset_idx >= 0 else self.ipset_mode_combo.currentIndex())
         game_idx = self.game_mode_combo.findData(str(payload.get("zapret_game_filter_mode", self.context.settings.get().zapret_game_filter_mode)))
         self.game_mode_combo.setCurrentIndex(game_idx if game_idx >= 0 else self.game_mode_combo.currentIndex())
+        self._select_combo_value(
+            self.gaming_set_combo,
+            str(payload.get("zapret_gaming_set", getattr(self.context.settings.get(), "zapret_gaming_set", "stun-wide-base"))),
+        )
         self.zapret_udp_exclude_input.setText(str(payload.get("zapret_udp_exclude_ports", self.context.settings.get().zapret_udp_exclude_ports)))
         self.autostart_checkbox.setChecked(bool(payload.get("autostart_windows", self.context.settings.get().autostart_windows)))
         self.tray_checkbox.setChecked(bool(payload.get("start_in_tray", self.context.settings.get().start_in_tray)))
         self.auto_components_checkbox.setChecked(bool(payload.get("auto_run_components", self.context.settings.get().auto_run_components)))
         self.check_updates_checkbox.setChecked(bool(payload.get("check_updates_on_start", self.context.settings.get().check_updates_on_start)))
-        self.experimental_appearance_checkbox.setChecked(bool(payload.get("experimental_appearance", getattr(self.context.settings.get(), "experimental_appearance", False))))
         self.vpn_subscription_input.setText(
             str(payload.get("goshkow_vpn_subscription_url", self.vpn_subscription_input.text()))
         )
@@ -3314,12 +3276,12 @@ class SettingsDialog(AppDialog):
             "tg_proxy_pool_size": max(0, tg_pool_size),
             "zapret_ipset_mode": self.ipset_mode_combo.currentData() or "loaded",
             "zapret_game_filter_mode": self.game_mode_combo.currentData() or "disabled",
+            "zapret_gaming_set": self.gaming_set_combo.currentData() or "stun-wide-base",
             "zapret_udp_exclude_ports": self.zapret_udp_exclude_input.text().strip(),
             "autostart_windows": self.autostart_checkbox.isChecked(),
             "start_in_tray": self.tray_checkbox.isChecked(),
             "auto_run_components": self.auto_components_checkbox.isChecked(),
             "check_updates_on_start": self.check_updates_checkbox.isChecked(),
-            "experimental_appearance": self.experimental_appearance_checkbox.isChecked(),
             "goshkow_vpn_subscription_url": self.vpn_subscription_input.text().strip(),
             "goshkow_vpn_tun_enabled": self.vpn_tun_checkbox.isChecked(),
             "goshkow_vpn_routing_mode": self.vpn_routing_combo.currentData() or "global",
@@ -6536,6 +6498,7 @@ class MainWindow(QMainWindow):
         path_row.addWidget(self.rename_file_btn)
         right_layout.addLayout(path_row)
         self.file_editor = QTextEdit()
+        self.file_editor.setAcceptRichText(False)
         self.file_editor.setObjectName("FileEditor")
         self.file_editor.textChanged.connect(self._on_file_editor_text_changed)
         editor_stack = QStackedWidget()
@@ -6609,6 +6572,7 @@ class MainWindow(QMainWindow):
         self._logs_refresh_btn = None
         root.addLayout(top)
         self.logs_text = QTextEdit()
+        self.logs_text.setAcceptRichText(False)
         self.logs_text.setReadOnly(True)
         self.logs_text.selectionChanged.connect(self._on_logs_selection_changed)
         self._register_scroll_fade(self.logs_text)
@@ -7254,7 +7218,6 @@ class MainWindow(QMainWindow):
         signature = (
             self.context.settings.get().theme,
             self.context.settings.get().language,
-            bool(getattr(self.context.settings.get(), "experimental_appearance", False)),
         )
         if self._settings_dialog is None or self._settings_dialog_signature != signature:
             if self._settings_dialog is not None:
@@ -7275,7 +7238,6 @@ class MainWindow(QMainWindow):
             if signature != (
                 str(payload["theme"]),
                 str(payload["language"]),
-                bool(payload.get("experimental_appearance", getattr(before, "experimental_appearance", False))),
             ):
                 self._settings_dialog = None
                 self._settings_dialog_signature = None
@@ -7306,24 +7268,21 @@ class MainWindow(QMainWindow):
         effective_payload = dict(payload)
         before_theme = str(getattr(before, "theme", self.context.settings.get().theme))
         before_language = str(getattr(before, "language", self.context.settings.get().language))
-        before_experimental = bool(getattr(before, "experimental_appearance", getattr(self.context.settings.get(), "experimental_appearance", False)))
         next_theme = str(effective_payload.get("theme", before_theme))
         next_language = str(effective_payload.get("language", before_language))
-        next_experimental = bool(effective_payload.get("experimental_appearance", before_experimental))
         theme_changed = before_theme != next_theme
         language_changed = before_language != next_language
-        experimental_changed = before_experimental != next_experimental
         self._settings_save_revision += 1
         self._pending_settings_revision = self._settings_save_revision
         merged_payload = dict(self._pending_settings_payload or {})
         merged_payload.update(effective_payload)
         self._pending_settings_payload = merged_payload
         self.context.settings.update(**effective_payload)
-        if theme_changed or experimental_changed:
+        if theme_changed:
             self._apply_theme()
         if language_changed:
             self._retranslate_ui()
-        if theme_changed or language_changed or experimental_changed:
+        if theme_changed or language_changed:
             self._schedule_full_locale_theme_refresh()
         self._page_payload_cache.clear()
         self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
@@ -7473,7 +7432,6 @@ class MainWindow(QMainWindow):
         signature = (
             self.context.settings.get().theme,
             self.context.settings.get().language,
-            bool(getattr(self.context.settings.get(), "experimental_appearance", False)),
         )
         if self._settings_dialog is None or self._settings_dialog_signature != signature:
             self._settings_dialog = SettingsDialog(self, self.context)
@@ -7554,22 +7512,26 @@ class MainWindow(QMainWindow):
             if bool(payload.get("autostart_changed")) or desired_autostart != actual_autostart:
                 actual_autostart = self.context.autostart.set_enabled(desired_autostart)
                 if actual_autostart != desired_autostart:
+                    time.sleep(0.15)
+                    actual_autostart = self.context.autostart.is_enabled()
+                if actual_autostart != desired_autostart:
                     self.context.settings.update(autostart_windows=actual_autostart)
-                    self._add_notification(
-                        "error",
-                        self._t("Автозапуск Windows", "Windows autostart"),
-                        self._t(
-                            "Не удалось включить автозапуск. Проверьте права Windows или политики безопасности.",
-                            "Could not enable autostart. Check Windows permissions or security policies.",
-                        ),
-                        source="settings",
-                        details={"dedupe_key": "settings-autostart-failed"},
-                    )
-            if bool(payload.get("theme_changed")) or bool(payload.get("experimental_appearance_changed")):
+                    if desired_autostart:
+                        self._add_notification(
+                            "error",
+                            self._t("Автозапуск Windows", "Windows autostart"),
+                            self._t(
+                                "Не удалось включить автозапуск. Проверьте права Windows или политики безопасности.",
+                                "Could not enable autostart. Check Windows permissions or security policies.",
+                            ),
+                            source="settings",
+                            details={"dedupe_key": "settings-autostart-failed"},
+                        )
+            if bool(payload.get("theme_changed")):
                 self._apply_theme()
             if bool(payload.get("language_changed")):
                 self._retranslate_ui()
-            if bool(payload.get("theme_changed")) or bool(payload.get("language_changed")) or bool(payload.get("experimental_appearance_changed")):
+            if bool(payload.get("theme_changed")) or bool(payload.get("language_changed")):
                 self._schedule_full_locale_theme_refresh()
             self._mark_dirty("dashboard", "services", "components", "mods", "files", "logs", "tray")
             self._set_apply_status("done")
@@ -7997,7 +7959,6 @@ class MainWindow(QMainWindow):
         self._sync_onboarding_back_button_style()
         self._refresh_notifications_badge()
         self._apply_onboarding_style()
-        self._apply_experimental_appearance()
         self._apply_file_search_style()
         if self._file_search_toggle is not None:
             self._file_search_toggle.setIcon(self._icon("search.svg"))
@@ -8007,74 +7968,6 @@ class MainWindow(QMainWindow):
                 self.refresh_mods()
             except Exception:
                 pass
-
-    def _apply_experimental_appearance(self) -> None:
-        settings = self.context.settings.get()
-        theme = settings.theme
-        enabled = bool(getattr(settings, "experimental_appearance", False))
-        root = self.findChild(OnboardingFrame, "RootFrame")
-        title_bar = self.findChild(GlassFrame, "TitleBar")
-        sidebar = self.findChild(SidebarPanel, "Sidebar")
-        if self._onboarding_active:
-            _set_window_acrylic_blur(self, False, theme)
-            if title_bar is not None:
-                title_bar.set_glass_enabled(False, theme)
-            if sidebar is not None:
-                sidebar.set_glass_enabled(False, theme)
-            if self._apply_status_label is not None and self._apply_status_opacity is not None:
-                self._apply_status_label.hide()
-                self._apply_status_opacity.setOpacity(0.0)
-            return
-        if not enabled:
-            _set_window_acrylic_blur(self, False, theme)
-            if root is not None:
-                root.setStyleSheet("")
-            if title_bar is not None:
-                title_bar.set_glass_enabled(False, theme)
-                title_bar.setStyleSheet("")
-            if sidebar is not None:
-                sidebar.set_glass_enabled(False, theme)
-                sidebar.setStyleSheet("")
-            return
-        light = is_light_theme(theme)
-        if light:
-            text = "#172033"
-        else:
-            text = "#f6f8fc"
-        if root is not None:
-            root.setStyleSheet(
-                "QFrame#RootFrame {"
-                "background: transparent;"
-                "border: 1px solid rgba(103, 127, 170, 0.42);"
-                "border-radius: 16px;"
-                "}"
-            )
-        _set_window_acrylic_blur(self, True, theme)
-        if title_bar is not None:
-            title_bar.set_glass_enabled(True, theme)
-            title_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            title_bar.setStyleSheet(
-                "QFrame#TitleBar {"
-                "background: transparent;"
-                "border: none;"
-                "border-top-left-radius: 16px;"
-                "border-top-right-radius: 16px;"
-                "}"
-                "QFrame#TitleBar QLabel, QFrame#TitleBar QToolButton {"
-                "background: transparent;"
-                f"color: {text};"
-                "}"
-            )
-        if sidebar is not None:
-            sidebar.set_glass_enabled(True, theme)
-            sidebar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-            sidebar.setStyleSheet(
-                "QFrame#Sidebar {"
-                "background: transparent;"
-                "border: none;"
-                "border-bottom-left-radius: 16px;"
-                "}"
-            )
 
     def _sync_apply_status_style(self, state: str | None = None) -> None:
         label = self._apply_status_label
@@ -9574,7 +9467,9 @@ class MainWindow(QMainWindow):
         name_input = QLineEdit(entry.name or entry.id)
         author_input = QLineEdit(entry.author or self._t("неизвестен", "unknown"))
         version_input = QLineEdit(entry.version or datetime.utcnow().strftime("%Y.%m.%d"))
-        description_input = QTextEdit(entry.description or "")
+        description_input = QTextEdit()
+        description_input.setAcceptRichText(False)
+        description_input.setPlainText(entry.description or "")
         description_input.setFixedHeight(86)
         form.addRow(self._t("Название", "Name"), name_input)
         form.addRow(self._t("Автор", "Author"), author_input)
@@ -9594,6 +9489,7 @@ class MainWindow(QMainWindow):
         files_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         files_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         editor = QTextEdit()
+        editor.setAcceptRichText(False)
         editor.setObjectName("FileEditor")
         editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         current_path: dict[str, str] = {"path": ""}
@@ -9942,6 +9838,7 @@ class MainWindow(QMainWindow):
             body_layout.addWidget(versions_list, 0)
 
         notes = QTextEdit()
+        notes.setAcceptRichText(False)
         notes.setReadOnly(True)
         notes.setMinimumHeight(160)
         notes.setMaximumHeight(260)
@@ -11471,7 +11368,6 @@ class MainWindow(QMainWindow):
             self._onboarding_back_btn.hide()
         if not visible:
             self._apply_onboarding_chrome(self.context.settings.get().theme, False)
-            self._apply_experimental_appearance()
         elif not self._onboarding_quick_restart:
             self._apply_onboarding_style()
         self._relayout_onboarding_content()
@@ -12675,6 +12571,7 @@ class MainWindow(QMainWindow):
         title.setProperty("class", "title")
         dialog.body_layout.addWidget(title)
         summary = QTextEdit()
+        summary.setAcceptRichText(False)
         summary.setReadOnly(True)
         summary.setMinimumHeight(260)
         summary.setPlainText(

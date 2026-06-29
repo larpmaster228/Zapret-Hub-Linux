@@ -1,5 +1,5 @@
 """
-Минимальная проверка новой версии через GitHub Releases API (без сторонних зависимостей).
+Проверка новой версии через GitHub Releases API
 
 Ограничение частоты запросов: не чаще одного раза в час на машину (кэш в каталоге
 данных приложения). Поддерживается If-None-Match (ETag) для ответа 304.
@@ -18,6 +18,7 @@ from proxy.utils import build_github_opener
 
 REPO = "Flowseal/tg-ws-proxy"
 RELEASES_LATEST_API = f"https://api.github.com/repos/{REPO}/releases/latest"
+RELEASES_BY_TAG_API = f"https://api.github.com/repos/{REPO}/releases/tags/{{tag}}?t={{timestamp}}"
 RELEASES_PAGE_URL = f"https://github.com/{REPO}/releases/latest"
 
 # Не чаще одного полного запроса к API в час (без учёта 304 с тем же ETag).
@@ -223,58 +224,101 @@ def run_check(current_version: str) -> None:
         _state["html_url"] = RELEASES_PAGE_URL
 
 
+def fetch_release_by_tag(
+    tag: str, timeout: float = 12.0,
+) -> Tuple[Optional[dict], int]:
+    if not tag:
+        return None, 0
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "tg-ws-proxy-update-check",
+    }
+    req = Request(
+        RELEASES_BY_TAG_API.format(tag=tag, timestamp=int(time.time())),
+        headers=headers,
+        method="GET",
+    )
+    try:
+        with build_github_opener().open(req, timeout=timeout) as resp:
+            code = getattr(resp, "status", None) or resp.getcode()
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw), int(code)
+    except HTTPError as e:
+        if e.code in [304, 404]:
+            return None, e.code
+        raise
+
+
+def _extract_assets(data: Optional[dict]) -> list:
+    if not data:
+        return []
+    return [
+        {"name": a.get("name", ""), "url": a.get("browser_download_url", ""), "digest": a.get("digest", "")}
+        for a in (data.get("assets") or [])
+        if a.get("name") and a.get("browser_download_url")
+    ]
+
+
 def get_status() -> Dict[str, Any]:
     """Снимок состояния после run_check (для подписей в настройках)."""
     return dict(_state)
 
 
-def get_update_asset(exe_path: Path) -> Optional[Tuple[str, str]]:
-    assets = _state.get("assets") or []
-    if not assets:
+def get_update_asset(exe_path: Path, current_version: str) -> Optional[Tuple[str, str]]:
+    new_assets = _state.get("assets") or []
+    if not new_assets:
         return None
 
-    # Try SHA256 match against release asset digests
+    target_name = None
+
+    # SHA256 match
     try:
         import hashlib
-        h = hashlib.sha256()
-        with open(exe_path, "rb") as f:
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                h.update(chunk)
-        exe_sha = h.hexdigest().lower()
-        for a in assets:
-            d = (a.get("digest") or "").lower()
-            if d.startswith("sha256:") and d[7:] == exe_sha:
-                return a["url"], a["name"]
+        data, code = fetch_release_by_tag(f"v{current_version}")
+        if code == 200 and data:
+            cur_assets = _extract_assets(data)
+            if cur_assets:
+                h = hashlib.sha256()
+                with open(exe_path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                exe_sha = h.hexdigest().lower()
+                for a in cur_assets:
+                    d = (a.get("digest") or "").lower()
+                    if d.startswith("sha256:") and d[7:] == exe_sha:
+                        target_name = a["name"]
+                        break
     except Exception:
         pass
 
     # Fallback
-    import platform
-    import struct
+    if not target_name or target_name not in [a.get("name") for a in new_assets]:
+        import platform
+        import struct
 
-    is_64 = struct.calcsize("P") * 8 == 64
-    machine = platform.machine().lower()
-    is_arm64 = machine in ("arm64", "aarch64")
+        is_64 = struct.calcsize("P") * 8 == 64
+        machine = platform.machine().lower()
+        is_arm64 = machine in ("arm64", "aarch64")
 
-    try:
-        is_modern = sys.getwindowsversion().major >= 10
-    except Exception:
-        is_modern = True
+        try:
+            is_modern = sys.getwindowsversion().major >= 10
+        except Exception:
+            is_modern = True
 
-    if is_arm64:
-        name = "TgWsProxy_windows_arm64.exe"
-    elif is_modern:
-        name = "TgWsProxy_windows.exe"
-    elif is_64:
-        name = "TgWsProxy_windows_7_64bit.exe"
-    else:
-        name = "TgWsProxy_windows_7_32bit.exe"
+        if is_arm64:
+            target_name = "TgWsProxy_windows_arm64.exe"
+        elif is_modern:
+            target_name = "TgWsProxy_windows.exe"
+        elif is_64:
+            target_name = "TgWsProxy_windows_7_64bit.exe"
+        else:
+            target_name = "TgWsProxy_windows_7_32bit.exe"
 
-    for a in assets:
-        if a.get("name") == name:
+    for a in new_assets:
+        if a.get("name") == target_name:
             return a["url"], a["name"]
 
     return None
