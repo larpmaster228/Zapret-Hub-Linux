@@ -196,9 +196,7 @@ jobs:
           elif [ -n "$CHANGELOG" ]; then
             BODY="$CHANGELOG"
           else
-            BODY="## Assets
-- \`zapret_hub_${VERSION}_linux_x64.tar.gz\` - portable build for x86_64
-- \`zapret_hub_${VERSION}_linux_arm64.tar.gz\` - portable build for ARM64"
+            BODY=$(printf '## Assets\n- `zapret_hub_%s_linux_x64.tar.gz` - portable build for x86_64\n- `zapret_hub_%s_linux_arm64.tar.gz` - portable build for ARM64' "$VERSION" "$VERSION")
           fi
 
           {
