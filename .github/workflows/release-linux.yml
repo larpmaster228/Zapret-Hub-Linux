@@ -25,11 +25,11 @@ jobs:
     name: Resolve version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
-      - id: version
+      - id: v
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
           if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
@@ -39,7 +39,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-  build-linux-x64:
+  build:
     needs: version
     runs-on: ubuntu-latest
     steps:
@@ -85,8 +85,7 @@ jobs:
           python -m pip install pyinstaller
 
       - name: Build Linux x64 portable
-        run: |
-          VERSION="${{ needs.version.outputs.version }}" ./scripts/build_linux.sh
+        run: VERSION="${{ needs.version.outputs.version }}" ./scripts/build_linux.sh
 
       - uses: actions/upload-artifact@v6
         with:
@@ -97,7 +96,7 @@ jobs:
   publish:
     needs:
       - version
-      - build-linux-x64
+      - build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -116,17 +115,11 @@ jobs:
           VERSION="${{ needs.version.outputs.version }}"
           RELEASE_DIR="release_${VERSION}"
           mkdir -p "$RELEASE_DIR"
-
-          echo "Downloaded artifacts:"
-          find .artifacts -type f
-
           for f in .artifacts/zapret_hub_*.tar.gz; do
             [ -f "$f" ] || continue
             cp "$f" "$RELEASE_DIR/"
             echo "Staged $(basename "$f")"
           done
-
-          echo "Release assets:"
           ls -lh "$RELEASE_DIR/"
 
       - name: Read release notes
@@ -135,16 +128,13 @@ jobs:
           VERSION="${{ needs.version.outputs.version }}"
           NOTES_PATH=".github/release-notes/${VERSION}.md"
           CHANGELOG="${{ inputs.changelog }}"
-
           if [ -f "$NOTES_PATH" ]; then
             BODY=$(cat "$NOTES_PATH")
           elif [ -n "$CHANGELOG" ]; then
             BODY="$CHANGELOG"
           else
-            BODY="## Assets
-- zapret_hub_${VERSION}_linux_x64.tar.gz - portable build for x86_64"
+            BODY="## Assets"
           fi
-
           {
             echo "body<<__ZAPRET_HUB_NOTES__"
             echo "$BODY"
@@ -159,8 +149,7 @@ jobs:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
           body: ${{ steps.release_notes.outputs.body }}
-          files: |
-            release_${{ needs.version.outputs.version }}/zapret_hub_*.tar.gz
+          files: release_${{ needs.version.outputs.version }}/zapret_hub_*.tar.gz
 
   aur:
     name: Update AUR package
@@ -173,11 +162,9 @@ jobs:
         run: |
           VERSION="${{ needs.version.outputs.version }}"
           TAG="${{ needs.version.outputs.tag }}"
-
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur/PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
           sed -i "s|/download/v[0-9][0-9.]*[a-z]*\?/|/download/$TAG/|" aur/PKGBUILD
-
           echo "=== PKGBUILD ==="
           cat aur/PKGBUILD
 

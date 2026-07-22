@@ -1,12 +1,6 @@
 name: CI Build
 
 on:
-  push:
-    branches:
-      - main
-      - master
-      - "codex/**"
-  pull_request:
   workflow_dispatch:
 
 jobs:
