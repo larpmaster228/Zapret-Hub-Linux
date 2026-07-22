@@ -45,7 +45,6 @@ PYTHONPATH="$ROOT/src" $PYTHON -m PyInstaller \
     --clean \
     --distpath "$OUTPUT_DIR" \
     --workpath "$ROOT/build" \
-    --specpath "$ROOT/packaging" \
     "$ROOT/packaging/zapret_hub_linux.spec"
 
 # 4. Copy staged runtime into PyInstaller output
