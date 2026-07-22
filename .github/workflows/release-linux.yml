@@ -94,66 +94,10 @@ jobs:
           path: zapret_hub_*_linux_x64.tar.gz
           if-no-files-found: error
 
-  build-linux-arm64:
-    needs: version
-    runs-on: ubuntu-24.04-arm64
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgl1 \
-            libegl1 \
-            libglib2.0-0 \
-            libxkbcommon0 \
-            libxkbcommon-x11-0 \
-            libxcb-cursor0 \
-            libxcb-icccm4 \
-            libxcb-image0 \
-            libxcb-keysyms1 \
-            libxcb-randr0 \
-            libxcb-render-util0 \
-            libxcb-shape0 \
-            libxcb-xinerama0 \
-            libxcb-xfixes0 \
-            libxcb-xkb1 \
-            rsync
-
-      - name: Install Python dependencies
-        env:
-          PIP_PREFER_BINARY: "1"
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .[dev]
-          python -m pip install pyinstaller
-
-      - name: Build Linux arm64 portable
-        run: |
-          VERSION="${{ needs.version.outputs.version }}" ./scripts/build_linux.sh
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: release-linux-arm64
-          path: zapret_hub_*_linux_arm64.tar.gz
-          if-no-files-found: error
-
   publish:
     needs:
       - version
       - build-linux-x64
-      - build-linux-arm64
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -170,7 +114,6 @@ jobs:
       - name: Stage release folder
         run: |
           VERSION="${{ needs.version.outputs.version }}"
-          TAG="${{ needs.version.outputs.tag }}"
           RELEASE_DIR="release_${VERSION}"
           mkdir -p "$RELEASE_DIR"
 
@@ -198,7 +141,8 @@ jobs:
           elif [ -n "$CHANGELOG" ]; then
             BODY="$CHANGELOG"
           else
-            BODY=$(printf '## Assets\n- `zapret_hub_%s_linux_x64.tar.gz` - portable build for x86_64\n- `zapret_hub_%s_linux_arm64.tar.gz` - portable build for ARM64' "$VERSION" "$VERSION")
+            BODY="## Assets
+- zapret_hub_${VERSION}_linux_x64.tar.gz - portable build for x86_64"
           fi
 
           {

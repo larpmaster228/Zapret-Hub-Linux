@@ -3,27 +3,20 @@ pkgname=zapret-hub
 pkgver=3.0.0
 pkgrel=1
 pkgdesc="Desktop hub for managing network bypass utilities (zapret, tg-ws-proxy, vpn)"
-arch=('x86_64' 'aarch64')
+arch=('x86_64')
 url="https://github.com/larpmaster228/Zapret-Hub-Linux"
 license=('MIT')
 options=('!strip')
 depends=('glib2' 'libglvnd' 'nftables' 'iproute2')
 optdepends=('qt6-base: Qt GUI' 'qt6-wayland: Wayland support')
-source_x86_64=("$url/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_x64.tar.gz")
-source_aarch64=("$url/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_arm64.tar.gz")
-sha256sums_x86_64=('SKIP')
-sha256sums_aarch64=('SKIP')
+source=("$url/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_x64.tar.gz")
+sha256sums=('SKIP')
 
 package() {
     cd "${srcdir}"
-    local _arch
-    case "${CARCH}" in
-        x86_64)  _arch=x64 ;;
-        aarch64) _arch=arm64 ;;
-    esac
 
     install -dm755 "${pkgdir}/opt/zapret-hub"
-    cp -a "zapret_hub_${pkgver}_linux_${_arch}/"* "${pkgdir}/opt/zapret-hub/"
+    cp -a "zapret_hub_${pkgver}_linux_x64/"* "${pkgdir}/opt/zapret-hub/"
 
     install -Dm644 "${pkgdir}/opt/zapret-hub/ui_assets/icons/app.png" \
         "${pkgdir}/usr/share/icons/hicolor/256x256/apps/zapret-hub.png" 2>/dev/null || true
