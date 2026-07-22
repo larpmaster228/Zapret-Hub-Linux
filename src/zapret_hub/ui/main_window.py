@@ -25,6 +25,7 @@ from PySide6.QtCore import QCoreApplication, QEasingCurve, QEvent, QEventLoop, Q
 from PySide6.QtGui import QAction, QActionGroup, QColor, QCloseEvent, QFont, QFontDatabase, QFontMetrics, QIcon, QImage, QKeyEvent, QLinearGradient, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
     QAbstractScrollArea,
     QApplication,
@@ -395,7 +396,12 @@ class AnimatedNavButton(QToolButton):
         self._glow_pos = QPointF(22.0, 22.0)
         self._light_theme = False
         self._theme_name = "night"
+        self._svg_path = ""
         self._anims: list[QPropertyAnimation] = []
+
+    def set_svg_path(self, path: Path) -> None:
+        self._svg_path = str(path)
+        self.update()
 
     def set_nav_theme(self, theme: str) -> None:
         self._theme_name = theme
@@ -419,25 +425,13 @@ class AnimatedNavButton(QToolButton):
 
     def enterEvent(self, event: QEvent) -> None:
         self._animate_property(b"hoverProgress", self._hover_progress, 1.0, 220)
-        self._animate_property(b"iconScale", self._icon_scale, 1.035, 240)
         super().enterEvent(event)
 
     def leaveEvent(self, event: QEvent) -> None:
         self._animate_property(b"hoverProgress", self._hover_progress, 0.0, 220)
-        self._animate_property(b"iconScale", self._icon_scale, 1.0, 220)
-        self._animate_property(b"iconDx", self._icon_dx, 0.0, 180)
-        self._animate_property(b"iconDy", self._icon_dy, 0.0, 180)
         super().leaveEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        pos = event.position()
-        self._glow_pos = QPointF(pos.x(), pos.y())
-        center = QPointF(self.width() / 2.0, self.height() / 2.0)
-        dx = max(-1.0, min(1.0, (pos.x() - center.x()) / max(8.0, center.x())))
-        dy = max(-1.0, min(1.0, (pos.y() - center.y()) / max(8.0, center.y())))
-        self._icon_dx += (dx * 1.1 - self._icon_dx) * 0.18
-        self._icon_dy += (dy * 1.1 - self._icon_dy) * 0.18
-        self.update()
         super().mouseMoveEvent(event)
 
     def paintEvent(self, event: QEvent) -> None:
@@ -449,54 +443,42 @@ class AnimatedNavButton(QToolButton):
         checked = self.isChecked()
 
         base_icon_dx = float(self.property("baseIconDx") or 0.0)
-        if self._light_theme:
-            base_fill = QColor(181, 204, 242, 34)
-            hover_fill = QColor(194, 214, 245, int(30 * self._hover_progress))
-            checked_fill = QColor(0, 0, 0, 0)
-            border = QColor(191, 210, 240, int(88 * self._hover_progress))
-            glow_color = QColor(255, 255, 255, int(44 * self._hover_progress))
-        elif self._theme_name == "night":
-            base_fill = QColor(90, 112, 152, 22)
-            hover_fill = QColor(95, 124, 177, int(26 * self._hover_progress))
-            checked_fill = QColor(0, 0, 0, 0)
-            border = QColor(102, 132, 191, int(84 * self._hover_progress))
-            glow_color = QColor(126, 164, 255, int(58 * self._hover_progress))
-        else:
-            base_fill = QColor(126, 133, 145, 20)
-            hover_fill = QColor(144, 151, 165, int(24 * self._hover_progress))
-            checked_fill = QColor(0, 0, 0, 0)
-            border = QColor(154, 162, 174, int(78 * self._hover_progress))
-            glow_color = QColor(208, 216, 232, int(34 * self._hover_progress))
-
-        fill = QColor(checked_fill if checked else base_fill)
-        if not checked and self._hover_progress > 0:
-            mix = max(0.0, min(1.0, self._hover_progress))
-            fill = QColor(
-                int(base_fill.red() + (hover_fill.red() - base_fill.red()) * mix),
-                int(base_fill.green() + (hover_fill.green() - base_fill.green()) * mix),
-                int(base_fill.blue() + (hover_fill.blue() - base_fill.blue()) * mix),
-                int(base_fill.alpha() + (hover_fill.alpha() - base_fill.alpha()) * mix),
-            )
-        painter.setPen(QPen(border if (border.alpha() > 0 and not checked) else QColor(0, 0, 0, 0), 1))
-        painter.setBrush(fill)
-        painter.drawRoundedRect(rect, radius, radius)
-
-        if self._hover_progress > 0:
-            glow = QRadialGradient(self._glow_pos, max(self.width(), self.height()) * 0.75)
-            glow.setColorAt(0.0, glow_color)
-            glow.setColorAt(1.0, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), 0))
+        hover_alpha = int(22 * self._hover_progress)
+        if not checked and hover_alpha > 0:
+            hover_color = QColor(0, 0, 0, hover_alpha) if self._light_theme else QColor(255, 255, 255, hover_alpha)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(glow)
+            painter.setBrush(hover_color)
             painter.drawRoundedRect(rect, radius, radius)
 
         icon_size = max(20, round(26 * self._icon_scale))
         requested_icon = self.iconSize()
         if requested_icon.isValid():
             icon_size = max(18, round(max(requested_icon.width(), requested_icon.height()) * self._icon_scale))
-        pixmap = self.icon().pixmap(icon_size, icon_size)
+        pixmap = QPixmap()
+        if self._svg_path and Path(self._svg_path).exists():
+            physical_size = 128
+            image = QImage(physical_size, physical_size, QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(Qt.GlobalColor.transparent)
+            renderer = QSvgRenderer(self._svg_path)
+            svg_painter = QPainter(image)
+            svg_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            renderer.render(svg_painter, QRectF(8, 8, physical_size - 16, physical_size - 16))
+            svg_painter.end()
+            pixmap = QPixmap.fromImage(image)
+        else:
+            pixmap = self.icon().pixmap(64, 64)
+        if not pixmap.isNull():
+            tinted = QPixmap(pixmap.size())
+            tinted.fill(Qt.GlobalColor.transparent)
+            tint_painter = QPainter(tinted)
+            tint_painter.drawPixmap(0, 0, pixmap)
+            tint_painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            tint_painter.fillRect(tinted.rect(), QColor("#222222" if self._light_theme else "#f5f5f5"))
+            tint_painter.end()
+            pixmap = tinted
         target = QRectF(
-            (self.width() - icon_size) / 2.0 + self._icon_dx + base_icon_dx,
-            (self.height() - icon_size) / 2.0 + self._icon_dy,
+            (self.width() - icon_size) / 2.0 + base_icon_dx,
+            (self.height() - icon_size) / 2.0,
             icon_size,
             icon_size,
         )
@@ -565,6 +547,82 @@ class ClickSelectComboBox(QComboBox):
         return super().eventFilter(watched, event)
 
 
+class ThemedSwitch(QAbstractButton):
+    def __init__(self, text: str, theme: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setText(text)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(34)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._light_theme = is_light_theme(theme)
+        self._position = 0.0
+        self._animation: QPropertyAnimation | None = None
+        self.toggled.connect(self._animate_position)
+
+    def sizeHint(self) -> QSize:
+        return QSize(300, 36)
+
+    def hitButton(self, pos: QPoint) -> bool:
+        return self.rect().contains(pos)
+
+    def _animate_position(self, checked: bool) -> None:
+        if self._animation is not None:
+            self._animation.stop()
+        animation = QPropertyAnimation(self, b"switchPosition", self)
+        animation.setDuration(180)
+        animation.setStartValue(self._position)
+        animation.setEndValue(1.0 if checked else 0.0)
+        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        animation.start()
+        self._animation = animation
+
+    def paintEvent(self, event: QEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        text_color = QColor("#283548" if self._light_theme else "#dedede")
+        if not self.isEnabled():
+            text_color.setAlpha(110)
+        painter.setPen(text_color)
+        text_rect = QRectF(0, 0, max(0, self.width() - 58), self.height())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.text())
+
+        track_width = 46.0
+        track_height = 25.0
+        track_rect = QRectF(
+            self.width() - track_width,
+            (self.height() - track_height) / 2.0,
+            track_width,
+            track_height,
+        )
+        off = QColor(31, 42, 55, 42) if self._light_theme else QColor(255, 255, 255, 34)
+        on = QColor("#555f6d" if self._light_theme else "#6b6b6b")
+        track = QColor(
+            round(off.red() + (on.red() - off.red()) * self._position),
+            round(off.green() + (on.green() - off.green()) * self._position),
+            round(off.blue() + (on.blue() - off.blue()) * self._position),
+            round(off.alpha() + (on.alpha() - off.alpha()) * self._position),
+        )
+        painter.setPen(QPen(QColor(0, 0, 0, 32) if self._light_theme else QColor(255, 255, 255, 42), 1))
+        painter.setBrush(track)
+        painter.drawRoundedRect(track_rect, track_height / 2.0, track_height / 2.0)
+        knob_size = 19.0
+        knob_x = track_rect.left() + 3.0 + (track_width - knob_size - 6.0) * self._position
+        knob_rect = QRectF(knob_x, track_rect.top() + 3.0, knob_size, knob_size)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#ffffff" if self._light_theme else "#eeeeee"))
+        painter.drawEllipse(knob_rect)
+
+    def _get_switch_position(self) -> float:
+        return self._position
+
+    def _set_switch_position(self, value: float) -> None:
+        self._position = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    switchPosition = Property(float, _get_switch_position, _set_switch_position)
+
+
 class NotificationBellButton(QToolButton):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -593,6 +651,7 @@ class GitHubSidebarButton(QToolButton):
         super().__init__(parent)
         self._hover_progress = 0.0
         self._theme_name = "dark"
+        self._svg_path = ""
         self._hover_anim: QPropertyAnimation | None = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMouseTracking(True)
@@ -600,6 +659,10 @@ class GitHubSidebarButton(QToolButton):
 
     def set_button_theme(self, theme: str) -> None:
         self._theme_name = theme
+        self.update()
+
+    def set_svg_path(self, path: Path) -> None:
+        self._svg_path = str(path)
         self.update()
 
     def enterEvent(self, event: QEvent) -> None:
@@ -622,14 +685,24 @@ class GitHubSidebarButton(QToolButton):
         anim.start()
 
     def paintEvent(self, event: QEvent) -> None:
-        super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        opacity = 0.30 + 0.40 * self._hover_progress
-        scale = 1.0 + 0.08 * self._hover_progress
-        icon_size = int(22 * scale)
-        pixmap = self.icon().pixmap(icon_size, icon_size)
+        opacity = 0.34 + 0.66 * self._hover_progress
+        icon_size = int(round(18 + 4 * self._hover_progress))
+        pixmap = QPixmap()
+        if self._svg_path and Path(self._svg_path).exists():
+            physical_size = 128
+            image = QImage(physical_size, physical_size, QImage.Format.Format_ARGB32_Premultiplied)
+            image.fill(Qt.GlobalColor.transparent)
+            renderer = QSvgRenderer(self._svg_path)
+            svg_painter = QPainter(image)
+            svg_painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            renderer.render(svg_painter, QRectF(6, 6, physical_size - 12, physical_size - 12))
+            svg_painter.end()
+            pixmap = QPixmap.fromImage(image)
+        else:
+            pixmap = self.icon().pixmap(64, 64)
         target = QRectF(
             (self.width() - icon_size) / 2.0,
             (self.height() - icon_size) / 2.0,
@@ -637,7 +710,7 @@ class GitHubSidebarButton(QToolButton):
             icon_size,
         )
         if not pixmap.isNull():
-            tint = QColor("#1f2a3d" if is_light_theme(self._theme_name) else "#d7deea")
+            tint = QColor("#222222" if is_light_theme(self._theme_name) else "#f5f5f5")
             pixmap.setDevicePixelRatio(1.0)
             tinted = QPixmap(pixmap.size())
             tinted.fill(Qt.GlobalColor.transparent)
@@ -1101,6 +1174,7 @@ class AnimatedPowerButton(QToolButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._light_theme = False
         self._theme_name = "night"
+        self._runtime_mode = "zapret"
         self._active = False
         self._visual_mode = "off"
         self._visual_scale = 1.0
@@ -1119,11 +1193,15 @@ class AnimatedPowerButton(QToolButton):
         self._light_theme = is_light_theme(theme)
         self.update()
 
+    def set_runtime_mode(self, mode: str) -> None:
+        self._runtime_mode = mode if mode in {"zapret", "zapret2", "goshkow-vpn"} else "zapret"
+        self.update()
+
     def set_active_state(self, active: bool, *, animate: bool = True) -> None:
         self._active = active
         if self._visual_mode != "vpn":
             self._visual_mode = "on" if active else "off"
-        target = 1.14 if active else 1.0
+        target = 1.0
         if self._scale_anim is not None:
             self._scale_anim.stop()
         if not animate:
@@ -1140,7 +1218,7 @@ class AnimatedPowerButton(QToolButton):
 
     def set_loading_state(self, loading: bool, *, animate: bool = True) -> None:
         self._visual_mode = "loading" if loading else ("on" if self._active else "off")
-        target = 1.06 if loading else (1.14 if self._active else 1.0)
+        target = 1.0
         if self._scale_anim is not None:
             self._scale_anim.stop()
         if not animate:
@@ -1171,8 +1249,6 @@ class AnimatedPowerButton(QToolButton):
         super().leaveEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        self._glow_pos = event.position()
-        self.update()
         super().mouseMoveEvent(event)
 
     def _animate_hover(self, target: float) -> None:
@@ -1216,7 +1292,7 @@ class AnimatedPowerButton(QToolButton):
         rect = QRectF(self.rect())
         center = rect.center()
         base_radius = min(rect.width(), rect.height()) * 0.39
-        radius = base_radius * self._visual_scale
+        radius = base_radius * self._visual_scale * (1.0 + 0.025 * self._hover_progress)
 
         if self._light_theme:
             off_top = QColor("#f7f9ff")
@@ -1256,57 +1332,39 @@ class AnimatedPowerButton(QToolButton):
                 loading_bottom = QColor("#353941")
                 loading_border = QColor("#5b626d")
 
-        gradient = QRadialGradient(center.x(), center.y() - radius * 0.36, radius * 1.3)
+        if self._runtime_mode == "zapret":
+            on_top = QColor("#35b978" if self._light_theme else "#39b978")
+            on_bottom = QColor("#178451" if self._light_theme else "#176b45")
+            on_border = QColor("#4dca8b" if self._light_theme else "#48c787")
+        elif self._runtime_mode == "zapret2":
+            on_top = QColor("#5c8dff" if self._light_theme else "#5688f4")
+            on_bottom = QColor("#2d62d5" if self._light_theme else "#315dbf")
+            on_border = QColor("#79a4ff" if self._light_theme else "#78a0fa")
+        elif self._runtime_mode == "goshkow-vpn":
+            on_top = QColor("#a976f8" if self._light_theme else "#a36ef0")
+            on_bottom = QColor("#7041cf" if self._light_theme else "#6d3ec4")
+            on_border = QColor("#bd93ff" if self._light_theme else "#b88cf8")
+
         if self._visual_mode == "loading":
-            gradient.setColorAt(0.0, loading_top)
-            gradient.setColorAt(1.0, loading_bottom)
+            fill_color = loading_bottom
             border = loading_border
         elif self._visual_mode == "vpn":
-            gradient.setColorAt(0.0, vpn_top)
-            gradient.setColorAt(1.0, vpn_bottom)
+            fill_color = vpn_bottom
             border = vpn_border
         elif self._active:
-            gradient.setColorAt(0.0, on_top)
-            gradient.setColorAt(1.0, on_bottom)
+            fill_color = on_bottom
             border = on_border
         else:
-            gradient.setColorAt(0.0, off_top)
-            gradient.setColorAt(1.0, off_bottom)
+            fill_color = off_bottom
             border = off_border
         painter.setPen(QPen(border, 2))
-        painter.setBrush(gradient)
+        painter.setBrush(fill_color)
         painter.drawEllipse(center, radius, radius)
 
         if self._hover_progress > 0.001:
-            if self._light_theme:
-                if self._visual_mode == "vpn":
-                    glow_color = QColor(118, 80, 255, int(76 * self._hover_progress))
-                elif self._active or self._visual_mode == "loading":
-                    glow_color = QColor(232, 243, 255, int(62 * self._hover_progress))
-                else:
-                    glow_color = QColor(109, 154, 255, int(34 * self._hover_progress))
-            else:
-                glow_color = QColor(150, 112, 255, int(52 * self._hover_progress)) if self._visual_mode == "vpn" else QColor(148, 206, 255, int(34 * self._hover_progress))
-            dx = self._glow_pos.x() - center.x()
-            dy = self._glow_pos.y() - center.y()
-            distance = max(1.0, (dx * dx + dy * dy) ** 0.5)
-            max_offset = radius * 0.34
-            focus = QPointF(
-                center.x() + dx / distance * min(distance, max_offset),
-                center.y() + dy / distance * min(distance, max_offset),
-            )
-            button_path = QPainterPath()
-            button_path.addEllipse(center, radius, radius)
-            painter.save()
-            painter.setClipPath(button_path)
-            glow = QRadialGradient(focus, radius * (1.08 if self._light_theme else 0.98))
-            glow.setColorAt(0.0, glow_color)
-            glow.setColorAt(0.65, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), max(0, glow_color.alpha() // 2)))
-            glow.setColorAt(1.0, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), 0))
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(glow)
+            painter.setBrush(QColor(255, 255, 255, int(20 * self._hover_progress)))
             painter.drawEllipse(center, radius, radius)
-            painter.restore()
 
         icon_size = 48 if self._active else 44
         if self._visual_mode == "loading":
@@ -1830,8 +1888,10 @@ class ButtonInteractionFilter(QObject):
 
 class ScrollFadeOverlay(QWidget):
     def __init__(self, scrollable: QAbstractScrollArea) -> None:
-        super().__init__(scrollable.viewport())
-        self._scrollable = scrollable
+        viewport = scrollable.viewport()
+        super().__init__(viewport)
+        self._scrollable: QAbstractScrollArea | None = scrollable
+        self._viewport: QWidget | None = viewport
         self._theme_name = "night"
         self._surface_override: QColor | None = None
         self._onboarding_background_frame: QWidget | None = None
@@ -1843,7 +1903,9 @@ class ScrollFadeOverlay(QWidget):
         self._paint_bottom = True
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.hide()
-        scrollable.viewport().installEventFilter(self)
+        viewport.installEventFilter(self)
+        viewport.destroyed.connect(self._detach_scrollable)
+        scrollable.destroyed.connect(self._detach_scrollable)
         scrollable.verticalScrollBar().valueChanged.connect(self._sync_state)
         scrollable.verticalScrollBar().rangeChanged.connect(lambda *_: self._sync_state())
         self._sync_geometry()
@@ -1885,11 +1947,15 @@ class ScrollFadeOverlay(QWidget):
         self._sync_state()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self._scrollable.viewport() and event.type() in {QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.Paint}:
+        if watched is self._viewport and event.type() in {QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.Paint}:
             self._sync_geometry()
             if event.type() != QEvent.Type.Paint:
                 QTimer.singleShot(0, self._sync_state)
         return super().eventFilter(watched, event)
+
+    def _detach_scrollable(self, *_args: object) -> None:
+        self._viewport = None
+        self._scrollable = None
 
     def _surface_color(self) -> QColor:
         if self._surface_override is not None:
@@ -1899,18 +1965,30 @@ class ScrollFadeOverlay(QWidget):
         if self._theme_name == "light blue":
             return QColor("#e4f0ff")
         if self._theme_name == "oled":
-            return QColor("#101215")
+            return QColor("#121212")
         if self._theme_name == "dark":
             return QColor("#15171a")
         return QColor("#0d1320")
 
     def _sync_geometry(self) -> None:
-        viewport = self._scrollable.viewport()
-        self.setGeometry(viewport.rect())
-        self.raise_()
+        viewport = self._viewport
+        if viewport is None:
+            return
+        try:
+            self.setGeometry(viewport.rect())
+            self.raise_()
+        except RuntimeError:
+            self._detach_scrollable()
 
     def _sync_state(self) -> None:
-        bar = self._scrollable.verticalScrollBar()
+        scrollable = self._scrollable
+        if scrollable is None:
+            return
+        try:
+            bar = scrollable.verticalScrollBar()
+        except RuntimeError:
+            self._detach_scrollable()
+            return
         maximum = max(0, int(bar.maximum()))
         value = max(0, int(bar.value()))
         self._top_visible = value > 0
@@ -2074,14 +2152,22 @@ def _chrome_surface_color(theme: str) -> QColor:
 
 
 def _load_ui_font_family(ui_assets_dir: Path) -> str:
-    font_path = ui_assets_dir / "fonts" / "JetBrainsSans[wght]-VF.ttf"
-    family = "JetBrains Sans"
-    if font_path.exists():
+    fonts_dir = ui_assets_dir / "fonts"
+    inter_family = "Inter"
+    for filename in ("Inter-Regular.ttf", "Inter-SemiBold.ttf", "Inter-Bold.ttf"):
+        font_path = fonts_dir / filename
+        if not font_path.exists():
+            continue
         font_id = QFontDatabase.addApplicationFont(str(font_path))
         families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
         if families:
-            family = str(families[0])
-    return family
+            inter_family = str(families[0])
+
+    # The logo line deliberately keeps the former brand typeface.
+    brand_font = fonts_dir / "JetBrainsSans[wght]-VF.ttf"
+    if brand_font.exists():
+        QFontDatabase.addApplicationFont(str(brand_font))
+    return inter_family
 
 
 def _onboarding_text_color(theme: str) -> str:
@@ -2654,16 +2740,30 @@ class EmojiBadgeButton(QToolButton):
 class SmoothScrollController(QObject):
     def __init__(self, scrollable: QAbstractScrollArea, *, duration: int = 170, angle_divisor: float = 2.0) -> None:
         super().__init__(scrollable)
-        self._scrollable = scrollable
+        viewport = scrollable.viewport()
+        self._scrollable: QAbstractScrollArea | None = scrollable
+        self._viewport: QWidget | None = viewport
         self._angle_divisor = max(1.0, float(angle_divisor))
         self._target_value = scrollable.verticalScrollBar().value()
         self._animation = QPropertyAnimation(scrollable.verticalScrollBar(), b"value", self)
         self._animation.setDuration(max(80, int(duration)))
         self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        scrollable.viewport().installEventFilter(self)
+        viewport.installEventFilter(self)
+        viewport.destroyed.connect(self._detach_scrollable)
+        scrollable.destroyed.connect(self._detach_scrollable)
+
+    def _detach_scrollable(self, *_args: object) -> None:
+        animation = self._animation
+        self._viewport = None
+        self._scrollable = None
+        try:
+            animation.stop()
+        except RuntimeError:
+            pass
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self._scrollable.viewport() and event.type() == QEvent.Type.Wheel:
+        scrollable = self._scrollable
+        if watched is self._viewport and scrollable is not None and event.type() == QEvent.Type.Wheel:
             wheel = event  # type: ignore[assignment]
             delta = 0
             if hasattr(wheel, "pixelDelta") and wheel.pixelDelta().y() != 0:  # type: ignore[attr-defined]
@@ -2671,7 +2771,11 @@ class SmoothScrollController(QObject):
             elif hasattr(wheel, "angleDelta"):
                 delta = int(wheel.angleDelta().y() / self._angle_divisor)  # type: ignore[attr-defined]
             if delta != 0:
-                bar = self._scrollable.verticalScrollBar()
+                try:
+                    bar = scrollable.verticalScrollBar()
+                except RuntimeError:
+                    self._detach_scrollable()
+                    return False
                 self._target_value = max(bar.minimum(), min(bar.maximum(), self._target_value - delta))
                 self._animation.stop()
                 self._animation.setStartValue(bar.value())
@@ -2893,8 +2997,8 @@ class SettingsDialog(AppDialog):
         self._settings_section_frames: dict[str, QFrame] = {}
         self._pending_scroll_section = ""
         super().__init__(parent, context, self._t("Настройки", "Settings"))
-        self.setMinimumWidth(520)
-        self.resize(600, 980)
+        self.setMinimumSize(640, 700)
+        self.resize(700, 820)
         layout = self.body_layout
 
         self.theme_combo = ClickSelectComboBox()
@@ -2914,8 +3018,9 @@ class SettingsDialog(AppDialog):
         self.tg_dc_ip_input = QTextEdit()
         self.tg_dc_ip_input.setAcceptRichText(False)
         self.tg_dc_ip_input.setFixedHeight(72)
-        self.tg_cfproxy_checkbox = QCheckBox(self._t("Cloudflare fallback", "Cloudflare fallback"))
-        self.tg_cfproxy_priority_checkbox = QCheckBox(self._t("Пробовать Cloudflare первым", "Try Cloudflare first"))
+        switch_theme = self.context.settings.get().theme
+        self.tg_cfproxy_checkbox = ThemedSwitch(self._t("Cloudflare fallback", "Cloudflare fallback"), switch_theme)
+        self.tg_cfproxy_priority_checkbox = ThemedSwitch(self._t("Пробовать Cloudflare первым", "Try Cloudflare first"), switch_theme)
         self.tg_cfproxy_domain_input = QLineEdit()
         self.tg_fake_tls_input = QLineEdit()
         self.tg_buf_input = QLineEdit()
@@ -2939,13 +3044,28 @@ class SettingsDialog(AppDialog):
         self.gaming_set_combo.addItem("UDP first", "udp-first")
         self.gaming_set_combo.addItem("TCP first", "tcp-first")
         self.gaming_set_combo.addItem("STUN between", "stun-between")
-        self.autostart_checkbox = QCheckBox(self._t("Запускать вместе с Windows", "Run with Windows"))
-        self.tray_checkbox = QCheckBox(self._t("Стартовать в трее", "Start in tray"))
-        self.auto_components_checkbox = QCheckBox(self._t("Автозапуск компонентов", "Auto-run components"))
-        self.check_updates_checkbox = QCheckBox(self._t("Проверять наличие обновлений", "Check for updates"))
+        self.autostart_checkbox = ThemedSwitch(self._t("Запускать вместе с Windows", "Run with Windows"), switch_theme)
+        self.tray_checkbox = ThemedSwitch(self._t("Стартовать в трее", "Start in tray"), switch_theme)
+        self.auto_components_checkbox = ThemedSwitch(self._t("Автозапуск компонентов", "Auto-run components"), switch_theme)
+        self.tray_hide_notification_checkbox = ThemedSwitch(self._t("Показывать уведомление о скрытии в трей", "Show tray minimize notification"), switch_theme)
+        self.check_updates_checkbox = ThemedSwitch(self._t("Проверять наличие обновлений автоматически", "Check for updates automatically"), switch_theme)
+        self.runtime_order_list = QListWidget()
+        self.runtime_order_list.setObjectName("RuntimeOrderList")
+        self.runtime_order_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.runtime_order_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.runtime_order_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.runtime_order_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.runtime_order_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.runtime_order_list.setFixedHeight(118)
+        self.runtime_order_list.setToolTip(
+            self._t(
+                "Перетащите методы, чтобы изменить порядок переключения на главной странице.",
+                "Drag methods to change their order on the dashboard.",
+            )
+        )
         self.vpn_subscription_input = QLineEdit()
         self.vpn_subscription_input.setPlaceholderText("https://vpn.goshkow.ru/sub/...")
-        self.vpn_tun_checkbox = QCheckBox(self._t("Использовать TUN-режим", "Use TUN mode"))
+        self.vpn_tun_checkbox = ThemedSwitch(self._t("Использовать TUN-режим", "Use TUN mode"), switch_theme)
         self.vpn_routing_combo = ClickSelectComboBox()
         self.vpn_routing_combo.addItem(self._t("Глобальная", "Global"), "global")
         self.vpn_routing_combo.addItem(self._t("RU чёрный список", "RU blacklist"), "blacklist")
@@ -2962,7 +3082,7 @@ class SettingsDialog(AppDialog):
                 "Comma-separated process list",
             )
         )
-        self.vpn_processes_exclude_checkbox = QCheckBox(self._t("Исключать процессы", "Exclude processes"))
+        self.vpn_processes_exclude_checkbox = ThemedSwitch(self._t("Исключать процессы", "Exclude processes"), switch_theme)
         self.vpn_processes_label = QLabel(self._t("Проксировать процессы", "Proxy processes"))
         self.vpn_processes_exclude_checkbox.toggled.connect(self._sync_vpn_processes_label)
         self.vpn_refresh_btn = QPushButton(self._t("Обновить подписку", "Refresh subscription"))
@@ -2975,38 +3095,106 @@ class SettingsDialog(AppDialog):
         self.rebuild_runtime_btn = QPushButton(self._t("Пересобрать сборку", "Rebuild runtime"))
         self.rebuild_runtime_btn.clicked.connect(lambda: self._run_parent_action("_rebuild_runtime"))
 
-        scroll = QScrollArea()
-        scroll.setObjectName("SettingsScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumHeight(560)
-        scroll.setMaximumHeight(760)
-        self._settings_scroll = scroll
-        canvas = QWidget()
-        canvas.setObjectName("SettingsCanvas")
-        canvas_layout = QVBoxLayout(canvas)
-        canvas_layout.setContentsMargins(0, 0, 0, 0)
-        canvas_layout.setSpacing(10)
-        scroll.setWidget(canvas)
-        self._smooth_scroll_helpers.append(SmoothScrollController(scroll))
-        fade = ScrollFadeOverlay(scroll)
-        fade.set_theme(self.context.settings.get().theme)
-        fade.set_surface_color(_dialog_surface_color(self.context.settings.get().theme))
-        self._scroll_fade_overlays.append(fade)
-        layout.addWidget(scroll, 1)
+        self.theme_combo.hide()
+        self.language_combo.hide()
+        self._settings_tab_buttons: dict[str, QPushButton] = {}
+        self._settings_page_indexes: dict[str, int] = {}
+        self._theme_choice_buttons: dict[str, QToolButton] = {}
+        self._language_choice_buttons: dict[str, QPushButton] = {}
 
-        app_form = self._settings_section(canvas_layout, self._t("Приложение", "Application"), "app")
-        app_form.addRow(self._t("Тема", "Theme"), self.theme_combo)
-        app_form.addRow(self._t("Язык", "Language"), self.language_combo)
+        tabs_bar = QWidget()
+        tabs_bar.setObjectName("SettingsTabsBar")
+        tabs_layout = QHBoxLayout(tabs_bar)
+        tabs_layout.setContentsMargins(0, 0, 0, 0)
+        tabs_layout.setSpacing(6)
+        layout.addWidget(tabs_bar)
+
+        self._settings_pages = QStackedWidget()
+        self._settings_pages.setObjectName("SettingsPages")
+        layout.addWidget(self._settings_pages, 1)
+
+        def create_page(page_id: str) -> tuple[QScrollArea, QVBoxLayout]:
+            page_scroll = QScrollArea()
+            page_scroll.setObjectName("SettingsScroll")
+            page_scroll.setWidgetResizable(True)
+            page_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            page_canvas = QWidget()
+            page_canvas.setObjectName("SettingsCanvas")
+            page_layout = QVBoxLayout(page_canvas)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(10)
+            page_scroll.setWidget(page_canvas)
+            self._smooth_scroll_helpers.append(SmoothScrollController(page_scroll))
+            fade = ScrollFadeOverlay(page_scroll)
+            fade.set_theme(self.context.settings.get().theme)
+            fade.set_surface_color(_dialog_surface_color(self.context.settings.get().theme))
+            self._scroll_fade_overlays.append(fade)
+            self._settings_page_indexes[page_id] = self._settings_pages.addWidget(page_scroll)
+            return page_scroll, page_layout
+
+        app_scroll, app_layout = create_page("app")
+        self._settings_scroll = app_scroll
+        _zapret_scroll, zapret_layout = create_page("zapret")
+        vpn_scroll, vpn_layout = create_page("goshkow-vpn")
+        _tg_scroll, tg_layout = create_page("tg-ws-proxy")
+
+        vpn_state_for_tabs = self.context.vpn.state()
+        tab_specs = [
+            ("app", self._t("Приложение", "Application")),
+            ("zapret", "Zapret"),
+        ]
+        if str(vpn_state_for_tabs.get("subscription_state", "") or "") == "valid":
+            tab_specs.append(("goshkow-vpn", "VPN"))
+        tab_specs.append(("tg-ws-proxy", "TG WS Proxy"))
+        for page_id, title in tab_specs:
+            tab_button = QPushButton(title)
+            tab_button.setObjectName("SettingsTabButton")
+            tab_button.setCheckable(True)
+            tab_button.setAutoExclusive(True)
+            tab_button.clicked.connect(lambda _=False, target=page_id: self._switch_settings_page(target))
+            self._settings_tab_buttons[page_id] = tab_button
+            tabs_layout.addWidget(tab_button, 1)
+        self._settings_tab_buttons["app"].setChecked(True)
+
+        appearance_frame = QFrame()
+        appearance_frame.setProperty("class", "settingsSection")
+        appearance_layout = QVBoxLayout(appearance_frame)
+        appearance_layout.setContentsMargins(14, 12, 14, 14)
+        appearance_layout.setSpacing(12)
+        appearance_title = QLabel(self._t("Внешний вид", "Appearance"))
+        appearance_title.setProperty("class", "title")
+        appearance_layout.addWidget(appearance_title)
+        appearance_layout.addWidget(self._build_theme_selector())
+        appearance_layout.addWidget(self._build_language_selector())
+        app_layout.addWidget(appearance_frame)
+
+        app_form = self._settings_section(app_layout, self._t("Приложение", "Application"), "app")
         app_form.addRow("", self.autostart_checkbox)
         app_form.addRow("", self.tray_checkbox)
         app_form.addRow("", self.auto_components_checkbox)
+        app_form.addRow("", self.tray_hide_notification_checkbox)
         app_form.addRow("", self.check_updates_checkbox)
-        app_form.addRow("", self.check_updates_btn)
+        check_updates_row = QWidget()
+        check_updates_row.setObjectName("SettingsInlineRow")
+        check_updates_layout = QHBoxLayout(check_updates_row)
+        check_updates_layout.setContentsMargins(0, 0, 0, 0)
+        check_updates_layout.setSpacing(0)
+        check_updates_layout.addWidget(self.check_updates_btn)
+        check_updates_layout.addStretch(1)
+        app_form.addRow("", check_updates_row)
+        app_form.addRow(self._t("Порядок обходов", "Bypass order"), self.runtime_order_list)
 
-        vpn_form = self._settings_section(canvas_layout, "goshkow vpn", "goshkow-vpn")
-        self.vpn_section_frame = vpn_form.parentWidget()
+        zapret_form = self._settings_section(zapret_layout, "Zapret", "zapret")
+        zapret_form.addRow("IPSet mode", self.ipset_mode_combo)
+        zapret_form.addRow(self._t("Gaming mode", "Gaming mode"), self.game_mode_combo)
+        zapret_form.addRow("Gaming Set", self.gaming_set_combo)
+        zapret_form.addRow(self._t("Исключить UDP-порты", "Exclude UDP ports"), self.zapret_udp_exclude_input)
+        zapret_form.addRow("", self.find_settings_btn)
+        zapret_form.addRow("", self.rebuild_runtime_btn)
+
+        vpn_form = self._settings_section(vpn_layout, "goshkow vpn", "goshkow-vpn")
+        self.vpn_section_frame = vpn_scroll
         vpn_form.addRow(self._t("Ссылка подписки", "Subscription URL"), self.vpn_subscription_input)
         vpn_form.addRow("", self.vpn_refresh_btn)
         vpn_form.addRow("", self.vpn_tun_checkbox)
@@ -3015,15 +3203,7 @@ class SettingsDialog(AppDialog):
         vpn_form.addRow("", self.vpn_processes_exclude_checkbox)
         vpn_form.addRow(self.vpn_processes_label, self.vpn_processes_input)
 
-        zapret_form = self._settings_section(canvas_layout, "Zapret", "zapret")
-        zapret_form.addRow("IPSet mode", self.ipset_mode_combo)
-        zapret_form.addRow(self._t("Gaming mode", "Gaming mode"), self.game_mode_combo)
-        zapret_form.addRow("Gaming Set", self.gaming_set_combo)
-        zapret_form.addRow(self._t("Исключить UDP-порты", "Exclude UDP ports"), self.zapret_udp_exclude_input)
-        zapret_form.addRow("", self.find_settings_btn)
-        zapret_form.addRow("", self.rebuild_runtime_btn)
-
-        tg_form = self._settings_section(canvas_layout, "TG WS Proxy", "tg-ws-proxy")
+        tg_form = self._settings_section(tg_layout, "TG WS Proxy", "tg-ws-proxy")
         tg_form.addRow(self._t("Хост", "Host"), self.tg_host_input)
         tg_form.addRow(self._t("Порт", "Port"), self.tg_port_input)
         tg_form.addRow(self._t("Секрет", "Secret"), self.tg_secret_input)
@@ -3058,7 +3238,7 @@ class SettingsDialog(AppDialog):
             "}"
         )
         restart_onboarding_btn.clicked.connect(self._restart_onboarding)
-        canvas_layout.addWidget(restart_onboarding_btn)
+        zapret_layout.addWidget(restart_onboarding_btn)
 
         credits = QLabel(
             self._t(
@@ -3071,8 +3251,11 @@ class SettingsDialog(AppDialog):
             )
         )
         credits.setProperty("class", "muted")
-        canvas_layout.addWidget(credits)
-        canvas_layout.addStretch(1)
+        app_layout.addWidget(credits)
+        app_layout.addStretch(1)
+        zapret_layout.addStretch(1)
+        vpn_layout.addStretch(1)
+        tg_layout.addStretch(1)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
@@ -3084,7 +3267,111 @@ class SettingsDialog(AppDialog):
         buttons.addWidget(cancel_btn)
         buttons.addWidget(save_btn)
         layout.addLayout(buttons)
+        self.autostart_checkbox.toggled.connect(self._sync_autostart_options)
         self._load()
+
+    def _theme_preview_icon(self, theme_id: str) -> QIcon:
+        palettes = {
+            "light": ("#f4f7fc", "#ffffff", "#1f2a3d", "#d9e1ec"),
+            "light blue": ("#e7f2ff", "#f9fcff", "#24344d", "#c8ddf5"),
+            "dark": ("#181a1d", "#15171a", "#f5f7fc", "#30353d"),
+            "night": ("#101726", "#0d1320", "#d9e0f0", "#243550"),
+            "oled": ("#0f0f0f", "#121212", "#f1f1f1", "#292929"),
+        }
+        chrome, content, text, border = palettes.get(theme_id, palettes["dark"])
+        image = QImage(168, 104, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        outer = QRectF(3, 3, 162, 98)
+        painter.setPen(QPen(QColor(border), 2))
+        painter.setBrush(QColor(chrome))
+        painter.drawRoundedRect(outer, 15, 15)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(content))
+        painter.drawRoundedRect(QRectF(34, 24, 121, 66), 9, 9)
+        painter.setBrush(QColor(text))
+        painter.drawRoundedRect(QRectF(47, 37, 60, 8), 4, 4)
+        muted = QColor(text)
+        muted.setAlpha(145)
+        painter.setBrush(muted)
+        painter.drawRoundedRect(QRectF(47, 55, 88, 7), 3.5, 3.5)
+        painter.drawRoundedRect(QRectF(47, 69, 68, 7), 3.5, 3.5)
+        painter.end()
+        return QIcon(QPixmap.fromImage(image))
+
+    def _build_theme_selector(self) -> QWidget:
+        host = QWidget()
+        host.setObjectName("ThemeSelector")
+        grid = QGridLayout(host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        language = self.context.settings.get().language
+        for index, theme_id in enumerate(("light", "light blue", "dark", "night", "oled")):
+            button = QToolButton(host)
+            button.setObjectName("ThemeChoice")
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            button.setIcon(self._theme_preview_icon(theme_id))
+            button.setIconSize(QSize(84, 52))
+            button.setText(_theme_display_name(theme_id, language))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumSize(106, 88)
+            button.clicked.connect(lambda _=False, value=theme_id: self._select_theme_choice(value))
+            self._theme_choice_buttons[theme_id] = button
+            grid.addWidget(button, index // 3, index % 3)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        return host
+
+    def _build_language_selector(self) -> QWidget:
+        host = QWidget()
+        host.setObjectName("LanguageSelector")
+        row = QHBoxLayout(host)
+        row.setContentsMargins(3, 3, 3, 3)
+        row.setSpacing(3)
+        for language_id, title in (("ru", "Русский"), ("en", "English")):
+            button = QPushButton(title, host)
+            button.setObjectName("LanguageChoice")
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+            button.setMinimumHeight(38)
+            button.clicked.connect(lambda _=False, value=language_id: self._select_language_choice(value))
+            self._language_choice_buttons[language_id] = button
+            row.addWidget(button, 1)
+        return host
+
+    def _select_theme_choice(self, theme_id: str) -> None:
+        index = self.theme_combo.findData(theme_id)
+        if index >= 0:
+            self.theme_combo.setCurrentIndex(index)
+        for value, button in self._theme_choice_buttons.items():
+            button.setChecked(value == theme_id)
+
+    def _select_language_choice(self, language_id: str) -> None:
+        self._select_combo_value(self.language_combo, language_id)
+        for value, button in self._language_choice_buttons.items():
+            button.setChecked(value == language_id)
+
+    def _sync_visual_selectors(self) -> None:
+        self._select_theme_choice(str(self.theme_combo.currentData() or "night"))
+        self._select_language_choice(str(self.language_combo.currentData() or "ru"))
+
+    def _sync_autostart_options(self) -> None:
+        visible = self.autostart_checkbox.isChecked()
+        self.tray_checkbox.setVisible(visible)
+        self.auto_components_checkbox.setVisible(visible)
+
+    def _switch_settings_page(self, page_id: str) -> None:
+        index = self._settings_page_indexes.get(page_id)
+        if index is None:
+            return
+        self._settings_pages.setCurrentIndex(index)
+        for value, button in self._settings_tab_buttons.items():
+            button.setChecked(value == page_id)
 
     def _settings_section(self, parent_layout: QVBoxLayout, title: str, section_id: str = "") -> QFormLayout:
         frame = QFrame()
@@ -3117,15 +3404,10 @@ class SettingsDialog(AppDialog):
 
     def _scroll_to_pending_section(self) -> None:
         target = self._pending_scroll_section
-        if not target or self._settings_scroll is None:
+        if not target:
             return
-        frame = self._settings_section_frames.get(target)
-        if frame is None or not frame.isVisible():
-            return
-        try:
-            self._settings_scroll.ensureWidgetVisible(frame, 18, 18)
-        except Exception:
-            pass
+        if target in self._settings_tab_buttons:
+            self._switch_settings_page(target)
 
     def _t(self, ru: str, en: str) -> str:
         return ru if self.context.settings.get().language == "ru" else en
@@ -3169,7 +3451,9 @@ class SettingsDialog(AppDialog):
         self.autostart_checkbox.setChecked(self.context.autostart.is_enabled())
         self.tray_checkbox.setChecked(settings.start_in_tray)
         self.auto_components_checkbox.setChecked(settings.auto_run_components)
+        self.tray_hide_notification_checkbox.setChecked(bool(getattr(settings, "show_tray_hide_notification", True)))
         self.check_updates_checkbox.setChecked(settings.check_updates_on_start)
+        self._load_runtime_mode_order(settings.runtime_mode_order)
         self.vpn_subscription_input.setText(
             str(vpn_state.get("subscription_url", "") or settings.goshkow_vpn_subscription_url)
         )
@@ -3191,6 +3475,8 @@ class SettingsDialog(AppDialog):
         self._sync_vpn_processes_label()
         if self.vpn_section_frame is not None:
             self.vpn_section_frame.setVisible(str(vpn_state.get("subscription_state", "") or "") == "valid")
+        self._sync_autostart_options()
+        self._sync_visual_selectors()
 
     def load_from_payload(self, payload: dict[str, object]) -> None:
         self._load()
@@ -3223,7 +3509,11 @@ class SettingsDialog(AppDialog):
         self.autostart_checkbox.setChecked(bool(payload.get("autostart_windows", self.context.settings.get().autostart_windows)))
         self.tray_checkbox.setChecked(bool(payload.get("start_in_tray", self.context.settings.get().start_in_tray)))
         self.auto_components_checkbox.setChecked(bool(payload.get("auto_run_components", self.context.settings.get().auto_run_components)))
+        self.tray_hide_notification_checkbox.setChecked(bool(payload.get("show_tray_hide_notification", getattr(self.context.settings.get(), "show_tray_hide_notification", True))))
         self.check_updates_checkbox.setChecked(bool(payload.get("check_updates_on_start", self.context.settings.get().check_updates_on_start)))
+        runtime_order = payload.get("runtime_mode_order", self.context.settings.get().runtime_mode_order)
+        if isinstance(runtime_order, list):
+            self._load_runtime_mode_order(runtime_order)
         self.vpn_subscription_input.setText(
             str(payload.get("goshkow_vpn_subscription_url", self.vpn_subscription_input.text()))
         )
@@ -3245,6 +3535,8 @@ class SettingsDialog(AppDialog):
             bool(payload.get("goshkow_vpn_processes_exclude_mode", self.vpn_processes_exclude_checkbox.isChecked()))
         )
         self._sync_vpn_processes_label()
+        self._sync_autostart_options()
+        self._sync_visual_selectors()
 
     def payload(self) -> dict[str, object]:
         try:
@@ -3281,7 +3573,9 @@ class SettingsDialog(AppDialog):
             "autostart_windows": self.autostart_checkbox.isChecked(),
             "start_in_tray": self.tray_checkbox.isChecked(),
             "auto_run_components": self.auto_components_checkbox.isChecked(),
+            "show_tray_hide_notification": self.tray_hide_notification_checkbox.isChecked(),
             "check_updates_on_start": self.check_updates_checkbox.isChecked(),
+            "runtime_mode_order": self._runtime_mode_order(),
             "goshkow_vpn_subscription_url": self.vpn_subscription_input.text().strip(),
             "goshkow_vpn_tun_enabled": self.vpn_tun_checkbox.isChecked(),
             "goshkow_vpn_routing_mode": self.vpn_routing_combo.currentData() or "global",
@@ -3289,6 +3583,29 @@ class SettingsDialog(AppDialog):
             "goshkow_vpn_processes": self.vpn_processes_input.text().strip(),
             "goshkow_vpn_processes_exclude_mode": self.vpn_processes_exclude_checkbox.isChecked(),
         }
+
+    def _load_runtime_mode_order(self, order: object) -> None:
+        labels = {
+            "zapret": "Zapret",
+            "goshkow-vpn": "goshkow vpn",
+            "zapret2": "Zapret2",
+        }
+        preferred = [str(item) for item in order] if isinstance(order, list) else []
+        normalized = [mode for mode in preferred if mode in labels]
+        normalized.extend(mode for mode in labels if mode not in normalized)
+        self.runtime_order_list.clear()
+        for mode in normalized:
+            item = QListWidgetItem(labels[mode])
+            item.setData(Qt.ItemDataRole.UserRole, mode)
+            item.setSizeHint(QSize(0, 34))
+            self.runtime_order_list.addItem(item)
+
+    def _runtime_mode_order(self) -> list[str]:
+        return [
+            str(self.runtime_order_list.item(index).data(Qt.ItemDataRole.UserRole) or "")
+            for index in range(self.runtime_order_list.count())
+            if str(self.runtime_order_list.item(index).data(Qt.ItemDataRole.UserRole) or "")
+        ]
 
     def _sync_vpn_processes_label(self) -> None:
         if getattr(self, "vpn_processes_label", None) is None:
@@ -3767,12 +4084,18 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self._submit_backend_task("load_startup_snapshot", action_id="__startup_snapshot__"))
 
     def _themed_icon_color(self, filename: str) -> QColor | None:
-        if filename not in {"power.svg", "share.svg", "trash.svg", "search.svg", "refresh.svg", "external.svg", "vpn.svg", "vpn.png", "bell.svg", "settings.svg"}:
+        themed_icons = {
+            "power.svg", "share.svg", "trash.svg", "search.svg", "refresh.svg", "external.svg", "vpn.svg", "vpn.png", "bell.svg", "settings.svg",
+            "home.svg", "services.svg", "components.svg", "mods.svg", "files.svg", "logs.svg", "github.svg",
+            "files_domains.svg", "files_exclude.svg", "files_ip.svg", "files_editor.svg", "files_general.svg", "files_hosts.svg",
+            "status_ok.svg", "status_off.svg", "status_warn.svg", "status_mod.svg", "status_theme.svg", "status_sun.svg",
+        }
+        if filename not in themed_icons:
             return None
         theme = self.context.settings.get().theme
         if is_light_theme(theme):
-            return QColor("#1f2a3d")
-        return QColor("#e7edf9")
+            return QColor("#202020")
+        return QColor("#f5f5f5")
 
     def _compose_icon_slot_pixmap(
         self,
@@ -3861,7 +4184,8 @@ class MainWindow(QMainWindow):
     ) -> QIcon:
         base = QIcon(str(icon_path))
         icon = QIcon()
-        for size in (14, 16, 18, 20, 24, 26, 32):
+        # Include high-resolution entries: sidebar icons remain sharp on 125-200% DPI.
+        for size in (14, 16, 18, 20, 24, 26, 32, 40, 48, 64):
             source = self._load_trimmed_icon_pixmap(icon_path, size)
             if source.isNull():
                 continue
@@ -4460,6 +4784,7 @@ class MainWindow(QMainWindow):
             if page.layout() is not None:
                 page.layout().activate()
         if index == 0:
+            self._prime_dashboard_reconfigure_button()
             self._sync_power_aura_geometry()
         elif index == 1:
             self.refresh_services()
@@ -4679,11 +5004,19 @@ class MainWindow(QMainWindow):
         row.addWidget(icon)
 
         title = QLabel("Zapret Hub")
+        title.setObjectName("AppBrandTitle")
         title.setProperty("class", "title")
+        title_font = QFont("JetBrains Sans", 13)
+        title_font.setWeight(QFont.Weight.Bold)
+        title.setFont(title_font)
         row.addWidget(title)
 
         author = QLabel("by goshkow")
+        author.setObjectName("AppBrandAuthor")
         author.setProperty("class", "muted")
+        author_font = QFont("JetBrains Sans", 10)
+        author_font.setWeight(QFont.Weight.Normal)
+        author.setFont(author_font)
         author.setContentsMargins(0, 2, 0, 0)
         row.addWidget(author)
         row.addStretch(1)
@@ -4913,7 +5246,7 @@ class MainWindow(QMainWindow):
             return
 
     def _component_display_name(self, component_id: str) -> str:
-        return {"zapret": "Zapret", "tg-ws-proxy": "TG WS Proxy", "goshkow-vpn": "goshkow vpn"}.get(component_id, component_id)
+        return {"zapret": "Zapret", "zapret2": "Zapret2", "tg-ws-proxy": "TG WS Proxy", "goshkow-vpn": "goshkow vpn"}.get(component_id, component_id)
 
     def _translate_component_error(self, error: str) -> str:
         text = str(error or "").strip()
@@ -5116,17 +5449,11 @@ class MainWindow(QMainWindow):
         for idx, item in enumerate(self._nav_items):
             btn = AnimatedNavButton()
             btn.setProperty("class", "nav")
-            if item.key == "files":
-                btn.setProperty("baseIconDx", 1.0)
             btn.setCheckable(True)
             btn.setAutoExclusive(True)
             btn.setIcon(self._icon(item.icon_file))
-            icon_size = 26
-            if item.key in {"services", "mods"}:
-                icon_size = 28
-            elif item.key == "components":
-                icon_size = 24
-            btn.setIconSize(QSize(icon_size, icon_size))
+            btn.set_svg_path(self._icons_dir / item.icon_file)
+            btn.setIconSize(QSize(25, 25))
             btn.setToolTip(item.tooltip)
             btn.clicked.connect(lambda _=False, index=idx: self._switch_page(index))
             self._attach_button_animations(btn)
@@ -5136,11 +5463,14 @@ class MainWindow(QMainWindow):
         col.addStretch(1)
         github_btn = GitHubSidebarButton()
         github_btn.setIcon(self._icon("github.svg"))
+        github_btn.set_svg_path(self._icons_dir / "github.svg")
         github_btn.setIconSize(QSize(22, 22))
         github_btn.set_button_theme(self.context.settings.get().theme)
         github_btn.setToolTip(self._t("Открыть репозиторий", "Open repository"))
         github_btn.setFixedSize(44, 44)
-        github_btn.setStyleSheet("QToolButton { background: transparent; border: none; }")
+        github_btn.setStyleSheet(
+            "QToolButton, QToolButton:hover, QToolButton:pressed { background: transparent; border: none; }"
+        )
         github_btn.clicked.connect(lambda: webbrowser.open("https://github.com/goshkow/Zapret-Hub/"))
         self._github_sidebar_btn = github_btn
         col.addWidget(github_btn, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
@@ -5529,7 +5859,7 @@ class MainWindow(QMainWindow):
         self.power_aura.lower()
 
         power_stage = QWidget(power_block)
-        power_stage.setFixedSize(224, 188)
+        power_stage.setFixedSize(360, 188)
         power_stage.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         power_stage.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         power_stage.setStyleSheet("background: transparent;")
@@ -5540,7 +5870,13 @@ class MainWindow(QMainWindow):
         power_button_row = QHBoxLayout()
         power_button_row.setContentsMargins(0, 0, 0, 0)
         power_button_row.setSpacing(0)
-        power_button_row.addStretch(1)
+        self.power_previous_btn = QToolButton(power_stage)
+        self.power_previous_btn.setObjectName("PowerModePreviousButton")
+        self.power_previous_btn.setFixedSize(46, 46)
+        self.power_previous_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.power_previous_btn.clicked.connect(lambda: self._select_adjacent_runtime_mode(-1))
+        power_button_row.addWidget(self.power_previous_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        power_button_row.addSpacing(22)
         self.power_button = AnimatedPowerButton(power_stage)
         self.power_button.setProperty("class", "power")
         self.power_button.setIcon(self._icon("power.svg"))
@@ -5551,68 +5887,33 @@ class MainWindow(QMainWindow):
         self._attach_button_animations(self.power_button)
         self.power_button.set_power_theme(self.context.settings.get().theme)
         power_button_row.addWidget(self.power_button, 0, Qt.AlignmentFlag.AlignHCenter)
-        power_button_row.addStretch(1)
+        power_button_row.addSpacing(22)
+        self.power_next_btn = QToolButton(power_stage)
+        self.power_next_btn.setObjectName("PowerModeNextButton")
+        self.power_next_btn.setFixedSize(46, 46)
+        self.power_next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.power_next_btn.clicked.connect(lambda: self._select_adjacent_runtime_mode(1))
+        power_button_row.addWidget(self.power_next_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         power_stage_layout.addLayout(power_button_row)
         power_stage_layout.addStretch(1)
+
+        self.power_mode_title = QLabel()
+        self.power_mode_title.setObjectName("PowerModeTitle")
+        self.power_mode_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.power_mode_title.setProperty("class", "title")
+        self.power_mode_title.setMinimumHeight(24)
 
         self.power_caption = QWidget()
         self.power_caption.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.power_caption.setStyleSheet("background: transparent;")
-        self.power_caption.setFixedWidth(304)
+        self.power_caption.setFixedWidth(220)
         caption_layout = QHBoxLayout(self.power_caption)
         caption_layout.setContentsMargins(0, 0, 0, 0)
         caption_layout.setSpacing(8)
-        self.power_vpn_btn = QToolButton(self.power_caption)
-        self.power_vpn_btn.setObjectName("PowerVpnButton")
-        self.power_vpn_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.power_vpn_btn.setIcon(
-            self._build_tinted_icon(
-                self._icons_dir / self._vpn_icon_name(),
-                self._themed_icon_color(self._vpn_icon_name()) or QColor("#f3f7ff"),
-                fill_ratio=0.72,
-                offset_x=0.4,
-                offset_y=1.0,
-            )
-        )
-        self.power_vpn_btn.setIconSize(QSize(16, 16))
-        self.power_vpn_btn.setFixedSize(30, 30)
-        self.power_vpn_btn.setToolTip("goshkow vpn")
-        self.power_vpn_btn.clicked.connect(self._handle_power_vpn_button)
-        self._attach_button_animations(self.power_vpn_btn)
-
-        self.power_reconfigure_slot = QWidget(self.power_caption)
-        self.power_reconfigure_slot.setObjectName("PowerReconfigureSlot")
-        self.power_reconfigure_slot.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.power_reconfigure_slot.setStyleSheet("#PowerReconfigureSlot { background: transparent; border: none; }")
-        self.power_reconfigure_slot.setFixedHeight(30)
-        self.power_reconfigure_slot.setMinimumWidth(30)
-        self.power_reconfigure_slot.setMaximumWidth(30)
-        reconfigure_slot_layout = QHBoxLayout(self.power_reconfigure_slot)
-        reconfigure_slot_layout.setContentsMargins(0, 0, 0, 0)
-        reconfigure_slot_layout.setSpacing(0)
-
-        self.power_reconfigure_btn = QToolButton(self.power_reconfigure_slot)
-        self.power_reconfigure_btn.setObjectName("PowerReconfigureButton")
-        self.power_reconfigure_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.power_reconfigure_btn.setIcon(
-            self._build_tinted_icon(
-                self._icons_dir / "rerun.svg",
-                self._themed_icon_color("refresh.svg") or QColor("#f3f7ff"),
-                fill_ratio=0.82,
-                offset_x=-0.8,
-                offset_y=1.8,
-            )
-        )
-        self.power_reconfigure_btn.setIconSize(QSize(15, 15))
-        self.power_reconfigure_btn.setFixedSize(30, 30)
-        self.power_reconfigure_btn.setToolTip(self._t("Подобрать настройки", "Find settings"))
-        self.power_reconfigure_btn.clicked.connect(self._restart_onboarding_from_dashboard)
-        self._attach_button_animations(self.power_reconfigure_btn)
-        self._power_reconfigure_opacity = QGraphicsOpacityEffect(self.power_reconfigure_btn)
-        self._power_reconfigure_opacity.setOpacity(1.0)
-        self.power_reconfigure_btn.setGraphicsEffect(self._power_reconfigure_opacity)
-        self._sync_power_reconfigure_button_style()
-        reconfigure_slot_layout.addWidget(self.power_reconfigure_btn, 0, Qt.AlignmentFlag.AlignCenter)
+        self.power_vpn_btn = None
+        self.power_reconfigure_slot = None
+        self.power_reconfigure_btn = None
+        self._power_reconfigure_opacity = None
         self.power_caption_text = QLabel("OFF")
         self.power_caption_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.power_caption_text.setProperty("class", "title")
@@ -5624,11 +5925,10 @@ class MainWindow(QMainWindow):
         self._power_caption_dots_blur = None
         self._power_caption_dots_opacity = None
         caption_layout.addStretch(1)
-        caption_layout.addWidget(self.power_vpn_btn, 0, Qt.AlignmentFlag.AlignCenter)
         caption_layout.addWidget(self.power_caption_text, 0, Qt.AlignmentFlag.AlignCenter)
-        caption_layout.addWidget(self.power_reconfigure_slot, 0, Qt.AlignmentFlag.AlignCenter)
         caption_layout.addStretch(1)
         power_block_layout.addWidget(power_stage, 0, Qt.AlignmentFlag.AlignHCenter)
+        power_block_layout.addWidget(self.power_mode_title, 0, Qt.AlignmentFlag.AlignHCenter)
         power_block_layout.addWidget(self.power_caption, 0, Qt.AlignmentFlag.AlignHCenter)
         self._power_aura_host = top
         self._power_block = power_block
@@ -6279,7 +6579,7 @@ class MainWindow(QMainWindow):
                 "General",
                 self._t("Редактировать доступные general-конфигурации Zapret.", "Edit available Zapret general configurations."),
                 "generals",
-                "components.svg",
+                "files_general.svg",
             ),
             (
                 "Hosts",
@@ -6288,7 +6588,7 @@ class MainWindow(QMainWindow):
                     "Open the local .service/hosts file from the bundled Zapret runtime.",
                 ),
                 "hosts",
-                "files.svg",
+                "files_hosts.svg",
             ),
             (
                 self._t("Редактирование файлов", "Advanced editor"),
@@ -7113,6 +7413,8 @@ class MainWindow(QMainWindow):
         self._page_transition_target = index
         self._page_transition_running = True
         self._page_transition_started_at = time.monotonic()
+        if index == 0:
+            self._prime_dashboard_reconfigure_button()
         fade_out = QPropertyAnimation(effect, b"opacity", self)
         fade_out.setDuration(60)
         fade_out.setStartValue(1.0)
@@ -7140,6 +7442,7 @@ class MainWindow(QMainWindow):
         def _start_fade_in() -> None:
             self.pages.setCurrentIndex(index)
             if index == 0:
+                self._prime_dashboard_reconfigure_button()
                 self.refresh_dashboard()
             self._prepare_page_geometry_for_index(index)
             fade_in = QPropertyAnimation(effect, b"opacity", self)
@@ -7194,7 +7497,7 @@ class MainWindow(QMainWindow):
                     self.hide()
                     self._taskbar_restore_fade_waiting = False
                     self._pending_show_fade_reason = ""
-                    if not self._tray_notifications_shown:
+                    if bool(getattr(self.context.settings.get(), "show_tray_hide_notification", True)) and not self._tray_notifications_shown:
                         self.tray_icon.showMessage("Zapret Hub", self._t("Приложение свернуто в трей.", "Minimized to tray."), QSystemTrayIcon.MessageIcon.Information, 2200)
                         self._tray_notifications_shown = True
                 elif pending == "minimize":
@@ -7219,10 +7522,11 @@ class MainWindow(QMainWindow):
             self.context.settings.get().theme,
             self.context.settings.get().language,
         )
-        if self._settings_dialog is None or self._settings_dialog_signature != signature:
-            if self._settings_dialog is not None:
-                self._settings_dialog.deleteLater()
-            self._settings_dialog = SettingsDialog(self, self.context)
+        if self._settings_dialog is not None:
+            self._settings_dialog.deleteLater()
+        # The VPN tab depends on the current subscription state, so the dialog
+        # must be rebuilt each time rather than reusing stale page structure.
+        self._settings_dialog = SettingsDialog(self, self.context)
         self._settings_dialog_signature = signature
         dialog = self._settings_dialog
         if self._pending_settings_payload is not None:
@@ -7487,7 +7791,7 @@ class MainWindow(QMainWindow):
             self._notify_component_errors_from_payload(payload)
         self._notify_telegram_proxy_status_from_payload(payload)
         self._notify_zapret_restart_from_payload(payload)
-        if action in {"update_zapret_runtime", "update_tg_ws_proxy_runtime"}:
+        if action in {"update_zapret_runtime", "update_zapret2_runtime", "update_tg_ws_proxy_runtime"}:
             self._invalidate_general_options_cache()
             self._page_payload_cache.clear()
         elif action in {"toggle_mod", "toggle_component_enabled", "move_mod", "set_mod_emoji", "install_mod", "remove_mod", "import_mod_from_github", "import_mod_from_paths", "import_mod_from_path", "rebuild_merge_runtime", "set_selected_services", "select_runtime_mode", "toggle_goshkow_vpn_mode", "import_goshkow_vpn_subscription", "refresh_goshkow_vpn_subscription", "update_goshkow_vpn_settings", "reset_goshkow_vpn_traffic", "refresh_xbox_dns"}:
@@ -7642,6 +7946,18 @@ class MainWindow(QMainWindow):
                 self._show_error("Zapret", message)
             self._mark_dirty("dashboard", "components", "files", "logs")
             return
+        if action == "update_zapret2_runtime":
+            self._close_component_update_dialog()
+            status = str(payload.get("status", ""))
+            if status == "updated":
+                self._show_info("Zapret2", self._t("Zapret2 успешно обновлён.", "Zapret2 was updated successfully."))
+                self._add_notification("success", "Zapret2", self._t("Zapret2 успешно обновлён.", "Zapret2 was updated successfully."), source="zapret2")
+            else:
+                message = str(payload.get("error", self._t("Не удалось обновить Zapret2.", "Failed to update Zapret2.")))
+                self._add_notification("error", "Zapret2", message, source="zapret2", details={"dedupe_key": f"update-error:zapret2:{message}"})
+                self._show_error("Zapret2", message)
+            self._mark_dirty("dashboard", "components", "files", "logs")
+            return
         if action == "update_tg_ws_proxy_runtime":
             self._close_component_update_dialog()
             status = str(payload.get("status", ""))
@@ -7718,7 +8034,7 @@ class MainWindow(QMainWindow):
             self._settings_diag_dialog = None
             self._settings_diag_status_label = None
             self._settings_diag_progress_bar = None
-        if action in {"update_zapret_runtime", "update_tg_ws_proxy_runtime"}:
+        if action in {"update_zapret_runtime", "update_zapret2_runtime", "update_tg_ws_proxy_runtime"}:
             self._close_component_update_dialog()
         title = self._backend_error_title(source)
         self._add_notification(
@@ -7741,6 +8057,8 @@ class MainWindow(QMainWindow):
             return "tg-ws-proxy"
         if "goshkow_vpn" in normalized or "goshkow-vpn" in normalized or "vpn" in normalized:
             return "goshkow-vpn"
+        if "zapret2" in normalized:
+            return "zapret2"
         if "zapret" in normalized or "general" in normalized or "merge" in normalized:
             return "zapret"
         if "mod" in normalized:
@@ -7761,6 +8079,7 @@ class MainWindow(QMainWindow):
             "goshkow-vpn": "goshkow vpn",
             "xbox-dns": "XBox DNS",
             "zapret": "Zapret",
+            "zapret2": "Zapret2",
             "mods": self._t("Модификации", "Mods"),
             "settings": self._t("Настройки", "Settings"),
             "files": self._t("Файлы", "Files"),
@@ -9313,7 +9632,7 @@ class MainWindow(QMainWindow):
             self.power_button.set_loading_state(True, animate=True)
         if self.power_aura is not None:
             self.power_aura.set_idle_pulse_enabled(False)
-            self.power_aura.set_status_glow_enabled(True)
+            self.power_aura.set_status_glow_enabled(False)
         self._update_power_icon()
 
     def _toggle_component_card(self, component_id: str, button: QPushButton) -> None:
@@ -9613,7 +9932,6 @@ class MainWindow(QMainWindow):
         self._submit_backend_task("rebuild_merge_runtime", action_id="__merge_rebuild__")
 
     def _check_updates_popup(self) -> None:
-        self._stop_goshkow_vpn_before_update_flow()
         self._start_update_check(manual=True)
 
     def _stop_goshkow_vpn_before_update_flow(self) -> None:
@@ -9953,10 +10271,25 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _run_update_prepare_worker(self, release: dict[str, str]) -> None:
+        stopped_for_download: list[str] = []
         try:
+            states = {item.component_id: item for item in self.context.processes.list_states()}
+            for component_id, state in states.items():
+                if str(getattr(state, "status", "") or "").strip().lower() != "running":
+                    continue
+                try:
+                    self.context.processes.stop_component(component_id)
+                    stopped_for_download.append(component_id)
+                except Exception:
+                    pass
             prepared = self.context.updates.prepare_update(release)
             self._ui_signals.update_prepare_done.emit({"ok": True, "prepared": prepared})
         except Exception as error:
+            for component_id in stopped_for_download:
+                try:
+                    self.context.processes.start_component(component_id)
+                except Exception:
+                    pass
             self._ui_signals.update_prepare_done.emit({"ok": False, "error": str(error)})
 
     def _on_update_prepare_done(self, payload: object) -> None:
@@ -10681,6 +11014,111 @@ class MainWindow(QMainWindow):
         if self._loading_overlay_context == f"page:{section}":
             self._hide_loading_overlay()
 
+    def _runtime_mode_order(self) -> list[str]:
+        configured = list(getattr(self.context.settings.get(), "runtime_mode_order", []) or [])
+        vpn_state = self.context.vpn.state()
+        vpn_available = str(vpn_state.get("subscription_state", "") or "") == "valid"
+        allowed = tuple(
+            mode
+            for mode in ("zapret", "goshkow-vpn", "zapret2")
+            if mode != "goshkow-vpn" or vpn_available
+        )
+        order = [str(mode) for mode in configured if str(mode) in allowed]
+        order.extend(mode for mode in allowed if mode not in order)
+        return order or ["zapret"]
+
+    def _runtime_mode_title(self, mode: str) -> str:
+        return {
+            "zapret": "Zapret",
+            "goshkow-vpn": "goshkow vpn",
+            "zapret2": "Zapret2",
+        }.get(mode, self._t("Без обхода", "No bypass"))
+
+    def _runtime_mode_color(self, mode: str) -> QColor:
+        return QColor({
+            "zapret": "#24a969",
+            "goshkow-vpn": "#8454d8",
+            "zapret2": "#3d78d8",
+        }.get(mode, "#777777"))
+
+    def _sync_runtime_mode_switcher(self) -> None:
+        if not hasattr(self, "power_mode_title"):
+            return
+        settings = self.context.settings.get()
+        selected = str(getattr(settings, "selected_runtime_mode", "zapret") or "zapret")
+        order = self._runtime_mode_order()
+        if selected not in order:
+            selected = order[0]
+            self.context.settings.update(selected_runtime_mode=selected)
+        index = order.index(selected)
+        self.power_mode_title.setText(self._runtime_mode_title(selected))
+        if isinstance(self.power_button, AnimatedPowerButton):
+            self.power_button.set_runtime_mode(selected)
+        for button, neighbor, direction in (
+            (getattr(self, "power_previous_btn", None), order[index - 1] if index > 0 else "", "left"),
+            (getattr(self, "power_next_btn", None), order[index + 1] if index + 1 < len(order) else "", "right"),
+        ):
+            if button is None:
+                continue
+            available = bool(neighbor)
+            button.setVisible(True)
+            button.setEnabled(available and not self._toggle_in_progress)
+            if not available:
+                button.setIcon(QIcon())
+                button.setToolTip("")
+                button.setStyleSheet("QToolButton { background: transparent; border: none; }")
+                continue
+            color = self._runtime_mode_color(neighbor)
+            border = self._runtime_mode_color(neighbor)
+            border.setAlpha(72)
+            icon_name = "arrow_left.svg" if direction == "left" else "arrow_right.svg"
+            icon_color = QColor("#1f1f1f" if is_light_theme(settings.theme) else "#ffffff")
+            button.setIcon(self._build_tinted_icon(self._icons_dir / icon_name, icon_color))
+            button.setIconSize(QSize(15, 15))
+            button.setToolTip(self._runtime_mode_title(neighbor))
+            red, green, blue = color.red(), color.green(), color.blue()
+            if direction == "left":
+                gradient = (
+                    f"qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                    f"stop:0 rgba({red},{green},{blue},76), stop:0.62 rgba({red},{green},{blue},42), "
+                    f"stop:1 rgba({red},{green},{blue},10))"
+                )
+                hover_gradient = (
+                    f"qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                    f"stop:0 rgba({red},{green},{blue},118), stop:0.62 rgba({red},{green},{blue},68), "
+                    f"stop:1 rgba({red},{green},{blue},18))"
+                )
+            else:
+                gradient = (
+                    f"qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                    f"stop:0 rgba({red},{green},{blue},10), stop:0.38 rgba({red},{green},{blue},42), "
+                    f"stop:1 rgba({red},{green},{blue},76))"
+                )
+                hover_gradient = (
+                    f"qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                    f"stop:0 rgba({red},{green},{blue},18), stop:0.38 rgba({red},{green},{blue},68), "
+                    f"stop:1 rgba({red},{green},{blue},118))"
+                )
+            button.setStyleSheet(
+                f"QToolButton {{ background: {gradient}; "
+                f"border: 1px solid {border.name(QColor.NameFormat.HexArgb)}; border-radius: 23px; }}"
+                f"QToolButton:hover {{ background: {hover_gradient}; }}"
+            )
+
+    def _select_adjacent_runtime_mode(self, direction: int) -> None:
+        order = self._runtime_mode_order()
+        current = str(getattr(self.context.settings.get(), "selected_runtime_mode", "zapret") or "zapret")
+        if current not in order:
+            current = order[0]
+        target_index = order.index(current) + (1 if direction > 0 else -1)
+        if not 0 <= target_index < len(order):
+            return
+        target = order[target_index]
+        self.context.settings.update(selected_runtime_mode=target)
+        self._sync_runtime_mode_switcher()
+        self._mark_dirty("dashboard", "components", "tray")
+        self._submit_backend_task("select_runtime_mode", {"mode": target}, action_id=target)
+
     def _prime_dashboard_reconfigure_button(self) -> None:
         if self.power_reconfigure_btn is None or self.power_reconfigure_slot is None:
             return
@@ -10703,6 +11141,7 @@ class MainWindow(QMainWindow):
             self._refresh_dirty_sections.add("dashboard")
             return
         settings = self.context.settings.get()
+        self._sync_runtime_mode_switcher()
         if not self._startup_snapshot_ready:
             self._ensure_local_runtime_snapshot()
         if not self._startup_snapshot_ready:
@@ -10714,7 +11153,7 @@ class MainWindow(QMainWindow):
             if self.power_aura is not None:
                 self.power_aura.set_vpn_accent_state(False)
                 self.power_aura.set_idle_pulse_enabled(False)
-                self.power_aura.set_status_glow_enabled(True)
+                self.power_aura.set_status_glow_enabled(False)
             self._set_power_reconfigure_visible(True, animate=False)
             if self.power_caption_dots is not None:
                 self.power_caption_dots.setText("")
@@ -10732,6 +11171,11 @@ class MainWindow(QMainWindow):
             self._refresh_general_combo(settings.selected_zapret_general)
         states = self._component_states()
         components = self._component_defs()
+        selected_runtime_mode = str(getattr(settings, "selected_runtime_mode", "zapret") or "zapret")
+        if selected_runtime_mode not in {"zapret", "zapret2", "goshkow-vpn"}:
+            selected_runtime_mode = "zapret"
+        selected_runtime_state = states.get(selected_runtime_mode)
+        selected_runtime_component = components.get(selected_runtime_mode)
         active_ids = self._master_active_components()
         zapret_state = states.get("zapret", None)
         tg_state = states.get("tg-ws-proxy", None)
@@ -10755,11 +11199,8 @@ class MainWindow(QMainWindow):
             self.power_button.set_vpn_accent_state(vpn_running and fully_running)
         if self.power_aura is not None:
             self.power_aura.set_vpn_accent_state(vpn_running and fully_running)
-            self.power_aura.set_idle_pulse_enabled(fully_running and not self._toggle_in_progress)
-            self.power_aura.set_status_glow_enabled(fully_running or self._toggle_in_progress)
-        reconfigure_visible = not (vpn_display_selected or vpn_running or self._vpn_mode_switch_in_progress)
-        animate_reconfigure = not (self._page_transition_running or self._dashboard_page_opening)
-        self._set_power_reconfigure_visible(reconfigure_visible, animate=animate_reconfigure)
+            self.power_aura.set_idle_pulse_enabled(False)
+            self.power_aura.set_status_glow_enabled(False)
         if self.power_caption_dots is not None:
             self.power_caption_dots.setText("")
             self.power_caption_dots.hide()
@@ -10769,27 +11210,36 @@ class MainWindow(QMainWindow):
                 self._set_power_status_pill(self._t("Нет компонентов", "No components"), "off")
                 self._power_caption_base_text = self._t("НЕТ КОМПОНЕНТОВ", "NO COMPONENTS")
         else:
-            if fully_running and vpn_running:
+            selected_runtime_running = bool(
+                selected_runtime_state and str(getattr(selected_runtime_state, "status", "") or "") == "running"
+            )
+            if selected_runtime_mode == "goshkow-vpn" and selected_runtime_running:
                 location = self._current_goshkow_vpn_location_label()
                 target_caption = f"{self._t('Подключено', 'Connected')} · {location}" if location else self._t("Подключено", "Connected")
                 target_state = "vpn"
             else:
-                target_caption = self._t("Включено", "On") if fully_running else (self._t("Частично", "Partial") if any_running else self._t("Выключено", "Off"))
-                target_state = "on" if fully_running else ("partial" if any_running else "off")
+                target_caption, _ = self._component_badge_state(
+                    selected_runtime_component,
+                    selected_runtime_state,
+                    any_running,
+                )
+                target_state = "on" if selected_runtime_running else ("partial" if any_running else "off")
             if self.power_caption_text is not None:
                 self._set_power_status_pill(target_caption, target_state)
                 self._power_caption_base_text = target_caption
 
-        enabled_mods = list(settings.enabled_mod_ids or [])
+        try:
+            enabled_mods = [item.id for item in self.context.mods.list_installed() if item.enabled]
+        except Exception:
+            enabled_mods = list(settings.enabled_mod_ids or [])
 
         self._set_badge("app", self._t("Работает", "Running") if fully_running else (self._t("Частично", "Partial") if any_running else self._t("Ожидание", "Idle")), "status_ok.svg" if fully_running else ("status_warn.svg" if any_running else "status_off.svg"))
-        show_vpn_badge = vpn_display_selected or vpn_running
-        if show_vpn_badge:
-            zapret_text, zapret_icon = self._component_badge_state(components.get("goshkow-vpn"), vpn_state, any_running)
-            self._set_badge_title("zapret", self._t("VPN", "VPN"))
-        else:
-            zapret_text, zapret_icon = self._component_badge_state(components.get("zapret"), zapret_state, any_running)
-            self._set_badge_title("zapret", "Zapret")
+        zapret_text, zapret_icon = self._component_badge_state(
+            selected_runtime_component,
+            selected_runtime_state,
+            any_running,
+        )
+        self._set_badge_title("zapret", self._runtime_mode_title(selected_runtime_mode))
         tg_text, tg_icon = self._component_badge_state(components.get("tg-ws-proxy"), tg_state, any_running)
         self._set_badge("zapret", zapret_text, zapret_icon)
         self._set_badge("tg", tg_text, tg_icon)
@@ -10802,7 +11252,7 @@ class MainWindow(QMainWindow):
         self._sync_power_vpn_button_style()
         text_color, accent, alpha = self._power_status_palette(state)
         border = QColor(accent)
-        border.setAlpha(96 if state != "off" else 56)
+        border.setAlpha(72 if state != "off" else 46)
         fill = QColor(accent)
         fill.setAlpha(alpha)
         metrics = self.power_caption_text.fontMetrics()
@@ -10816,7 +11266,7 @@ class MainWindow(QMainWindow):
             f"color: {text_color};"
             f"background: {fill.name(QColor.NameFormat.HexArgb)};"
             f"border: 1px solid {border.name(QColor.NameFormat.HexArgb)};"
-            "border-radius: 15px;"
+            "border-radius: 14px;"
             "font-size: 12px;"
             "font-weight: 700;"
             "padding: 0 14px;"
@@ -10902,6 +11352,15 @@ class MainWindow(QMainWindow):
             and ((visible and current_width >= 30 and float(effect.opacity()) >= 0.99) or (not visible and current_width <= 0))
         )
         if already_visible:
+            if visible:
+                slot.setMinimumWidth(30)
+                slot.setMaximumWidth(30)
+                slot.setVisible(True)
+                button.setVisible(True)
+                button.setEnabled(True)
+                effect.setOpacity(1.0)
+                button.update()
+                slot.update()
             return
         self._power_reconfigure_visible = visible
         self._power_reconfigure_slot_visible = visible
@@ -11293,7 +11752,11 @@ class MainWindow(QMainWindow):
         active_set = set(active)
         if "goshkow-vpn" in active_set:
             active_set.discard("zapret")
+            active_set.discard("zapret2")
             active_set.discard("xbox-dns")
+        elif "zapret2" in active_set:
+            active_set.discard("zapret")
+            active_set.discard("goshkow-vpn")
         return [component_id for component_id in active if component_id in active_set]
 
     def _maybe_run_first_general_autotest(self) -> None:
@@ -11502,6 +11965,8 @@ class MainWindow(QMainWindow):
             return
 
     def _handle_onboarding_secondary_action(self) -> None:
+        if self._onboarding_transition_busy:
+            return
         if self._onboarding_stage == "services":
             self._skip_onboarding()
             return
@@ -11629,7 +12094,8 @@ class MainWindow(QMainWindow):
             self._onboarding_primary_btn.setVisible(True)
             self._onboarding_primary_btn.setText(self._t("Далее", "Next"))
         if self._onboarding_secondary_btn is not None:
-            self._onboarding_secondary_btn.hide()
+            self._onboarding_secondary_btn.setVisible(True)
+            self._onboarding_secondary_btn.setEnabled(True)
             self._onboarding_secondary_btn.setText(self._t("Пропустить", "Skip"))
         if self._onboarding_actions_widget is not None:
             self._onboarding_actions_widget.show()
@@ -11786,10 +12252,8 @@ class MainWindow(QMainWindow):
         self._mark_onboarding_seen()
         self.context.settings.update(general_autotest_done=True)
         self._submit_backend_task("set_general_autotest_done", {"done": True}, action_id="__autotest_declined__")
-        self._set_onboarding_visible(False)
-        self.refresh_all()
-        QTimer.singleShot(0, self._restore_sidebar_after_onboarding)
-        QTimer.singleShot(80, self._restore_sidebar_after_onboarding)
+        self._onboarding_quick_restart = False
+        self._fade_out_onboarding_to_app()
 
     def _start_onboarding_flow(self) -> None:
         if self._onboarding_running or self._onboarding_transition_busy:
@@ -12609,7 +13073,9 @@ class MainWindow(QMainWindow):
         if not badge:
             return
         badge.value_label.setText(text)
-        badge.icon_label.setPixmap(self._icon(icon_name).pixmap(18, 18))
+        icon_color = QColor("#1f1f1f" if is_light_theme(self.context.settings.get().theme) else "#ffffff")
+        icon = self._build_tinted_icon(self._icons_dir / icon_name, icon_color)
+        badge.icon_label.setPixmap(icon.pixmap(18, 18))
 
     def _set_badge_title(self, key: str, title: str) -> None:
         badge = self._status_badges.get(key)
@@ -12743,7 +13209,7 @@ class MainWindow(QMainWindow):
             components = list(self._component_defs().values())
         if not states and not explicit_payload:
             states = self._component_states()
-        order = {"zapret": 0, "goshkow-vpn": 1, "tg-ws-proxy": 2, "xbox-dns": 3}
+        order = {"zapret": 0, "zapret2": 1, "goshkow-vpn": 2, "tg-ws-proxy": 3, "xbox-dns": 4}
         components = sorted(components, key=lambda item: order.get(item.id, 99))
         self.components_list.clear()
         self._components_card_by_id = {}
@@ -12774,7 +13240,7 @@ class MainWindow(QMainWindow):
             state = states.get(component.id)
             status_text = state.status if state else "stopped"
             subtitle_parts = []
-            if component.id in {"zapret", "tg-ws-proxy"} and str(component.version or "").strip():
+            if component.id in {"zapret", "zapret2", "tg-ws-proxy"} and str(component.version or "").strip():
                 subtitle_parts.append(f"{self._t('Версия', 'Version')}: {component.version}")
             subtitle_parts.extend(
                 [
@@ -12785,7 +13251,7 @@ class MainWindow(QMainWindow):
             )
             subtitle = " | ".join(subtitle_parts)
             source = f"{self._t('Источник', 'Source')}: {component.source}"
-            display_name = {"zapret": "Zapret", "tg-ws-proxy": "Tg-Ws-Proxy", "goshkow-vpn": "goshkow vpn", "xbox-dns": "XBox DNS"}.get(component.id, component.name)
+            display_name = {"zapret": "Zapret", "zapret2": "Zapret2", "tg-ws-proxy": "Tg-Ws-Proxy", "goshkow-vpn": "goshkow vpn", "xbox-dns": "XBox DNS"}.get(component.id, component.name)
             item = QListWidgetItem(f"{display_name}\n{subtitle}\n{source}")
             item.setData(Qt.ItemDataRole.UserRole, component.id)
             item.setSizeHint(QSize(200, 70))
@@ -12821,6 +13287,10 @@ class MainWindow(QMainWindow):
                 "Классический способ обхода блокировок через DPI.",
                 "A classic DPI-based bypass method for blocked services.",
             ),
+            "zapret2": self._t(
+                "Экспериментальное новое поколение zapret от bol-van с winws2 и Lua-стратегиями. Не запускается вместе с классическим Zapret или VPN.",
+                "Experimental next-generation zapret by bol-van with winws2 and Lua strategies. It does not run together with classic Zapret or VPN.",
+            ),
             "tg-ws-proxy": self._t(
                 "Локальный Telegram Proxy. Позволяет подключаться к Telegram в обход блокировок, маскируясь под обычный https-трафик.",
                 "Local Telegram Proxy. Lets Telegram connect through restrictions by blending in with regular HTTPS traffic.",
@@ -12836,6 +13306,7 @@ class MainWindow(QMainWindow):
         }
         icons = {
             "zapret": "component_zapret.svg",
+            "zapret2": "component_zapret2.svg",
             "tg-ws-proxy": "component_tg.svg",
             "goshkow-vpn": self._vpn_icon_name(),
             "xbox-dns": "component_xbox_dns.svg",
@@ -12853,7 +13324,7 @@ class MainWindow(QMainWindow):
         for index, component in enumerate(components):
             state = states.get(component.id)
             status_text, _status_icon = self._component_badge_state(component, state, any_running=False)
-            display_name = {"zapret": "Zapret", "tg-ws-proxy": "Tg-Ws-Proxy", "goshkow-vpn": "goshkow vpn", "xbox-dns": "XBox DNS"}.get(component.id, component.name)
+            display_name = {"zapret": "Zapret", "zapret2": "Zapret2", "tg-ws-proxy": "Tg-Ws-Proxy", "goshkow-vpn": "goshkow vpn", "xbox-dns": "XBox DNS"}.get(component.id, component.name)
             card, card_layout = self._card()
             card.setMinimumWidth(360)
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
@@ -12899,7 +13370,7 @@ class MainWindow(QMainWindow):
                 settings_icon_btn.clicked.connect(lambda _=False, cid=component.id: self._open_component_settings(cid))
                 self._attach_button_animations(settings_icon_btn)
                 icon_row.addWidget(settings_icon_btn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
-            if component.id in {"zapret", "tg-ws-proxy", "goshkow-vpn", "xbox-dns"}:
+            if component.id in {"zapret", "zapret2", "tg-ws-proxy", "goshkow-vpn", "xbox-dns"}:
                 source_icon_btn = QToolButton()
                 source_icon_btn.setProperty("class", "action")
                 source_icon_btn.setIcon(self._icon("external.svg"))
@@ -12918,12 +13389,16 @@ class MainWindow(QMainWindow):
                     update_icon_btn.setToolTip(
                         self._t("Обновить Zapret", "Update Zapret")
                         if component.id == "zapret"
+                        else self._t("Обновить Zapret2", "Update Zapret2")
+                        if component.id == "zapret2"
                         else self._t("Обновить DNS", "Refresh DNS")
                         if component.id == "xbox-dns"
                         else self._t("Обновить TG WS Proxy", "Update TG WS Proxy")
                     )
                     if component.id == "zapret":
                         update_icon_btn.clicked.connect(self._update_zapret_runtime)
+                    elif component.id == "zapret2":
+                        update_icon_btn.clicked.connect(self._update_zapret2_runtime)
                     elif component.id == "xbox-dns":
                         update_icon_btn.clicked.connect(self._refresh_xbox_dns)
                     else:
@@ -12948,12 +13423,12 @@ class MainWindow(QMainWindow):
             desc.setWordWrap(True)
             card_layout.addWidget(desc)
 
-            author = "goshkow" if component.id == "goshkow-vpn" else "xbox-dns.ru" if component.id == "xbox-dns" else "Flowseal"
+            author = "goshkow" if component.id == "goshkow-vpn" else "xbox-dns.ru" if component.id == "xbox-dns" else "bol-van" if component.id == "zapret2" else "Flowseal"
             detail_lines = [
                 f"{self._t('Автор', 'Author')}: {author}",
                 f"{self._t('Статус', 'Status')}: {status_text}",
             ]
-            if component.id in {"zapret", "tg-ws-proxy"} and str(component.version or "").strip():
+            if component.id in {"zapret", "zapret2", "tg-ws-proxy"} and str(component.version or "").strip():
                 detail_lines.append(f"{self._t('Версия', 'Version')}: {component.version}")
             details = QLabel("\n".join(detail_lines))
             details.setProperty("class", "muted")
@@ -13023,6 +13498,17 @@ class MainWindow(QMainWindow):
                 config_row.addWidget(favorite_btn, 0)
                 card_layout.addLayout(config_row)
                 card_layout.addWidget(config_status)
+                reconfigure_btn = QPushButton(self._t("Настроить заново", "Configure again"))
+                reconfigure_btn.setProperty("class", "secondary")
+                reconfigure_btn.setToolTip(
+                    self._t(
+                        "Открыть первоначальную настройку и подобрать конфигурацию Zapret.",
+                        "Open initial setup and choose a Zapret configuration.",
+                    )
+                )
+                reconfigure_btn.clicked.connect(self._restart_onboarding_from_dashboard)
+                self._attach_button_animations(reconfigure_btn)
+                card_layout.addWidget(reconfigure_btn)
 
             if component.id == "tg-ws-proxy":
                 telegram_link = QLabel()
@@ -13214,6 +13700,14 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self._close_component_update_dialog()
             self._show_error("Zapret", str(error))
+
+    def _update_zapret2_runtime(self) -> None:
+        try:
+            self._show_component_update_dialog("Zapret2")
+            self._submit_backend_task("update_zapret2_runtime")
+        except Exception as error:
+            self._close_component_update_dialog()
+            self._show_error("Zapret2", str(error))
 
     def _update_tg_ws_proxy_runtime(self) -> None:
         try:

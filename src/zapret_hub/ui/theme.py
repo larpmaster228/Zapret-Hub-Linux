@@ -13,7 +13,7 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     QWidget {
         background: #0f1420;
         color: #d9e0f0;
-        font-family: "JetBrains Sans", "Segoe UI Variable", "Segoe UI", "Arial", "Noto Sans", sans-serif;
+        font-family: "Inter";
         font-size: 10pt;
     }
     #WindowShell {
@@ -38,6 +38,7 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         border: none;
         border-top-left-radius: 16px;
         border-top-right-radius: 16px;
+        font-family: "JetBrains Sans";
     }
     #Sidebar {
         background: #101726;
@@ -521,7 +522,7 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
     QWidget {
         background: #eef2f8;
         color: #1f2a3d;
-        font-family: "JetBrains Sans", "Segoe UI Variable", "Segoe UI", "Arial", "Noto Sans", sans-serif;
+        font-family: "Inter";
         font-size: 10pt;
     }
     #WindowShell {
@@ -546,6 +547,7 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         border: none;
         border-top-left-radius: 16px;
         border-top-right-radius: 16px;
+        font-family: "JetBrains Sans";
     }
     #Sidebar {
         background: #f3f6fd;
@@ -1087,26 +1089,47 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
 
     oled = (
         dark
-        .replace("#151618", "#0a0b0d")
-        .replace("#181a1d", "#0d0f12")
-        .replace("#15171a", "#101215")
-        .replace("#1a1c20", "#13161a")
-        .replace("#181a1e", "#121418")
-        .replace("#181b1f", "#111318")
-        .replace("#20242a", "#171a20")
-        .replace("#2e333b", "#232730")
-        .replace("#31363f", "#252a33")
-        .replace("#373d46", "#2a2f38")
-        .replace("#363c45", "#292d36")
-        .replace("#474d57", "#393e48")
-        .replace("#131518", "#0c0e11")
-        .replace("#363b45", "#272b34")
-        .replace("#2b3038", "#20242c")
+        .replace("#151618", "#0b0b0b")
+        .replace("#181a1d", "#0f0f0f")
+        .replace("#15171a", "#121212")
+        .replace("#1a1c20", "#161616")
+        .replace("#181a1e", "#141414")
+        .replace("#181b1f", "#131313")
+        .replace("#20242a", "#1a1a1a")
+        .replace("#2e333b", "#272727")
+        .replace("#31363f", "#2a2a2a")
+        .replace("#373d46", "#2f2f2f")
+        .replace("#363c45", "#2d2d2d")
+        .replace("#474d57", "#3e3e3e")
+        .replace("#131518", "#0e0e0e")
+        .replace("#363b45", "#2b2b2b")
+        .replace("#2b3038", "#242424")
         .replace("rgba(255, 255, 255, 0.035)", "rgba(255, 255, 255, 0.025)")
         .replace("rgba(255, 255, 255, 0.075)", "rgba(255, 255, 255, 0.055)")
-        .replace("#1f2329", "#181b20")
-        .replace("#1d2127", "#16191e")
-        .replace("#6b7280", "#646c79")
+        .replace("#1f2329", "#1b1b1b")
+        .replace("#1d2127", "#191919")
+        .replace("#6b7280", "#6b6b6b")
+        .replace("#d9e0f0", "#e0e0e0")
+        .replace("#f5f7fc", "#f7f7f7")
+        .replace("#90a1c2", "#a0a0a0")
+        .replace("#a9b8d8", "#b8b8b8")
+        .replace("#f8fbff", "#fbfbfb")
+        .replace("#d7e1f2", "#e0e0e0")
+        .replace("#afbdd9", "#bcbcbc")
+        .replace("#d6e4ff", "#e3e3e3")
+        .replace("#bcc9df", "#c8c8c8")
+        .replace("#37568a", "#565656")
+        .replace("#4a628c", "#626262")
+        .replace("#90a5ff", "#aaaaaa")
+        .replace("#6366f1", "#777777")
+        .replace("#7c85ff", "#919191")
+        .replace("#17233a", "#232323")
+        .replace("#2e4269", "#424242")
+        .replace("#253c62", "#3c3c3c")
+        .replace("#5f80bc", "#808080")
+        .replace("#203352", "#333333")
+        .replace("#1d2940", "#292929")
+        .replace("#dbe4f5", "#e3e3e3")
     )
 
     light_blue = (
@@ -1151,5 +1174,48 @@ def build_stylesheet(theme: str, chevron_icon: str = "", check_icon: str = "") -
         "light blue": light_blue,
     }
     style = styles.get(theme, dark)
+    if is_light_theme(theme):
+        runtime_order_style = """
+        QListWidget#RuntimeOrderList { background: rgba(31,42,61,0.035); border: 1px solid rgba(31,42,61,0.12); border-radius: 10px; padding: 3px; }
+        QListWidget#RuntimeOrderList::item { color: #1f2a3d; border-radius: 7px; padding: 7px 10px; }
+        QListWidget#RuntimeOrderList::item:selected, QListWidget#RuntimeOrderList::item:hover { background: rgba(31,42,61,0.08); }
+        """
+    else:
+        runtime_order_style = """
+        QListWidget#RuntimeOrderList { background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.09); border-radius: 10px; padding: 3px; }
+        QListWidget#RuntimeOrderList::item { color: #e4e4e4; border-radius: 7px; padding: 7px 10px; }
+        QListWidget#RuntimeOrderList::item { background: rgba(255,255,255,0.018); border: 1px solid rgba(255,255,255,0.045); color: #e4e4e4; border-radius: 7px; padding: 7px 10px; }
+        QListWidget#RuntimeOrderList::item:selected, QListWidget#RuntimeOrderList::item:hover { background: rgba(255,255,255,0.055); border-color: rgba(255,255,255,0.10); }
+        """
+    if is_light_theme(theme):
+        settings_navigation_style = """
+        QWidget#SettingsTabsBar, QStackedWidget#SettingsPages, QWidget#ThemeSelector, QWidget#SettingsInlineRow { background: transparent; border: none; }
+        QPushButton#SettingsTabButton { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0px; color: #617087; padding: 9px 12px; font-weight: 600; }
+        QPushButton#SettingsTabButton:hover { color: #27364d; background: rgba(31,42,61,0.045); }
+        QPushButton#SettingsTabButton:checked { color: #1f2a3d; border-bottom-color: #596779; background: transparent; }
+        QToolButton#ThemeChoice { background: transparent; border: 1px solid transparent; border-radius: 10px; color: #1f2a3d; padding: 6px; font-weight: 500; }
+        QToolButton#ThemeChoice:hover { background: rgba(31,42,61,0.04); border-color: rgba(31,42,61,0.10); }
+        QToolButton#ThemeChoice:checked { background: rgba(31,42,61,0.055); border-color: #758196; }
+        QWidget#LanguageSelector { background: rgba(31,42,61,0.035); border: 1px solid rgba(31,42,61,0.10); border-radius: 11px; }
+        QPushButton#LanguageChoice { background: transparent; border: none; border-radius: 8px; color: #617087; }
+        QPushButton#LanguageChoice:hover { background: rgba(31,42,61,0.04); color: #27364d; }
+        QPushButton#LanguageChoice:checked { background: #ffffff; color: #1f2a3d; border: 1px solid #c9d3e0; font-weight: 600; }
+        """
+    else:
+        settings_navigation_style = """
+        QWidget#SettingsTabsBar, QStackedWidget#SettingsPages, QWidget#ThemeSelector, QWidget#SettingsInlineRow { background: transparent; border: none; }
+        QPushButton#SettingsTabButton { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0px; color: rgba(235,235,235,0.58); padding: 9px 12px; font-weight: 600; }
+        QPushButton#SettingsTabButton:hover { color: rgba(245,245,245,0.86); background: rgba(255,255,255,0.025); }
+        QPushButton#SettingsTabButton:checked { color: #f1f1f1; border-bottom-color: #757575; background: transparent; }
+        QToolButton#ThemeChoice { background: transparent; border: 1px solid transparent; border-radius: 10px; color: #e5e5e5; padding: 6px; font-weight: 500; }
+        QToolButton#ThemeChoice:hover { background: rgba(255,255,255,0.025); border-color: rgba(255,255,255,0.065); }
+        QToolButton#ThemeChoice:checked { background: rgba(255,255,255,0.035); border-color: #696969; }
+        QWidget#LanguageSelector { background: rgba(255,255,255,0.018); border: 1px solid rgba(255,255,255,0.065); border-radius: 11px; }
+        QPushButton#LanguageChoice { background: transparent; border: none; border-radius: 8px; color: rgba(235,235,235,0.60); }
+        QPushButton#LanguageChoice:hover { background: rgba(255,255,255,0.025); color: rgba(245,245,245,0.88); }
+        QPushButton#LanguageChoice:checked { background: rgba(255,255,255,0.075); color: #f1f1f1; border: 1px solid rgba(255,255,255,0.12); font-weight: 600; }
+        """
+    style += runtime_order_style
+    style += settings_navigation_style
     style = style.replace("__COMBO_ARROW__", arrow_rule)
     return style.replace("__CHECK_ICON__", check_rule)

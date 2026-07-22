@@ -2,21 +2,40 @@ from __future__ import annotations
 
 import ctypes
 import base64
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime
+import hashlib
+import json
 import locale
 import os
 import platform
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from installer.embedded_app_icon import APP_PNG_BASE64
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, Property, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, Signal
+from installer.common import (
+    INSTALLER_VERSION,
+    copy_bundled_uninstaller,
+    perform_uninstall,
+    terminate_running_instances,
+    write_uninstall_registry as _write_uninstall_registry_common,
+)
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, Property, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QShowEvent
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -50,7 +69,6 @@ def _is_ru() -> bool:
 RU = _is_ru()
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ZapretHub"
 INSTALLER_LOG_PATH = Path(tempfile.gettempdir()) / "zapret_hub_installer.log"
-INSTALLER_VERSION = "2.1.2"
 
 def tr(ru: str, en: str) -> str:
     return ru if RU else en
@@ -338,7 +356,7 @@ def _is_dangerous_install_dir(path: Path) -> bool:
 def _looks_like_zapret_hub_dir(path: Path) -> bool:
     if not path.exists():
         return False
-    return (path / "zapret_hub.exe").exists()
+    return any((path / name).exists() for name in ("zapret_hub.exe", "Zapret_Hub.exe", "uninstall_zaprethub.exe"))
 
 
 def _suggest_empty_install_dir(path: Path) -> Path:
@@ -359,6 +377,23 @@ def _suggest_safe_install_dir(path: Path) -> Path:
     if _normalized_path_text(path) == _normalized_path_text(program_files):
         return _suggest_empty_install_dir(path)
     return default_install_dir()
+
+
+def _resolve_requested_install_dir(path: Path) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).resolve()
+    if _looks_like_zapret_hub_dir(candidate):
+        return candidate
+    try:
+        has_items = candidate.exists() and any(candidate.iterdir())
+    except OSError:
+        has_items = True
+    if not candidate.exists() or not has_items:
+        return candidate
+    if candidate.name.casefold() == "zapret hub":
+        return candidate
+    return candidate / "Zapret Hub"
 
 
 def _native_windows_machine() -> str:
@@ -394,6 +429,278 @@ def detect_payload_name() -> str:
     if "arm" in machine or "aarch64" in machine:
         return "win_arm64.zip"
     return "win_x64.zip"
+
+
+UPDATE_URL = "https://goshkow.ru/zapret-hub/update"
+METADATA_TIMEOUT_SEC = 10.0
+DOWNLOAD_CONNECT_TIMEOUT_SEC = 12.0
+DOWNLOAD_STALL_TIMEOUT_SEC = 45.0
+REMOTE_VERSION_TIMEOUT_SEC = 4.0
+# Hard UI/connect ceiling: never leave the user on «Подключение…» longer than this.
+CONNECT_WATCHDOG_SEC = 15.0
+# Keep a generous ceiling for slow links (~130MB x64). Stall timeout covers freezes.
+DOWNLOAD_TOTAL_TIMEOUT_SEC = 30 * 60
+PROCESS_KILL_TIMEOUT_SEC = 12.0
+
+
+class InstallAbort(Exception):
+    """Raised when the user closes the installer mid-operation."""
+
+
+def _check_cancel(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise InstallAbort(tr("Установка отменена.", "Installation cancelled."))
+
+
+def _run_with_deadline(func, *, timeout: float, cancel_event: threading.Event | None = None):
+    """Run func() with a hard wall-clock deadline on a daemon thread.
+
+    Important: ``with ThreadPoolExecutor(): future.result(timeout=...)`` is unsafe here.
+    On timeout the context manager still calls ``shutdown(wait=True)`` and can block
+    forever while DNS/connect hangs. Daemon thread + polling avoids that freeze.
+    """
+    _check_cancel(cancel_event)
+    box: dict[str, object] = {}
+    errors: list[BaseException] = []
+    done = threading.Event()
+
+    def _target() -> None:
+        try:
+            box["value"] = func()
+        except BaseException as exc:  # noqa: BLE001 - propagate any failure to caller
+            errors.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_target, name="zapret-hub-installer-net", daemon=True)
+    thread.start()
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    while True:
+        _check_cancel(cancel_event)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(tr("goshkow.ru не отвечает (таймаут)", "goshkow.ru is not responding (timeout)"))
+        if done.wait(timeout=min(0.25, remaining)):
+            break
+    if errors:
+        raise errors[0]
+    return box.get("value")
+
+
+def _friendly_network_error(error: BaseException, *, context: str = "goshkow.ru") -> str:
+    if isinstance(error, InstallAbort):
+        return str(error)
+    if isinstance(error, HTTPError):
+        code = int(getattr(error, "code", 0) or 0)
+        reason = str(getattr(error, "reason", "") or error)
+        if 500 <= code <= 599:
+            return tr(f"Ошибка HTTP {code}: {context} недоступен ({reason})", f"HTTP {code}: {context} unavailable ({reason})")
+        if code == 404:
+            return tr(f"Ошибка HTTP 404: сборка не найдена на {context}", f"HTTP 404: build not found on {context}")
+        return tr(f"Ошибка HTTP {code}: {reason}", f"HTTP {code}: {reason}")
+    if isinstance(error, ssl.SSLError):
+        return tr(f"Ошибка TLS при подключении к {context}", f"TLS error connecting to {context}")
+    if isinstance(error, socket.gaierror):
+        return tr(f"Не удалось найти {context} (DNS)", f"Could not resolve {context} (DNS)")
+    if isinstance(error, TimeoutError) or isinstance(error, socket.timeout) or isinstance(error, FuturesTimeout):
+        return tr(f"{context} не отвечает (таймаут)", f"{context} is not responding (timeout)")
+    if isinstance(error, URLError):
+        reason = getattr(error, "reason", error)
+        if isinstance(reason, BaseException):
+            return _friendly_network_error(reason, context=context)
+        text = str(reason or error)
+        lower = text.lower()
+        if "timed out" in lower or "timeout" in lower:
+            return tr(f"{context} не отвечает (таймаут)", f"{context} is not responding (timeout)")
+        if "getaddrinfo" in lower or "name or service not known" in lower or "nodename" in lower:
+            return tr(f"Не удалось найти {context} (DNS)", f"Could not resolve {context} (DNS)")
+        if "ssl" in lower or "certificate" in lower:
+            return tr(f"Ошибка TLS при подключении к {context}", f"TLS error connecting to {context}")
+        return tr(f"Сеть: не удалось подключиться к {context} ({text})", f"Network: could not reach {context} ({text})")
+    if isinstance(error, json.JSONDecodeError):
+        return tr("Не удалось разобрать ответ сайта (JSON)", "Failed to parse site response (JSON)")
+    if isinstance(error, ValueError):
+        text = str(error)
+        lower = text.lower()
+        if "sha" in lower or "digest" in lower or "checksum" in lower or "размер" in lower or "size" in lower:
+            return tr(f"Не удалось проверить сборку: {text}", f"Failed to verify build: {text}")
+        return text
+    text = str(error).strip() or error.__class__.__name__
+    lower = text.lower()
+    if "timed out" in lower or "timeout" in lower:
+        return tr(f"{context} не отвечает (таймаут)", f"{context} is not responding (timeout)")
+    return text
+
+
+def _urlopen_json(url: str, *, timeout: float, cancel_event: threading.Event | None = None) -> dict[str, object]:
+    _check_cancel(cancel_event)
+    request = Request(url, headers={"User-Agent": f"Zapret-Hub-Installer/{INSTALLER_VERSION}"})
+
+    def _load() -> tuple[int, bytes]:
+        with urlopen(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", 0) or response.getcode() or 0)
+            return status, response.read()
+
+    status, raw = _run_with_deadline(_load, timeout=timeout + 1.0, cancel_event=cancel_event)
+    _check_cancel(cancel_event)
+    if status and status >= 400:
+        raise HTTPError(url, status, f"HTTP {status}", hdrs=None, fp=None)  # type: ignore[arg-type]
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as error:
+        raise error
+    if not isinstance(payload, dict):
+        raise ValueError(tr("Некорректный формат метаданных обновления.", "Unexpected update metadata format."))
+    return payload
+
+
+def _ensure_host_resolvable(url: str, *, timeout: float, cancel_event: threading.Event | None = None) -> None:
+    host = str(urlparse(url).hostname or "").strip()
+    if not host:
+        return
+
+    def _resolve() -> None:
+        socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+
+    try:
+        _run_with_deadline(_resolve, timeout=timeout, cancel_event=cancel_event)
+    except Exception as error:
+        raise RuntimeError(_friendly_network_error(error, context=host)) from error
+
+
+def _fetch_mirror_release(*, timeout: float = METADATA_TIMEOUT_SEC, cancel_event: threading.Event | None = None) -> dict[str, object]:
+    try:
+        _ensure_host_resolvable(UPDATE_URL, timeout=min(timeout, 8.0), cancel_event=cancel_event)
+        return _urlopen_json(UPDATE_URL, timeout=timeout, cancel_event=cancel_event)
+    except Exception as error:
+        raise RuntimeError(_friendly_network_error(error, context="goshkow.ru")) from error
+
+
+def _remote_release_version(release: dict[str, object] | None = None, *, timeout: float = REMOTE_VERSION_TIMEOUT_SEC) -> str:
+    try:
+        if release is not None:
+            payload = release
+        else:
+            # Never block the UI thread on a hung DNS/connect: hard deadline + non-waiting shutdown.
+            payload = _urlopen_json(UPDATE_URL, timeout=timeout, cancel_event=None)
+            if not isinstance(payload, dict):
+                return ""
+    except Exception:
+        return ""
+    for key in ("version", "tag", "name"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value.lstrip("vV")
+    return ""
+
+
+def _download_payload_from_mirror(
+    progress_cb=None,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[Path, Path, str]:
+    def report(percent: int, status: str, *, downloaded: int = 0, total: int = 0) -> None:
+        _check_cancel(cancel_event)
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(int(percent), status, downloaded=int(downloaded), total=int(total))
+        except TypeError:
+            try:
+                progress_cb(int(percent), status)
+            except Exception:
+                return
+        except Exception:
+            return
+
+    _installer_log("download_begin", update_url=UPDATE_URL)
+    report(2, tr("Запрос метаданных goshkow.ru…", "Requesting goshkow.ru metadata…"))
+    temp_root = Path(tempfile.mkdtemp(prefix="zapret_hub_installer_download_"))
+    try:
+        _installer_log("download_dns_metadata")
+        release = _fetch_mirror_release(timeout=METADATA_TIMEOUT_SEC, cancel_event=cancel_event)
+        _installer_log("download_metadata_ok", keys=sorted(str(k) for k in release.keys())[:12])
+        report(4, tr("Метаданные получены, подготовка загрузки…", "Metadata received, preparing download…"))
+        remote_version = _remote_release_version(release)
+        asset_key = "arm64" if detect_payload_name() == "win_arm64.zip" else "x64"
+        asset = dict((release.get("assets") or {}).get(asset_key) or {})
+        download_url = str(asset.get("download_url") or "").strip()
+        if not download_url:
+            download_url = f"https://goshkow.ru/zapret-hub/{asset_key}"
+        archive_path = temp_root / detect_payload_name()
+        digest = hashlib.sha256()
+        downloaded = 0
+        expected_size = int(asset.get("size") or 0)
+        last_logged_mb = -1
+        report(5, tr("Подключение к загрузке сборки…", "Connecting to build download…"))
+        _installer_log("download_dns_asset", url=download_url, expected_size=expected_size)
+        _ensure_host_resolvable(download_url, timeout=min(DOWNLOAD_CONNECT_TIMEOUT_SEC, 8.0), cancel_event=cancel_event)
+        _installer_log("download_dns_asset_ok", url=download_url)
+        request = Request(download_url, headers={"User-Agent": f"Zapret-Hub-Installer/{INSTALLER_VERSION}"})
+        try:
+            # Hard wall-clock deadline: urllib timeout alone can miss DNS/IPv6/proxy hangs.
+            response = _run_with_deadline(
+                lambda: urlopen(request, timeout=DOWNLOAD_CONNECT_TIMEOUT_SEC),
+                timeout=DOWNLOAD_CONNECT_TIMEOUT_SEC + 1.0,
+                cancel_event=cancel_event,
+            )
+        except Exception as error:
+            _installer_log("download_connect_failed", error=str(error))
+            raise RuntimeError(_friendly_network_error(error, context="goshkow.ru")) from error
+        download_started = time.monotonic()
+        last_chunk_at = download_started
+        first_byte_logged = False
+        with response, archive_path.open("wb") as stream:
+            status = int(getattr(response, "status", 0) or response.getcode() or 0)
+            if status and status >= 400:
+                raise RuntimeError(_friendly_network_error(HTTPError(download_url, status, f"HTTP {status}", hdrs=None, fp=None), context="goshkow.ru"))  # type: ignore[arg-type]
+            total = expected_size or int(response.headers.get("Content-Length") or 0)
+            report(6, tr("Скачивание сборки…", "Downloading build…"))
+            while True:
+                _check_cancel(cancel_event)
+                if time.monotonic() - download_started > DOWNLOAD_TOTAL_TIMEOUT_SEC:
+                    raise TimeoutError(tr("Скачивание превысило лимит времени", "Download exceeded time limit"))
+                if time.monotonic() - last_chunk_at > DOWNLOAD_STALL_TIMEOUT_SEC:
+                    raise TimeoutError(tr("Загрузка зависла (нет данных)", "Download stalled (no data)"))
+                try:
+                    chunk = response.read(256 * 1024)
+                except Exception as error:
+                    raise RuntimeError(_friendly_network_error(error, context="goshkow.ru")) from error
+                if not chunk:
+                    break
+                if not first_byte_logged:
+                    first_byte_logged = True
+                    _installer_log("download_first_byte", bytes=len(chunk), elapsed_sec=round(time.monotonic() - download_started, 2))
+                last_chunk_at = time.monotonic()
+                stream.write(chunk)
+                digest.update(chunk)
+                downloaded += len(chunk)
+                mb = downloaded // (1024 * 1024)
+                if mb != last_logged_mb and (mb <= 1 or mb % 8 == 0):
+                    last_logged_mb = mb
+                    _installer_log("download_progress_mb", mb=mb, total_mb=(total // (1024 * 1024)) if total else 0)
+                if total > 0:
+                    percent = 6 + int(min(40, (downloaded / total) * 40))
+                    report(
+                        percent,
+                        tr("Скачивание", "Downloading") + f" {mb} / {max(1, total // (1024 * 1024))} MB",
+                        downloaded=downloaded,
+                        total=total,
+                    )
+                else:
+                    report(20, tr("Скачивание", "Downloading") + f" {mb} MB", downloaded=downloaded, total=0)
+        if expected_size and downloaded != expected_size:
+            raise ValueError(tr("размер пакета не совпадает с метаданными", "package size does not match metadata"))
+        expected_digest = str(asset.get("digest") or "").strip().lower().removeprefix("sha256:")
+        if expected_digest and digest.hexdigest().lower() != expected_digest:
+            raise ValueError(tr("контрольная сумма SHA-256 не совпала", "SHA-256 checksum mismatch"))
+        _installer_log("download_complete", bytes=downloaded, remote_version=remote_version, elapsed_sec=round(time.monotonic() - download_started, 2))
+        report(46, tr("Проверка сборки…", "Verifying build…"))
+        return archive_path, temp_root, remote_version
+    except Exception as error:
+        _installer_log("download_failed", error=str(error))
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
 
 
 def is_admin() -> bool:
@@ -606,54 +913,8 @@ foreach ($path in $paths) {
 
 
 def _terminate_running_instances(install_dir: Path | None = None) -> None:
-    if not sys.platform.startswith("win"):
-        return
-    _remove_autostart_entries()
-    _run_hidden(["sc", "stop", "zapret"])
-    _run_hidden(["sc", "delete", "zapret"])
-    for image_name in ("zapret_hub.exe", "TgWsProxy_windows.exe", "winws.exe"):
-        _run_hidden(["taskkill", "/F", "/T", "/IM", image_name])
-    if install_dir is not None:
-        target = str(install_dir).lower().replace("'", "''")
-        current_pid = os.getpid()
-        ps = f"""
-$needle = '{target}'
-$selfPid = {current_pid}
-Get-CimInstance Win32_Process | ForEach-Object {{
-  if ($_.ProcessId -eq $selfPid) {{ return }}
-  $exe = ''
-  $cmd = ''
-  try {{ $exe = [string]$_.ExecutablePath }} catch {{}}
-  try {{ $cmd = [string]$_.CommandLine }} catch {{}}
-  $joined = ($exe + ' ' + $cmd).ToLowerInvariant()
-  if ($joined.Contains($needle)) {{
-    try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} catch {{}}
-  }}
-}}
-"""
-        _run_hidden_script(ps)
-        merged_runtime = (install_dir / "merged_runtime").resolve()
-        active_runtime = (merged_runtime / "active_zapret").resolve()
-        ps_handles = f"""
-$paths = @('{str(merged_runtime).lower().replace("'", "''")}', '{str(active_runtime).lower().replace("'", "''")}')
-$selfPid = {current_pid}
-Get-CimInstance Win32_Process | ForEach-Object {{
-  if ($_.ProcessId -eq $selfPid) {{ return }}
-  $exe = ''
-  $cmd = ''
-  try {{ $exe = [string]$_.ExecutablePath }} catch {{}}
-  try {{ $cmd = [string]$_.CommandLine }} catch {{}}
-  $joined = ($exe + ' ' + $cmd).ToLowerInvariant()
-  foreach ($path in $paths) {{
-    if ($joined.Contains($path)) {{
-      try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} catch {{}}
-      break
-    }}
-  }}
-}}
-"""
-        _run_hidden_script(ps_handles)
-    time.sleep(0.35)
+    # Path-scoped only — never taskkill by image name (portable copies elsewhere must survive).
+    terminate_running_instances(install_dir)
 
 
 def _remove_shortcuts() -> None:
@@ -808,59 +1069,63 @@ def _overlay_tree(
                 raise
 
 
+def _estimate_install_size_kb(install_dir: Path) -> int:
+    total = 0
+    try:
+        for item in install_dir.rglob("*"):
+            if item.is_file():
+                try:
+                    total += item.stat().st_size
+                except OSError:
+                    continue
+    except Exception:
+        return 0
+    return max(1, total // 1024)
+
+
 def _write_uninstall_registry(install_dir: Path, uninstaller_exe: Path, app_exe: Path) -> None:
-    if not sys.platform.startswith("win"):
-        return
-    uninstall_cmd = f'"{uninstaller_exe}" --uninstall --install-dir "{install_dir}"'
-    values = {
-        "DisplayName": "Zapret Hub",
-        "DisplayVersion": INSTALLER_VERSION,
-        "Publisher": "goshkow",
-        "InstallLocation": str(install_dir),
-        "DisplayIcon": str(app_exe),
-        "UninstallString": uninstall_cmd,
-        "QuietUninstallString": f'{uninstall_cmd} --silent',
-        "NoModify": 1,
-        "NoRepair": 1,
-    }
-    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-        try:
-            access = winreg.KEY_WRITE
-            if root == winreg.HKEY_LOCAL_MACHINE:
-                access |= winreg.KEY_WOW64_64KEY
-            with winreg.CreateKeyEx(root, UNINSTALL_KEY, 0, access) as key:
-                for name, value in values.items():
-                    if isinstance(value, int):
-                        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
-                    else:
-                        winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
-            return
-        except Exception:
+    _write_uninstall_registry_common(install_dir, uninstaller_exe, app_exe)
+
+
+def _user_data_dirs(install_dir: Path | None = None) -> list[Path]:
+    roots: list[Path] = []
+    explicit = str(os.environ.get("ZAPRET_HUB_WORK_ROOT", "") or "").strip()
+    if explicit:
+        roots.append(Path(explicit).expanduser())
+    local_app_data = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    for name in ("Zapret_Hub", "Zapret Hub", "ZapretHub"):
+        roots.append(local_app_data / name)
+    roaming = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+    for name in ("Zapret_Hub", "Zapret Hub", "ZapretHub"):
+        roots.append(roaming / name)
+    if install_dir is not None:
+        for name in ("user_data", "data", "configs", "mods", "mods_zapret2", "cache", "logs", "backups", "merged_runtime"):
+            roots.append(install_dir / name)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in roots:
+        key = str(path).casefold()
+        if key in seen:
             continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _remove_app_data(install_dir: Path | None = None) -> None:
+    for path in _user_data_dirs(install_dir):
+        if not path.exists():
+            continue
+        try:
+            _safe_remove_item(path, install_dir)
+        except Exception:
+            _quarantine_item(path)
 
 
 def _copy_running_installer_to(target_path: Path) -> bool:
-    current_installer = Path(sys.executable).resolve()
-    if not current_installer.exists() or current_installer.suffix.lower() != ".exe":
-        return False
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_target = target_path.with_suffix(target_path.suffix + ".tmp")
-    try:
-        if temp_target.exists():
-            temp_target.unlink()
-    except OSError:
-        pass
-    try:
-        shutil.copyfile(current_installer, temp_target)
-        temp_target.replace(target_path)
-        return target_path.exists()
-    except Exception:
-        try:
-            if temp_target.exists():
-                temp_target.unlink()
-        except OSError:
-            pass
-        return False
+    """Legacy helper kept for compatibility; prefer bundled standalone uninstaller."""
+    installed = copy_bundled_uninstaller(target_path.parent)
+    return bool(installed and installed.exists())
 
 
 def _remove_uninstall_registry() -> None:
@@ -1004,13 +1269,13 @@ class InstallerDialog(QDialog):
 
         self.setStyleSheet(
             """
-            #DlgRoot { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #11182a, stop:0.72 #11182a, stop:1 #162344); color: #dbe5fb; border: 1px solid #2a3f61; border-radius: 12px; font-family: Segoe UI; font-size: 10pt; }
-            #DlgTitle { background: transparent; border-bottom: 1px solid #243551; }
-            QLabel { background: transparent; color: #dbe5fb; }
-            QPushButton { background: #253b62; border: 1px solid #396197; border-radius: 12px; padding: 8px 14px; min-width: 88px; color: #dbe5fb; }
-            QPushButton#primary { background: #5865f2; border: 1px solid #7481ff; color: #fff; font-weight: 700; }
-            QToolButton { border: none; background: transparent; min-width: 26px; min-height: 26px; max-width: 26px; max-height: 26px; border-radius: 12px; padding: 0px; margin: 0px; }
-            QToolButton[role="close"]:hover { background: rgba(170, 84, 97, 0.62); border-radius: 12px; }
+            #DlgRoot { background: #0b0910; color: #ece8f4; border: 1px solid rgba(180,154,241,0.28); border-radius: 8px; font-family: Segoe UI; font-size: 10pt; }
+            #DlgTitle { background: #0f0d16; border-bottom: 1px solid rgba(196,172,238,0.12); }
+            QLabel { background: transparent; color: #ece8f4; }
+            QPushButton { background: #14121c; border: 1px solid rgba(180,154,241,0.34); border-radius: 6px; padding: 8px 14px; min-width: 88px; color: #ece8f4; }
+            QPushButton#primary { background: #b49af1; border: 1px solid #c4acee; color: #120f1a; font-weight: 700; }
+            QToolButton { border: none; background: transparent; min-width: 26px; min-height: 26px; max-width: 26px; max-height: 26px; border-radius: 6px; padding: 0px; margin: 0px; }
+            QToolButton[role="close"]:hover { background: rgba(235, 164, 174, 0.28); border-radius: 6px; }
             """
         )
 
@@ -1058,7 +1323,7 @@ class InstallerDialog(QDialog):
 
 
 class InstallerWorker(QThread):
-    progress = Signal(int)
+    progress = Signal(int, str)
     done = Signal(bool, str)
 
     def __init__(self, target_dir: Path, preserve_data: bool, *, clean_target: bool = False) -> None:
@@ -1066,6 +1331,30 @@ class InstallerWorker(QThread):
         self.target_dir = target_dir
         self.preserve_data = preserve_data
         self.clean_target = clean_target
+        self.cancel_event = threading.Event()
+        self._downloaded_payload_root: Path | None = None
+        self._staging: Path | None = None
+        self.bytes_downloaded = 0
+        self.bytes_total = 0
+
+    def request_cancel(self) -> None:
+        self.cancel_event.set()
+
+    def _emit(self, value: int, status: str = "", *, downloaded: int = 0, total: int = 0) -> None:
+        _check_cancel(self.cancel_event)
+        if downloaded:
+            self.bytes_downloaded = int(downloaded)
+        if total:
+            self.bytes_total = int(total)
+        self.progress.emit(int(value), status)
+
+    def _cleanup_temps(self) -> None:
+        if self._staging is not None:
+            shutil.rmtree(self._staging, ignore_errors=True)
+            self._staging = None
+        if self._downloaded_payload_root is not None:
+            shutil.rmtree(self._downloaded_payload_root, ignore_errors=True)
+            self._downloaded_payload_root = None
 
     def run(self) -> None:
         try:
@@ -1078,41 +1367,71 @@ class InstallerWorker(QThread):
                 clean_target=bool(self.clean_target),
             )
             if _is_dangerous_install_dir(self.target_dir):
-                raise PermissionError("Unsafe install folder. Please choose an empty subfolder for Zapret Hub.")
+                raise PermissionError(
+                    tr(
+                        "Небезопасная папка установки. Выберите пустую подпапку для Zapret Hub.",
+                        "Unsafe install folder. Please choose an empty subfolder for Zapret Hub.",
+                    )
+                )
             root = payload_root()
             payload_name = detect_payload_name()
-            payload_zip = root / "installer_payload" / payload_name
-            if not payload_zip.exists():
+            local_payload = root / "installer_payload" / payload_name
+            if not local_payload.exists():
                 direct_payload_zip = root / payload_name
                 if direct_payload_zip.exists():
-                    payload_zip = direct_payload_zip
-            if not payload_zip.exists():
-                raise FileNotFoundError(f"payload not found: {payload_zip}")
+                    local_payload = direct_payload_zip
+            payload_zip: Path | None = None
+            remote_version = ""
+            self._emit(1, tr("Запуск загрузки с goshkow.ru…", "Starting download from goshkow.ru…"))
+            try:
+                payload_zip, downloaded_payload_root, remote_version = _download_payload_from_mirror(
+                    self._emit,
+                    cancel_event=self.cancel_event,
+                )
+                self._downloaded_payload_root = downloaded_payload_root
+                _installer_log("payload_downloaded", payload_zip=str(payload_zip), remote_version=remote_version)
+            except InstallAbort:
+                raise
+            except Exception as download_error:
+                friendly = _friendly_network_error(download_error, context="goshkow.ru")
+                _installer_log("payload_download_failed", error=friendly, local_payload=str(local_payload))
+                if local_payload.exists():
+                    payload_zip = local_payload
+                    self._emit(8, tr("Сайт недоступен — локальный пакет.", "Site unavailable — using local package."))
+                else:
+                    raise RuntimeError(friendly) from download_error
+            assert payload_zip is not None
+            _check_cancel(self.cancel_event)
             _installer_log("payload_resolved", payload_root=str(root), payload_zip=str(payload_zip))
 
-            self.progress.emit(8)
+            self._emit(48, tr("Остановка процессов в папке установки…", "Stopping processes in install folder…"))
             _terminate_running_instances(self.target_dir)
+            _check_cancel(self.cancel_event)
             self.target_dir.mkdir(parents=True, exist_ok=True)
             if self.clean_target:
+                self._emit(52, tr("Очистка папки установки…", "Cleaning install folder…"))
                 _wipe_install_dir(self.target_dir)
             staging = Path(tempfile.mkdtemp(prefix="zapret_hub_install_"))
+            self._staging = staging
             _installer_log("staging_created", staging=str(staging))
-            self.progress.emit(18)
+            self._emit(58, tr("Распаковка…", "Extracting…"))
 
             with zipfile.ZipFile(payload_zip, "r") as archive:
                 archive.extractall(staging)
+            _check_cancel(self.cancel_event)
             _installer_log("payload_extracted", staging=str(staging))
-            self.progress.emit(45)
+            self._emit(72, tr("Копирование файлов…", "Copying files…"))
 
             source_root = staging / "zapret_hub"
             if not source_root.exists():
                 source_root = staging
             _installer_log("source_root_resolved", source_root=str(source_root))
 
-            preserved_names = {"merged_runtime", "backups", "logs"}
+            preserved_names = {"merged_runtime", "backups", "logs", "uninstall_zaprethub.exe"}
             if self.preserve_data:
-                preserved_names.update({"data", "mods", "configs", "cache"})
+                preserved_names.update({"data", "mods", "configs", "cache", "user_data"})
             _terminate_running_instances(self.target_dir)
+            _check_cancel(self.cancel_event)
             if not self.preserve_data:
                 for runtime_dir_name in ("merged_runtime", "backups", "logs"):
                     runtime_dir = self.target_dir / runtime_dir_name
@@ -1123,17 +1442,25 @@ class InstallerWorker(QThread):
                     except Exception:
                         _quarantine_item(runtime_dir)
 
-            self.progress.emit(70)
+            self._emit(84, tr("Установка файлов…", "Installing files…"))
             _overlay_tree(source_root, self.target_dir, self.target_dir, preserved_names, remove_extra=self.clean_target)
             _installer_log("overlay_done", target_dir=str(self.target_dir))
 
-            shutil.rmtree(staging, ignore_errors=True)
-            self.progress.emit(100)
-            _installer_log("install_done", target_dir=str(self.target_dir))
+            self._cleanup_temps()
+            self._emit(100, tr("Готово", "Done"))
+            _installer_log("install_done", target_dir=str(self.target_dir), remote_version=remote_version)
             self.done.emit(True, "")
-        except Exception as error:
-            _installer_log("install_failed", error=str(error))
+        except InstallAbort as error:
+            _installer_log("install_aborted", error=str(error))
+            self._cleanup_temps()
             self.done.emit(False, str(error))
+        except Exception as error:
+            friendly = _friendly_network_error(error, context="goshkow.ru") if not str(error) else str(error)
+            if "goshkow" in str(error).lower() or isinstance(error, (URLError, HTTPError, TimeoutError, socket.timeout)):
+                friendly = _friendly_network_error(error, context="goshkow.ru")
+            _installer_log("install_failed", error=friendly)
+            self._cleanup_temps()
+            self.done.emit(False, friendly)
 
 
 class InstallerWindow(QMainWindow):
@@ -1257,20 +1584,20 @@ class InstallerWindow(QMainWindow):
         self.setStyleSheet(
             f"""
             QMainWindow {{ background: transparent; }}
-            QWidget#Root {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #11182a, stop:0.7 #11182a, stop:1 #162344); color: #dbe5fb; font-family: Segoe UI; font-size: 10pt; border: 1px solid #2a3f61; border-radius: 12px; }}
-            #InstallerTitleBar {{ background: transparent; border-bottom: 1px solid #243551; }}
+            QWidget#Root {{ background: #0b0910; color: #ece8f4; font-family: Segoe UI; font-size: 10pt; border: 1px solid rgba(180,154,241,0.28); border-radius: 8px; }}
+            #InstallerTitleBar {{ background: #0f0d16; border-bottom: 1px solid rgba(196,172,238,0.12); }}
             QLabel#title {{ font-size: 18pt; font-weight: 800; color: #ffffff; }}
             QLabel {{ background: transparent; }}
-            QLineEdit {{ background: #15213a; border: 1px solid #304a73; border-radius: 10px; padding: 9px; font-size: 11pt; color: #dbe5fb; selection-background-color: #5865f2; }}
-            QPushButton {{ background: #253b62; border: 1px solid #396197; border-radius: 12px; padding: 10px 14px; font-size: 11pt; color: #dbe5fb; }}
-            QPushButton#primary {{ background: #5865f2; border: 1px solid #7481ff; color: #fff; font-weight: 800; }}
-            QToolButton {{ border: none; background: transparent; min-width: 26px; min-height: 26px; max-width: 26px; max-height: 26px; border-radius: 12px; padding: 0px; margin: 0px; }}
-            QToolButton[role="close"]:hover {{ background: rgba(170, 84, 97, 0.62); border-radius: 12px; }}
-            QProgressBar {{ background: #15213a; border: 1px solid #304a73; border-radius: 10px; text-align: center; }}
-            QProgressBar::chunk {{ background: #5865f2; border-radius: 9px; }}
-            QCheckBox {{ color: #dbe5fb; background: transparent; }}
-            QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 5px; border: 1px solid #4f6a98; background: transparent; }}
-            QCheckBox::indicator:checked {{ background: #5865f2; border: 1px solid #7a86ff; image: url("{check_icon}"); }}
+            QLineEdit {{ background: #14121c; border: 1px solid rgba(180,154,241,0.28); border-radius: 6px; padding: 9px; font-size: 11pt; color: #ece8f4; selection-background-color: #9b7fd4; }}
+            QPushButton {{ background: #14121c; border: 1px solid rgba(180,154,241,0.34); border-radius: 6px; padding: 10px 14px; font-size: 11pt; color: #ece8f4; }}
+            QPushButton#primary {{ background: #b49af1; border: 1px solid #c4acee; color: #120f1a; font-weight: 800; }}
+            QToolButton {{ border: none; background: transparent; min-width: 26px; min-height: 26px; max-width: 26px; max-height: 26px; border-radius: 6px; padding: 0px; margin: 0px; }}
+            QToolButton[role="close"]:hover {{ background: rgba(235, 164, 174, 0.28); border-radius: 6px; }}
+            QProgressBar {{ background: #14121c; border: 1px solid rgba(180,154,241,0.28); border-radius: 6px; text-align: center; }}
+            QProgressBar::chunk {{ background: #b49af1; border-radius: 5px; }}
+            QCheckBox {{ color: #ece8f4; background: transparent; }}
+            QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1px solid rgba(180,154,241,0.34); background: transparent; }}
+            QCheckBox::indicator:checked {{ background: #b49af1; border: 1px solid #c4acee; image: url("{check_icon}"); }}
             """
         )
 
@@ -1298,9 +1625,23 @@ class InstallerWindow(QMainWindow):
         self._drag_pos = None
         super().mouseReleaseEvent(event)
 
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        worker = self.worker
+        if worker is not None:
+            try:
+                worker.request_cancel()
+            except Exception:
+                pass
+            if worker.isRunning():
+                if not worker.wait(2500):
+                    worker.terminate()
+                    worker.wait(1500)
+            self.worker = None
+        super().closeEvent(event)
+
     def _load_existing_install(self) -> None:
         existing = _install_dir_from_registry()
-        if existing:
+        if existing and _looks_like_zapret_hub_dir(existing):
             self.path_edit.setText(str(existing))
 
     def _choose_dir(self) -> None:
@@ -1378,7 +1719,7 @@ class InstallerWindow(QMainWindow):
             return
         self.stack.setCurrentWidget(self.page_progress)
         self.worker = InstallerWorker(self.install_path, preserve_data=self.preserve_existing_data, clean_target=self.clean_target)
-        self.worker.progress.connect(self.bar.setValue)
+        self.worker.progress.connect(lambda value, _status="": self.bar.setValue(value))
         self.worker.done.connect(self._on_done)
         self.worker.start()
 
@@ -1449,10 +1790,10 @@ class InstallerWindow(QMainWindow):
 
     def _register_uninstaller(self) -> None:
         app_exe = self.install_path / "zapret_hub.exe"
-        uninstaller_exe = self.install_path / "uninstall_zaprethub.exe"
         try:
-            _copy_running_installer_to(uninstaller_exe)
-            _write_uninstall_registry(self.install_path, uninstaller_exe, app_exe)
+            uninstaller_exe = copy_bundled_uninstaller(self.install_path)
+            if uninstaller_exe is not None:
+                _write_uninstall_registry(self.install_path, uninstaller_exe, app_exe)
         except Exception:
             pass
 
@@ -1519,73 +1860,548 @@ class InstallerWindow(QMainWindow):
         self.close()
 
 
+class WebInstallerBridge(QObject):
+    # Do not name this Signal "event" — it shadows QObject.event() and breaks Qt event delivery.
+    bridgeEvent = Signal(str, str)
+
+    def __init__(self, window: "WebInstallerWindow", *, uninstall_mode: bool = False, install_dir: Path | None = None) -> None:
+        super().__init__(window)
+        self.window = window
+        self.uninstall_mode = uninstall_mode
+        self.install_path = install_dir or _install_dir_from_registry() or default_install_dir()
+        self.selected_path = self.install_path
+        self.selected_action = "update"
+        self.create_desktop = True
+        self.create_start_menu = True
+        self.launch_after = True
+        self.worker: InstallerWorker | None = None
+        self._aborting = False
+        self._install_started_at = 0.0
+        self._last_progress_at = 0.0
+        self._last_progress_value = 0
+        self._snapshot: dict[str, object] = self._empty_snapshot()
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(500)
+        self._watchdog.timeout.connect(self._on_watchdog_tick)
+
+    @staticmethod
+    def _empty_snapshot() -> dict[str, object]:
+        return {
+            "phase": "idle",
+            "status": "",
+            "progress": 0,
+            "error": "",
+            "bytesDownloaded": 0,
+            "bytesTotal": 0,
+            "failed": False,
+            "done": False,
+            "running": False,
+            "startedAt": 0.0,
+        }
+
+    @staticmethod
+    def _phase_for(progress: int, status: str = "") -> str:
+        text = (status or "").lower()
+        if progress >= 100:
+            return "done"
+        if progress < 6 or any(
+            token in text
+            for token in (
+                "подключ",
+                "connect",
+                "метаданн",
+                "metadata",
+                "запуск загрузки",
+                "starting download",
+                "запрос",
+                "requesting",
+            )
+        ):
+            return "connecting"
+        if progress < 48:
+            return "downloading"
+        return "installing"
+
+    @Slot(str, str, result=str)
+    def call(self, command: str, raw_payload: str) -> str:
+        try:
+            payload = json.loads(raw_payload or "{}")
+            value = self._dispatch(command, payload if isinstance(payload, dict) else {})
+            return json.dumps({"value": value}, ensure_ascii=False)
+        except Exception as error:
+            _installer_log("web_command_failed", command=command, error=str(error))
+            return json.dumps({"error": str(error)}, ensure_ascii=False)
+
+    def abort_all(self) -> None:
+        if self._aborting:
+            return
+        self._aborting = True
+        _installer_log("installer_abort_requested")
+        self._watchdog.stop()
+        worker = self.worker
+        if worker is not None:
+            try:
+                worker.request_cancel()
+            except Exception:
+                pass
+            if worker.isRunning():
+                if not worker.wait(2500):
+                    worker.terminate()
+                    worker.wait(1500)
+            self.worker = None
+        if not bool(self._snapshot.get("done")):
+            self._snapshot.update(
+                {
+                    "running": False,
+                    "phase": "aborted" if not self._snapshot.get("failed") else self._snapshot.get("phase") or "error",
+                }
+            )
+
+    def _dispatch(self, command: str, payload: dict[str, object]) -> object:
+        if command == "state.get":
+            return self.build_state()
+        if command == "install.snapshot":
+            return self.build_snapshot()
+        if command == "window.minimize":
+            self.window.showMinimized()
+            return None
+        if command == "window.close":
+            self.window.close()
+            return None
+        if command == "window.startDrag":
+            handle = self.window.windowHandle()
+            if handle is not None:
+                handle.startSystemMove()
+            return None
+        if command == "path.preview":
+            return self._preview_path(str(payload.get("path", "") or ""))
+        if command == "folder.choose":
+            selected = QFileDialog.getExistingDirectory(
+                self.window,
+                tr("Выбор папки", "Choose install directory"),
+                str(payload.get("path", "") or self.selected_path),
+            )
+            return self._preview_path(selected) if selected else None
+        if command == "install.start":
+            self.selected_action = str(payload.get("action", "update") or "update")
+            self.create_desktop = bool(payload.get("desktop", True))
+            self.create_start_menu = bool(payload.get("startMenu", True))
+            self.launch_after = bool(payload.get("launchAfter", True))
+            preview = self._preview_path(str(payload.get("path", "") or self.selected_path))
+            self.install_path = Path(str(preview["resolvedPath"]))
+            self._start_install()
+            return self.build_snapshot()
+        if command == "install.abort":
+            self.abort_all()
+            return self.build_snapshot()
+        if command == "install.finish":
+            self._finish_install(
+                desktop=bool(payload.get("desktop", self.create_desktop)),
+                start_menu=bool(payload.get("startMenu", self.create_start_menu)),
+                launch_after=bool(payload.get("launchAfter", self.launch_after)),
+            )
+            return None
+        if command == "uninstall.start":
+            self._start_uninstall()
+            return self.build_snapshot()
+        raise ValueError(f"Unknown installer command: {command}")
+
+    def _discover_installed(self) -> Path | None:
+        existing = _install_dir_from_registry()
+        if existing is not None and _looks_like_zapret_hub_dir(existing):
+            return existing
+        if _looks_like_zapret_hub_dir(self.install_path):
+            return self.install_path
+        return None
+
+    def build_state(self) -> dict[str, object]:
+        existing = self._discover_installed()
+        if existing is not None:
+            self.install_path = existing
+        self.selected_path = self.install_path
+        preview = self._preview_path(str(self.selected_path))
+        return {
+            "locale": "ru" if RU else "en",
+            "mode": "uninstall" if self.uninstall_mode else "install",
+            "page": "uninstall" if self.uninstall_mode else "welcome",
+            "installed": existing is not None,
+            "selectedAction": "update",
+            "selectedPath": preview["selectedPath"],
+            "resolvedPath": preview["resolvedPath"],
+            "progress": int(self._snapshot.get("progress") or 0),
+            "status": str(self._snapshot.get("status") or ""),
+            "version": INSTALLER_VERSION,
+            # Never hit the network on the UI/WebChannel thread during state.get.
+            "remoteVersion": "",
+            "createDesktop": self.create_desktop,
+            "createStartMenu": self.create_start_menu,
+            "launchAfter": self.launch_after,
+            "error": str(self._snapshot.get("error") or ""),
+        }
+
+    def build_snapshot(self) -> dict[str, object]:
+        snap = dict(self._snapshot)
+        worker = self.worker
+        if worker is not None:
+            snap["bytesDownloaded"] = int(getattr(worker, "bytes_downloaded", 0) or snap.get("bytesDownloaded") or 0)
+            snap["bytesTotal"] = int(getattr(worker, "bytes_total", 0) or snap.get("bytesTotal") or 0)
+            snap["running"] = bool(worker.isRunning())
+            if not snap.get("failed") and not snap.get("done"):
+                progress = int(snap.get("progress") or 0)
+                status = str(snap.get("status") or "")
+                snap["phase"] = self._phase_for(progress, status)
+        else:
+            snap["running"] = False
+        snap["startedAt"] = float(self._install_started_at or 0.0)
+        return snap
+
+    def _preview_path(self, raw_path: str) -> dict[str, str]:
+        selected = Path(raw_path.strip() or str(default_install_dir())).expanduser()
+        resolved = _resolve_requested_install_dir(selected)
+        self.selected_path = selected
+        return {"selectedPath": str(selected), "resolvedPath": str(resolved)}
+
+    def _start_install(self) -> None:
+        if self._aborting and self.worker is None:
+            self._aborting = False
+        if _is_dangerous_install_dir(self.install_path):
+            self.install_path = self.install_path / "Zapret Hub"
+        preserve_data = self.selected_action == "update"
+        clean_target = self.selected_action == "reinstall"
+        _installer_log(
+            "web_install_start",
+            action=self.selected_action,
+            target=str(self.install_path),
+            preserve_data=preserve_data,
+            clean_target=clean_target,
+        )
+        if self.worker is not None and self.worker.isRunning():
+            self.abort_all()
+            self._aborting = False
+        status = tr("Запуск загрузки с goshkow.ru…", "Starting download from goshkow.ru…")
+        now = time.monotonic()
+        self._install_started_at = now
+        self._last_progress_at = now
+        self._last_progress_value = 1
+        self._snapshot = {
+            "phase": "connecting",
+            "status": status,
+            "progress": 1,
+            "error": "",
+            "bytesDownloaded": 0,
+            "bytesTotal": 0,
+            "failed": False,
+            "done": False,
+            "running": True,
+            "startedAt": now,
+        }
+        self.worker = InstallerWorker(self.install_path, preserve_data=preserve_data, clean_target=clean_target)
+        self.worker.progress.connect(self._on_worker_progress)
+        self.worker.done.connect(self._on_install_done)
+        self._watchdog.start()
+        self._emit("progress", {"value": 1, "status": status})
+        self.worker.start()
+
+    @Slot(int, str)
+    def _on_worker_progress(self, value: int, status: str = "") -> None:
+        self._last_progress_at = time.monotonic()
+        self._last_progress_value = int(value)
+        worker = self.worker
+        bytes_downloaded = int(getattr(worker, "bytes_downloaded", 0) or 0) if worker is not None else 0
+        bytes_total = int(getattr(worker, "bytes_total", 0) or 0) if worker is not None else 0
+        self._snapshot.update(
+            {
+                "phase": self._phase_for(int(value), status),
+                "progress": int(value),
+                "status": status,
+                "error": "",
+                "failed": False,
+                "done": False,
+                "running": True,
+                "bytesDownloaded": bytes_downloaded,
+                "bytesTotal": bytes_total,
+            }
+        )
+        self._emit(
+            "progress",
+            {
+                "value": int(value),
+                "status": status,
+                "bytesDownloaded": bytes_downloaded,
+                "bytesTotal": bytes_total,
+            },
+        )
+
+    def _on_watchdog_tick(self) -> None:
+        worker = self.worker
+        if worker is None or not worker.isRunning() or self._aborting:
+            self._watchdog.stop()
+            return
+        # Only enforce connect/metadata hang detection before download bytes flow.
+        if self._last_progress_value >= 6:
+            return
+        idle_for = time.monotonic() - self._install_started_at
+        if idle_for >= CONNECT_WATCHDOG_SEC:
+            message = tr(
+                "Не удалось подключиться к goshkow.ru за 15 секунд. Проверьте сеть и попробуйте снова.",
+                "Could not connect to goshkow.ru within 15 seconds. Check the network and try again.",
+            )
+            _installer_log(
+                "install_watchdog_timeout",
+                idle_for=round(idle_for, 1),
+                progress=self._last_progress_value,
+                error=message,
+            )
+            try:
+                worker.request_cancel()
+            except Exception:
+                pass
+            self._watchdog.stop()
+            self._snapshot.update(
+                {
+                    "phase": "error",
+                    "status": message,
+                    "error": message,
+                    "failed": True,
+                    "done": False,
+                    "running": False,
+                }
+            )
+            self._emit("error", {"message": message})
+
+    def _on_install_done(self, ok: bool, error: str) -> None:
+        self._watchdog.stop()
+        if self._aborting:
+            self._snapshot.update({"running": False, "phase": "aborted"})
+            return
+        if not ok:
+            message = error or tr("Неизвестная ошибка установки.", "Unknown install error.")
+            if "отменен" in message.lower() or "cancelled" in message.lower():
+                self._snapshot.update(
+                    {
+                        "phase": "aborted",
+                        "status": message,
+                        "error": "",
+                        "failed": False,
+                        "done": False,
+                        "running": False,
+                    }
+                )
+                self._emit("aborted", {"message": message})
+                return
+            self._snapshot.update(
+                {
+                    "phase": "error",
+                    "status": message,
+                    "error": message,
+                    "failed": True,
+                    "done": False,
+                    "running": False,
+                }
+            )
+            self._emit("error", {"message": message})
+            return
+        self._register_uninstaller()
+        self._snapshot.update(
+            {
+                "phase": "done",
+                "progress": 100,
+                "status": tr("Готово", "Done"),
+                "error": "",
+                "failed": False,
+                "done": True,
+                "running": False,
+            }
+        )
+        self._emit("done", {})
+
+    def _register_uninstaller(self) -> None:
+        app_exe = self._installed_executable()
+        uninstaller_exe = copy_bundled_uninstaller(self.install_path)
+        if uninstaller_exe is not None:
+            _write_uninstall_registry(self.install_path, uninstaller_exe, app_exe)
+
+    def _installed_executable(self) -> Path:
+        for name in ("Zapret_Hub.exe", "zapret_hub.exe"):
+            candidate = self.install_path / name
+            if candidate.exists():
+                return candidate
+        return self.install_path / "Zapret_Hub.exe"
+
+    def _finish_install(self, *, desktop: bool, start_menu: bool, launch_after: bool = True) -> None:
+        executable = self._installed_executable()
+        if desktop:
+            InstallerWindow._create_shortcut(None, executable, "Zapret Hub", desktop=True)
+        if start_menu:
+            InstallerWindow._create_shortcut(None, executable, "Zapret Hub", desktop=False)
+        try:
+            if launch_after:
+                InstallerWindow._launch_installed_app(None, executable)
+        finally:
+            self.window.close()
+
+    def _start_uninstall(self) -> None:
+        now = time.monotonic()
+        self._install_started_at = now
+        self._snapshot = {
+            "phase": "installing",
+            "status": tr("Остановка процессов…", "Stopping processes…"),
+            "progress": 1,
+            "error": "",
+            "bytesDownloaded": 0,
+            "bytesTotal": 0,
+            "failed": False,
+            "done": False,
+            "running": True,
+            "startedAt": now,
+        }
+        try:
+            def _uninstall_progress(value: int, status: str = "", **_kwargs: object) -> None:
+                self._snapshot.update(
+                    {
+                        "phase": "installing",
+                        "progress": int(value),
+                        "status": status,
+                        "error": "",
+                        "failed": False,
+                        "done": False,
+                        "running": True,
+                    }
+                )
+                self._emit("progress", {"value": int(value), "status": status})
+
+            perform_uninstall(self.install_path, progress_cb=_uninstall_progress)
+            self._snapshot.update(
+                {
+                    "phase": "done",
+                    "progress": 100,
+                    "status": tr("Готово", "Done"),
+                    "error": "",
+                    "failed": False,
+                    "done": True,
+                    "running": False,
+                }
+            )
+            self._emit("done", {})
+        except Exception as error:
+            message = str(error)
+            self._snapshot.update(
+                {
+                    "phase": "error",
+                    "status": message,
+                    "error": message,
+                    "failed": True,
+                    "done": False,
+                    "running": False,
+                }
+            )
+            self._emit("error", {"message": message})
+
+    def _emit(self, name: str, payload: dict[str, object]) -> None:
+        # Best-effort push; WebEngine may not receive bridgeEvent — JS also polls install.snapshot.
+        try:
+            self.bridgeEvent.emit(name, json.dumps(payload, ensure_ascii=False))
+        except Exception as error:
+            _installer_log("bridge_event_emit_failed", name=name, error=str(error))
+
+
+class WebInstallerWindow(QMainWindow):
+    def __init__(self, *, uninstall_mode: bool = False, install_dir: Path | None = None) -> None:
+        super().__init__()
+        self.setWindowTitle("Zapret Hub Installer")
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedSize(720, 500)
+        self.setWindowIcon(app_icon())
+
+        self.view = QWebEngineView(self)
+        self.view.page().setBackgroundColor(QColor(Qt.GlobalColor.transparent))
+        self.view.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        self.setCentralWidget(self.view)
+
+        self.bridge = WebInstallerBridge(self, uninstall_mode=False, install_dir=install_dir)
+        self.channel = QWebChannel(self.view.page())
+        self.channel.registerObject("installerBridge", self.bridge)
+        self.view.page().setWebChannel(self.channel)
+
+        index_path = resource_root() / "installer_web" / "index.html"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Installer web UI is missing: {index_path}")
+        self.view.setUrl(QUrl.fromLocalFile(str(index_path.resolve())))
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        disable_native_window_rounding(int(self.winId()))
+        apply_native_window_icons(self)
+        bring_widget_to_front(self)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        try:
+            self.bridge.abort_all()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+
+def _register_current_install(install_dir: Path) -> bool:
+    app_exe = None
+    for name in ("Zapret_Hub.exe", "zapret_hub.exe"):
+        candidate = install_dir / name
+        if candidate.exists():
+            app_exe = candidate
+            break
+    if app_exe is None:
+        app_exe = install_dir / "Zapret_Hub.exe"
+    uninstaller_exe = copy_bundled_uninstaller(install_dir)
+    if uninstaller_exe is None:
+        existing = install_dir / "uninstall_zaprethub.exe"
+        if not existing.exists():
+            return False
+        uninstaller_exe = existing
+    _write_uninstall_registry(install_dir, uninstaller_exe, app_exe)
+    return True
+
+
 def main() -> int:
     set_windows_app_id()
-    if (
-        sys.platform.startswith("win")
-        and getattr(sys, "frozen", False)
-        and "--uninstall" not in sys.argv
-        and "--elevated-ui" not in sys.argv
-        and not is_admin()
-    ):
-        if relaunch_with_elevation(["--elevated-ui", *sys.argv[1:]]):
-            return 0
-        return 1
-    if "--uninstall" in sys.argv:
-        if not is_admin():
-            relaunch_with_elevation(sys.argv[1:])
-            return 0
-        app = QApplication(sys.argv)
-        app.setWindowIcon(app_icon())
+    if "--register" in sys.argv:
         install_arg = ""
         if "--install-dir" in sys.argv:
             try:
                 install_arg = sys.argv[sys.argv.index("--install-dir") + 1]
             except Exception:
                 install_arg = ""
-        install_dir = Path(install_arg) if install_arg else (_install_dir_from_registry() or default_install_dir())
-        silent = "--silent" in sys.argv
-        if not silent:
-            confirm = InstallerDialog(
-                tr("Удаление Zapret Hub", "Remove Zapret Hub"),
-                tr(
-                    "Удалить Zapret Hub и все данные внутри папки установки?\n\nВнешние папки и сторонние файлы не будут затронуты.",
-                    "Remove Zapret Hub and all data inside the install folder?\n\nExternal folders and third-party files will not be touched.",
-                ),
-                with_yes_no=True,
-            )
-            confirm.exec()
-            if not confirm.result_yes:
-                return 0
-        _terminate_running_instances(install_dir)
-        _remove_shortcuts()
-        _remove_uninstall_registry()
-        if install_dir.exists():
-            _launch_folder_removal(install_dir)
-        if not silent:
-            InstallerDialog(
-                tr("Удаление запущено", "Uninstall started"),
-                tr("Приложение будет удалено через несколько секунд.", "The app will be removed in a few seconds."),
-            ).exec()
-        return 0
+        install_dir = Path(install_arg) if install_arg else Path(sys.executable).resolve().parent
+        return 0 if _register_current_install(install_dir) else 1
+
+    if "--uninstall" in sys.argv:
+        _installer_log(
+            "uninstall_flag_ignored",
+            hint="Use standalone uninstall_zaprethub.exe",
+        )
+        print("Use standalone uninstall_zaprethub.exe to remove Zapret Hub.", file=sys.stderr)
+        return 2
+
+    if (
+        sys.platform.startswith("win")
+        and getattr(sys, "frozen", False)
+        and "--elevated-ui" not in sys.argv
+        and not is_admin()
+    ):
+        if relaunch_with_elevation(["--elevated-ui", *sys.argv[1:]]):
+            return 0
+        return 1
 
     app = QApplication(sys.argv)
     app.setWindowIcon(app_icon())
-    window = InstallerWindow()
+    requested_dir: Path | None = None
     if "--install-dir" in sys.argv:
         try:
-            window.path_edit.setText(sys.argv[sys.argv.index("--install-dir") + 1])
+            requested_dir = Path(sys.argv[sys.argv.index("--install-dir") + 1])
         except Exception:
-            pass
+            requested_dir = None
+    window = WebInstallerWindow(install_dir=requested_dir)
     window.show()
-    if "--elevated-install" in sys.argv:
-        preserve_data = "--preserve-data" in sys.argv
-        if "--clean-install" in sys.argv:
-            preserve_data = False
-        window.preserve_existing_data = preserve_data
-        window.clean_target = "--clean-target" in sys.argv
-        window.install_mode_locked = True
-        QTimer.singleShot(0, window._start_install)
     return app.exec()
 
 
