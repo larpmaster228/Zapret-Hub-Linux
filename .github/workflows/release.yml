@@ -314,23 +314,23 @@ jobs:
       - name: Read release notes
         id: release_notes
         shell: pwsh
+        env:
+          INPUT_CHANGELOG: ${{ inputs.changelog }}
         run: |
           $version = "${{ steps.release_meta.outputs.version }}"
           $notesPath = ".\.github\release-notes\$version.md"
-          $changelog = @'
-${{ inputs.changelog }}
-'@
+          $changelog = $env:INPUT_CHANGELOG
           if (Test-Path $notesPath) {
             $body = Get-Content $notesPath -Raw -Encoding UTF8
           } elseif (-not [string]::IsNullOrWhiteSpace($changelog)) {
             $body = $changelog.Trim()
           } else {
-            $body = @"
-## Assets
-- ``install_zaprethub_${version}_universal.exe`` — slim installer (downloads app from goshkow.ru)
-- ``zapret_hub_${version}_portable_win_x64.zip`` / ``_win_arm64.zip`` — portable builds for the mirror
-- ``uninstall_zaprethub_${version}_win_x64.exe`` / ``_win_arm64.exe`` — standalone uninstallers
-"@
+            $body = @(
+              "## Assets",
+              "- ``install_zaprethub_${version}_universal.exe`` — slim installer (downloads app from goshkow.ru)",
+              "- ``zapret_hub_${version}_portable_win_x64.zip`` / ``_win_arm64.zip`` — portable builds for the mirror",
+              "- ``uninstall_zaprethub_${version}_win_x64.exe`` / ``_win_arm64.exe`` — standalone uninstallers"
+            ) -join "`n"
           }
           "body<<__ZAPRET_HUB_NOTES__" >> $env:GITHUB_OUTPUT
           $body >> $env:GITHUB_OUTPUT
