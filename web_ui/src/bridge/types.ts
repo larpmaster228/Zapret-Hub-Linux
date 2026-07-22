@@ -54,6 +54,7 @@ export interface Mod {
   updateAvailable?: boolean;
   latestVersion?: string;
   updateChangelog?: string;
+  diskSize?: number;
 }
 
 export type MarketplaceUpdateItem = {
@@ -217,6 +218,7 @@ export type Commands = {
   "state.get": { in: void; out: AppState };
   "window.minimize": { in: void; out: void };
   "window.startDrag": { in: void; out: void };
+  "window.edit": { in: { action: "cut" | "copy" | "paste" | "select-all" }; out: void };
   "window.close": { in: void; out: void };
   "onboarding.open": { in: { mode: RuntimeId }; out: void };
   "runtime.select": { in: { id: RuntimeId; keepPower?: boolean }; out: void };
@@ -478,6 +480,7 @@ export interface MarketplaceCard {
   featured: boolean;
   updatedAt: number;
   publishedAt: number;
+  latestVersionSize?: number;
 }
 
 export interface MarketplaceVersion {

@@ -8,13 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag or release version (for example v3.0.0-linux)"
+        description: "Git tag or release version (for example v3.0.1-linux)"
         required: true
-        default: "v3.0.0-linux"
+        default: "v3.0.1-linux"
       release_name:
         description: "Release title"
         required: true
-        default: "Zapret Hub 3.0.0 (Linux)"
+        default: "Zapret Hub 3.0.1 (Linux)"
       changelog:
         description: "Release changelog (optional)"
         required: false
@@ -33,7 +33,7 @@ jobs:
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
           if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
-            TAG="v3.0.0-linux"
+            TAG="v3.0.1-linux"
           fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
