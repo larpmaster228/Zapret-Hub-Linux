@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import urllib.error
@@ -46,11 +47,12 @@ class DownloadJob:
 class MarketplaceService:
     """Public Marketplace API client + sequential download queue."""
 
-    BASE_URL = "https://goshkow.ru/api/marketplace/v1"
+    BASE_URL = "https://goshkow.com/api/marketplace/v1"
     USER_AGENT = "Zapret-Hub"
     CONNECT_DEADLINE_SEC = 15.0
     DOWNLOAD_STALL_SEC = 45.0
     DOWNLOAD_WALL_SEC = 300.0
+    MIN_FREE_SPACE_BYTES = 1024 ** 3
 
     storage_paths: Any
     logging: Any
@@ -69,6 +71,8 @@ class MarketplaceService:
     _pause_ids: set[str] = field(default_factory=set, init=False, repr=False)
     _update_cache: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
     _dismissals: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _install_revision: int = field(default=0, init=False, repr=False)
+    _last_completed: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._device_id = self._load_or_create_device_id()
@@ -335,7 +339,7 @@ class MarketplaceService:
             if remaining <= 0:
                 raise MarketplaceError(
                     "timeout",
-                    "Не удалось подключиться к goshkow.ru за 15 секунд. Проверьте сеть и попробуйте снова.",
+                    "Не удалось подключиться к goshkow.com за 15 секунд. Проверьте сеть и попробуйте снова.",
                 )
             if done.wait(timeout=min(0.25, remaining)):
                 break
@@ -349,18 +353,18 @@ class MarketplaceService:
             text = str(error).strip()
             return text or error.code
         if isinstance(error, TimeoutError):
-            return "goshkow.ru не отвечает (таймаут). Проверьте сеть и попробуйте снова."
+            return "goshkow.com не отвечает (таймаут). Проверьте сеть и попробуйте снова."
         if isinstance(error, urllib.error.HTTPError):
             code = int(getattr(error, "code", 0) or 0)
             if code == 404:
-                return "Модификация не найдена на goshkow.ru (HTTP 404)."
+                return "Модификация не найдена на goshkow.com (HTTP 404)."
             if code == 429:
                 return "Слишком много запросов к маркетплейсу. Подождите немного."
             if 500 <= code <= 599:
-                return f"Маркетплейс goshkow.ru временно недоступен (HTTP {code})."
+                return f"Маркетплейс goshkow.com временно недоступен (HTTP {code})."
             return f"Ошибка маркетплейса (HTTP {code})."
         if isinstance(error, (urllib.error.URLError, OSError)):
-            return "Не удалось подключиться к маркетплейсу goshkow.ru. Проверьте сеть."
+            return "Не удалось подключиться к маркетплейсу goshkow.com. Проверьте сеть."
         text = str(error).strip()
         return text or "Сетевая ошибка маркетплейса."
 
@@ -481,6 +485,8 @@ class MarketplaceService:
             updated_ts = int(updated) if updated is not None else 0
         except Exception:
             updated_ts = 0
+        latest = item.get("latest_version") if isinstance(item.get("latest_version"), dict) else {}
+        latest_size = item.get("latest_version_size") or item.get("latestVersionSize") or item.get("latest_size") or latest.get("size") or 0
         return {
             "id": int(item.get("id") or 0),
             "slug": str(item.get("slug") or ""),
@@ -502,6 +508,7 @@ class MarketplaceService:
             "comments": int(item.get("comments") or 0) if not isinstance(item.get("comments"), list) else len(item.get("comments") or []),
             "featured": bool(item.get("featured")),
             "updatedAt": updated_ts,
+            "latestVersionSize": int(latest_size or 0),
             "publishedAt": int(item.get("published_at") or 0) if str(item.get("published_at") or "").isdigit() or isinstance(item.get("published_at"), int) else 0,
         }
 
@@ -510,7 +517,7 @@ class MarketplaceService:
             "id": int(item.get("id") or 0),
             "version": str(item.get("version") or ""),
             "changelog": str(item.get("changelog") or ""),
-            "size": int(item.get("size") or 0),
+            "size": int(item.get("size") or item.get("file_size") or 0),
             "sha256": str(item.get("sha256") or ""),
             "downloads": int(item.get("downloads") or 0),
             "publishedAt": item.get("published_at"),
@@ -532,6 +539,20 @@ class MarketplaceService:
         slug = str(slug or "").strip()
         if not slug:
             raise MarketplaceError("invalid_slug", "Empty slug")
+        installed = next((item for item in self._list_marketplace_mods() if item.get("slug") == slug), None)
+        if installed is not None:
+            return {
+                "queued": False,
+                "alreadyInstalled": True,
+                "slug": slug,
+                "modId": str(installed.get("modId") or ""),
+                "pending": [
+                    job.slug
+                    for job in self._jobs
+                    if job.status in {"queued", "downloading", "paused", "installing"}
+                ],
+            }
+        self._ensure_install_space(compatibility)
         with self._lock:
             for existing in self._jobs:
                 if existing.slug == slug and existing.status in {"queued", "downloading", "paused", "installing"}:
@@ -696,6 +717,8 @@ class MarketplaceService:
             "overallProgress": overall,
             "pending": [j["slug"] for j in items],
             "items": items,
+            "installRevision": self._install_revision,
+            "lastCompleted": dict(self._last_completed),
         }
 
     def _emit_job(self, job: DownloadJob) -> None:
@@ -742,6 +765,13 @@ class MarketplaceService:
                         elif job.status != "cancelled":
                             job.status = "done"
                             job.progress = 1.0
+                            self._install_revision += 1
+                            self._last_completed = {
+                                "revision": self._install_revision,
+                                "slug": job.slug,
+                                "modId": job.mod_id,
+                                "compatibility": job.compatibility,
+                            }
                     self._emit_job(job)
                 except Exception as error:
                     try:
@@ -797,6 +827,7 @@ class MarketplaceService:
         self._raise_if_stopped(job)
         filename = str(ticket.get("filename") or f"{job.slug}.zip")
         size = int(ticket.get("size") or 0)
+        self._ensure_install_space(job.compatibility, incoming_bytes=size)
         sha256 = str(ticket.get("sha256") or "").lower().removeprefix("sha256:")
         direct = str(ticket.get("direct_url") or "")
         fallback = str(ticket.get("fallback_url") or "")
@@ -878,6 +909,36 @@ class MarketplaceService:
         job.compatibility = compat
         job.mod_id = installed_id
 
+    def _install_root(self, compatibility: str) -> Path:
+        if str(compatibility or "").strip().lower() == "zapret2":
+            manager_root = getattr(self.mods2, "mods_dir", None)
+            if manager_root:
+                return Path(manager_root)
+            configured_root = getattr(self.storage_paths, "mods_zapret2_dir", None)
+            if configured_root:
+                return Path(configured_root)
+        configured_root = getattr(self.storage_paths, "mods_dir", None)
+        if configured_root:
+            return Path(configured_root)
+        return Path(self.storage_paths.data_dir) / "mods"
+
+    def _ensure_install_space(self, compatibility: str, *, incoming_bytes: int = 0) -> None:
+        root = self._install_root(compatibility)
+        probe = root
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        try:
+            free = int(shutil.disk_usage(probe).free)
+        except OSError as error:
+            self._log("warning", "Failed to check Marketplace free disk space", path=str(probe), error=str(error))
+            return
+        required = self.MIN_FREE_SPACE_BYTES + max(0, int(incoming_bytes or 0))
+        if free < required:
+            raise MarketplaceError(
+                "insufficient_disk_space",
+                f"insufficient_disk_space:{free}:{required}",
+            )
+
     def _raise_if_stopped(self, job: DownloadJob) -> None:
         with self._lock:
             if job.id in self._cancel_ids:
@@ -916,12 +977,12 @@ class MarketplaceService:
         latest_id = int(latest.get("versionId") or 0) or None
         selected_id = int(version_id or 0) or latest_id
         if selected_id and selected_id != latest_id:
-            download_url = f"https://goshkow.ru/zapret-hub/marketplace/download/{selected_id}"
+            download_url = f"https://goshkow.com/zapret-hub/marketplace/download/{selected_id}"
             size = 0
             sha256 = ""
         else:
             download_url = (
-                "https://goshkow.ru/zapret-hub/marketplace/projects/"
+                "https://goshkow.com/zapret-hub/marketplace/projects/"
                 f"{urllib.parse.quote(slug)}/download/latest"
             )
             size = int(latest.get("size") or 0)
@@ -948,7 +1009,7 @@ class MarketplaceService:
         source = str(url or "").strip()
         parsed = urllib.parse.urlparse(source)
         host = str(parsed.hostname or "").lower()
-        allowed = host == "goshkow.ru" or host.endswith(".goshkow.ru") or host == "i.imgur.com"
+        allowed = host == "goshkow.com" or host.endswith(".goshkow.com") or host == "i.imgur.com"
         if parsed.scheme != "https" or not allowed:
             raise MarketplaceError("invalid_image_url", "Unsupported Marketplace image URL")
 
@@ -1024,7 +1085,7 @@ class MarketplaceService:
             if not url:
                 continue
             if url.startswith("/"):
-                url = urllib.parse.urljoin("https://goshkow.ru", url)
+                url = urllib.parse.urljoin("https://goshkow.com", url)
             if url not in candidates:
                 candidates.append(url)
         last_error: BaseException | None = None

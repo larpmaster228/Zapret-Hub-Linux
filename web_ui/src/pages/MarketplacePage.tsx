@@ -5,6 +5,7 @@ import { useLocale } from "@/hooks/useLocale";
 import { useMarketplaceQueue } from "@/hooks/useMarketplaceQueue";
 import { MarkdownContent } from "@/components/ui/MarkdownContent";
 import { ConfirmModal } from "@/components/ui/ConfirmModal";
+import { ScrollGlassHeader } from "@/components/ui/ScrollGlassHeader";
 import { getBridge } from "@/bridge";
 import type {
   MarketplaceCard,
@@ -18,6 +19,23 @@ type SortKey = "relevance" | "popular" | "downloads" | "updated" | "newest";
 
 const CATEGORIES = ["Игры", "Программы", "Соцсети"] as const;
 const PAGE_LIMIT = 5;
+
+function formatFileSize(bytes?: number) {
+  const value = Math.max(0, Number(bytes || 0));
+  if (!value) return "";
+  if (value < 1024) return `${Math.round(value)} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function BackArrow() {
+  return (
+    <svg viewBox="0 0 18 18" aria-hidden="true" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M10.8 4.2 6 9l4.8 4.8" />
+      <path d="M6.3 9H15" />
+    </svg>
+  );
+}
 
 function formatUpdated(ts: number, locale: string) {
   if (!ts) return "—";
@@ -219,6 +237,7 @@ function CatalogCard({
   locale,
   queueItem,
   installed,
+  installedSize,
   onOpen,
   onDownload,
   onRemove,
@@ -230,6 +249,7 @@ function CatalogCard({
   locale: string;
   queueItem?: MarketplaceQueueItem;
   installed: boolean;
+  installedSize?: number;
   onOpen: () => void;
   onDownload: () => void;
   onRemove: () => void;
@@ -283,7 +303,7 @@ function CatalogCard({
             {ru ? "Обновлено" : "Updated"} {formatUpdated(item.updatedAt, locale)}
           </span>
         </div>
-        <div className="flex items-center justify-end" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-end gap-2" onClick={(e) => e.stopPropagation()}>
           <AnimatePresence initial={false}>
             {queueItem ? (
               <QueueActionButtons
@@ -296,6 +316,9 @@ function CatalogCard({
               />
             ) : null}
           </AnimatePresence>
+          {!queueItem && (installed ? installedSize : item.latestVersionSize) ? (
+            <span className="text-[10px] text-fg-mute">{formatFileSize(installed ? installedSize : item.latestVersionSize)}</span>
+          ) : null}
           {installed ? (
             <button
               type="button"
@@ -425,8 +448,8 @@ function DetailSkeleton({ onBack, locale }: { onBack: () => void; locale: string
   return (
     <div className="flex h-full flex-col">
       <div className="border-b border-line-1 px-6 pb-4 pt-5">
-        <button type="button" onClick={onBack} className="mb-3 text-[11px] text-fg-mute transition hover:text-fg">
-          ← {ru ? "Каталог" : "Catalog"}
+        <button type="button" onClick={onBack} className="mb-3 inline-flex items-center gap-1.5 text-[11px] text-fg-mute transition hover:text-fg">
+          <BackArrow /> {ru ? "Каталог" : "Catalog"}
         </button>
         <div className="flex items-start gap-4">
           <div className="h-14 w-14 animate-pulse rounded-[12px] bg-bg-3" />
@@ -453,6 +476,7 @@ function DetailView({
   locale,
   queueItem,
   installed,
+  installedSize,
   onBack,
   onDownload,
   onRemove,
@@ -465,6 +489,7 @@ function DetailView({
   locale: string;
   queueItem?: MarketplaceQueueItem;
   installed: boolean;
+  installedSize?: number;
   onBack: () => void;
   onDownload: () => void;
   onRemove: () => void;
@@ -479,8 +504,8 @@ function DetailView({
   return (
     <div className="flex h-full flex-col">
       <div className="border-b border-line-1 px-6 pb-4 pt-5">
-        <button type="button" onClick={onBack} className="mb-3 text-[11px] text-fg-mute transition hover:text-fg">
-          ← {ru ? "Каталог" : "Catalog"} / {project.title}
+        <button type="button" onClick={onBack} className="mb-3 inline-flex items-center gap-1.5 text-[11px] text-fg-mute transition hover:text-fg">
+          <BackArrow /> {ru ? "Каталог" : "Catalog"} / {project.title}
         </button>
         <div className="flex items-start gap-4">
           <ProjectCover url={project.iconUrl} title={project.title} eager />
@@ -504,13 +529,16 @@ function DetailView({
           </div>
           <div className="flex w-[220px] shrink-0 flex-col gap-2">
             {installed ? (
-              <button
-                type="button"
-                onClick={onRemove}
-                className="rounded-[10px] border border-line-1 bg-bg-3/70 px-3 py-2 text-[12px] text-fg-dim transition-colors hover:border-red-400/50 hover:bg-red-500/10 hover:text-red-300"
-              >
-                {ru ? "Удалить" : "Remove"}
-              </button>
+              <div className="flex items-center gap-2">
+                {installedSize ? <span className="shrink-0 text-[10px] text-fg-mute">{formatFileSize(installedSize)}</span> : null}
+                <button
+                  type="button"
+                  onClick={onRemove}
+                  className="min-w-0 flex-1 rounded-[10px] border border-line-1 bg-bg-3/70 px-3 py-2 text-[12px] text-fg-dim transition-colors hover:border-red-400/50 hover:bg-red-500/10 hover:text-red-300"
+                >
+                  {ru ? "Удалить" : "Remove"}
+                </button>
+              </div>
             ) : (
               <div className="flex items-center gap-1">
                 <AnimatePresence initial={false}>
@@ -525,6 +553,7 @@ function DetailView({
                     />
                   ) : null}
                 </AnimatePresence>
+                {!queueItem && latest?.size ? <span className="shrink-0 text-[10px] text-fg-mute">{formatFileSize(latest.size)}</span> : null}
                 <button
                   type="button"
                   disabled={downloading}
@@ -814,6 +843,14 @@ export function MarketplacePage({
     }
     return slugs;
   }, [state?.mods, state?.mods2, queueApi.recentlyInstalled]);
+  const installedSizeBySlug = useMemo(() => {
+    const sizes = new Map<string, number>();
+    for (const mod of [...(state?.mods || []), ...(state?.mods2 || [])]) {
+      const slug = String(mod.marketplaceSlug || "").trim();
+      if (slug && mod.diskSize) sizes.set(slug, mod.diskSize);
+    }
+    return sizes;
+  }, [state?.mods, state?.mods2]);
 
   const removeInstalled = useCallback(
     (slug: string, title: string) => {
@@ -827,15 +864,22 @@ export function MarketplacePage({
       const target = pendingRemoval;
       if (!target) return;
       setPendingRemoval(null);
+      const previousMods = state?.mods || [];
+      const previousMods2 = state?.mods2 || [];
+      applyMarketplaceMods(
+        previousMods.filter((mod) => mod.marketplaceSlug !== target.slug),
+        previousMods2.filter((mod) => mod.marketplaceSlug !== target.slug),
+      );
+      queueApi.markUninstalled(target.slug);
       try {
         const result = await bridge.call("marketplace.remove", { slug: target.slug });
         applyMarketplaceMods(result.mods || [], result.mods2 || []);
-        queueApi.markUninstalled(target.slug);
       } catch (err) {
+        applyMarketplaceMods(previousMods, previousMods2);
         setError(err instanceof Error ? err.message : String(err));
       }
     },
-    [bridge, pendingRemoval, queueApi],
+    [bridge, pendingRemoval, queueApi, state?.mods, state?.mods2],
   );
 
   const compatOptions = useMemo(
@@ -873,6 +917,7 @@ export function MarketplacePage({
                 locale={locale}
                 queueItem={queueApi.bySlug.get(detail.slug)}
                 installed={installedSlugs.has(detail.slug)}
+                installedSize={installedSizeBySlug.get(detail.slug)}
                 onBack={closeDetail}
                 onDownload={() =>
                   void queueApi.enqueue({
@@ -914,7 +959,7 @@ export function MarketplacePage({
             transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
             className="absolute inset-0 flex flex-col"
           >
-            <div className="border-b border-line-1 px-6 pb-3 pt-5">
+            <ScrollGlassHeader scrollerRef={scrollRef} contentKey="marketplace-catalog" className="absolute inset-x-0 top-0 z-30 border-b border-line-1 px-6 pb-3 pt-5">
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <h2 className="text-[15px] font-semibold text-fg">Marketplace</h2>
@@ -925,7 +970,7 @@ export function MarketplacePage({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => void bridge.call("marketplace.open-url", { url: "https://goshkow.ru/zapret-hub/marketplace" })}
+                    onClick={() => void bridge.call("marketplace.open-url", { url: "https://goshkow.com/zapret-hub/marketplace" })}
                     className="flex h-8 items-center gap-1.5 rounded-lg border border-line-1 bg-bg-1 px-2.5 text-[11px] text-fg-dim transition-colors hover:border-line-2 hover:bg-bg-3 hover:text-fg"
                   >
                     <svg viewBox="0 0 16 16" aria-hidden="true" className="h-3.5 w-3.5 fill-none stroke-current" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
@@ -989,17 +1034,14 @@ export function MarketplacePage({
                     className="grid h-7 w-7 place-items-center rounded-full border border-line-1 bg-bg-1 text-fg-dim transition hover:border-line-2 hover:bg-bg-3 hover:text-fg disabled:opacity-50"
                   >
                     <svg
-                      viewBox="0 0 24 24"
+                      viewBox="0 0 12 12"
                       aria-hidden="true"
-                      className={`h-3.5 w-3.5 fill-none stroke-current ${loading ? "animate-spin" : ""}`}
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
+                      className={`h-4 w-4 fill-none stroke-current ${loading ? "animate-spin" : ""}`}
                     >
-                      <path d="M20 7v5h-5" />
-                      <path d="M4 17v-5h5" />
-                      <path d="M6.1 8.2A7 7 0 0 1 18.8 7L20 12" />
-                      <path d="M17.9 15.8A7 7 0 0 1 5.2 17L4 12" />
+                      <path
+                        d="M10 4c-.8-1.1-2-2.5-4.1-2.5-2.5 0-4.4 2-4.4 4.5s2 4.5 4.4 4.5c1.3 0 2.5-.6 3.3-1.5m1.3-7.5V4c0 .3-.2.5-.5.5H7.5"
+                        strokeLinecap="round"
+                      />
                     </svg>
                   </button>
                   <FilterSelect
@@ -1017,9 +1059,10 @@ export function MarketplacePage({
                   />
                 </div>
               </div>
-            </div>
+            </ScrollGlassHeader>
 
-            <div ref={scrollRef} className="scroll-area min-h-0 flex-1 overflow-auto px-6 py-3">
+            <div ref={scrollRef} className="scroll-area glass-page-scroll h-full overflow-auto" style={{ "--glass-header-height": "132px" } as React.CSSProperties}>
+              <div className="scroll-content px-6 pb-3 pt-[132px]">
               {error ? (
                 <div className="mb-3 rounded-lg border border-[color-mix(in_srgb,var(--err)_40%,transparent)] bg-[color-mix(in_srgb,var(--err)_8%,transparent)] px-3 py-2 text-[11px] text-[var(--err)]">
                   {error}
@@ -1045,6 +1088,7 @@ export function MarketplacePage({
                     locale={locale}
                     queueItem={queueApi.bySlug.get(item.slug)}
                     installed={installedSlugs.has(item.slug)}
+                    installedSize={installedSizeBySlug.get(item.slug)}
                     onOpen={() => void openProject(item.slug)}
                     onDownload={() =>
                       void queueApi.enqueue({
@@ -1082,6 +1126,7 @@ export function MarketplacePage({
                   {ru ? `Показано ${projects.length} из ${total}` : `Shown ${projects.length} of ${total}`}
                 </div>
               ) : null}
+              </div>
             </div>
           </motion.div>
         )}
