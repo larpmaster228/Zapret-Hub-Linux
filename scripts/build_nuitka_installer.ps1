@@ -45,6 +45,7 @@ if (-not $SkipPrepareRelease -and -not $UninstallerOnly -and $X64Source -and $Ar
         $ReleaseDir,
         "--version",
         $Version
+        "--skip-installer-payload-zips"
     )
     if ($X64Source) {
         $prepareArgs += @("--x64-source", $X64Source)
@@ -235,6 +236,7 @@ if ($X64Source -and $Arm64Source -and (Test-Path $X64Source) -and (Test-Path $Ar
         --x64-source $X64Source `
         --arm64-source $Arm64Source `
         --version $Version `
+        --skip-installer-payload-zips `
         @prepareUninstallerArgs
     if ($LASTEXITCODE -ne 0) { throw "portable release refresh with uninstaller failed with exit code $LASTEXITCODE" }
 } elseif (-not $SkipPrepareRelease) {
