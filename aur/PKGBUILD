@@ -1,0 +1,38 @@
+# Maintainer: larpmaster228 <larpmaster228@users.noreply.github.com>
+pkgname=zapret-hub-bin
+pkgver=3.0.0
+pkgrel=1
+pkgdesc='Desktop hub for managing zapret DPI bypass utilities'
+arch=('x86_64' 'aarch64')
+url='https://github.com/larpmaster228/Zapret-Hub-Linux'
+license=('MIT')
+depends=(
+    'nftables'
+    'iproute2'
+)
+optdepends=(
+    'python: for TG WS Proxy support'
+    'qt6-base: for Qt GUI'
+    'qt6-wayland: for Wayland support'
+)
+provides=('zapret-hub')
+conflicts=('zapret-hub')
+source_x86_64=("${url}/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_x64.tar.gz")
+source_aarch64=("${url}/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_arm64.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    cd "${srcdir}"
+    local _arch
+    case "${CARCH}" in
+        x86_64)  _arch=x64 ;;
+        aarch64) _arch=arm64 ;;
+    esac
+
+    install -dm755 "${pkgdir}/opt/zapret-hub"
+    cp -r "zapret_hub_${pkgver}_linux_${_arch}/"* "${pkgdir}/opt/zapret-hub/"
+
+    install -dm755 "${pkgdir}/usr/bin"
+    ln -s /opt/zapret-hub/zapret_hub "${pkgdir}/usr/bin/zapret-hub"
+}

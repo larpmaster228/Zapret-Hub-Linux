@@ -241,3 +241,71 @@ jobs:
           body: ${{ steps.release_notes.outputs.body }}
           files: |
             release_${{ steps.release_meta.outputs.version }}/zapret_hub_*_linux_*.tar.gz
+
+  sync-aur:
+    needs:
+      - publish
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve version
+        id: meta
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
+            TAG="v3.0.0-linux"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Setup SSH for AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config <<EOF
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User git
+          EOF
+
+      - name: Update PKGBUILD version
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          PKG="$GITHUB_WORKSPACE/aur/PKGBUILD"
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" "$PKG"
+          sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKG"
+
+      - name: Sync to AUR
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          AUR_REPO="${{ secrets.AUR_PACKAGE_NAME }}"
+
+          if [ -z "$AUR_REPO" ]; then
+            echo "AUR_PACKAGE_NAME secret not set, skipping AUR sync"
+            exit 0
+          fi
+
+          git clone "ssh://aur.archlinux.org/${AUR_REPO}.git" /tmp/aur-repo
+          cp aur/PKGBUILD /tmp/aur-repo/
+
+          # Generate .SRCINFO via makepkg --printsrcinfo
+          cd /tmp/aur-repo
+          makepkg --printsrcinfo > .SRCINFO
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to push"
+          else
+            git commit -m "v${VERSION}"
+            git push origin master
+            echo "AUR package updated: https://aur.archlinux.org/packages/${AUR_REPO}"
+          fi
