@@ -153,9 +153,11 @@ jobs:
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
           tag_name: ${{ needs.version.outputs.tag }}
-          name: ${{ inputs.release_name || format('Zapret Hub {0} (Linux)', needs.version.outputs.version) }}
+          name: ${{ needs.version.outputs.tag }}
           body: ${{ steps.release_notes.outputs.body }}
           files: |
             release_${{ needs.version.outputs.version }}/zapret_hub_*.tar.gz
