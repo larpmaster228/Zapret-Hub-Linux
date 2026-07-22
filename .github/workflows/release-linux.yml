@@ -21,7 +21,26 @@ on:
         default: ""
 
 jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: version
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
+            TAG="v3.0.0-linux"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   build-linux-x64:
+    needs: version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -64,20 +83,9 @@ jobs:
           python -m pip install -e .[dev]
           python -m pip install pyinstaller
 
-      - name: Resolve version
-        id: meta
-        run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
-            TAG="v3.0.0-linux"
-          fi
-          VERSION="${TAG#v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Build Linux x64 portable
         run: |
-          VERSION="${{ steps.meta.outputs.version }}" ./scripts/build_linux.sh
+          VERSION="${{ needs.version.outputs.version }}" ./scripts/build_linux.sh
 
       - uses: actions/upload-artifact@v6
         with:
@@ -86,6 +94,7 @@ jobs:
           if-no-files-found: error
 
   build-linux-arm64:
+    needs: version
     runs-on: ubuntu-24.04-arm64
     steps:
       - uses: actions/checkout@v5
@@ -128,29 +137,19 @@ jobs:
           python -m pip install -e .[dev]
           python -m pip install pyinstaller
 
-      - name: Resolve version
-        id: meta
-        run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
-            TAG="v3.0.0-linux"
-          fi
-          VERSION="${TAG#v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
       - name: Build Linux arm64 portable
         run: |
-          VERSION="${{ steps.meta.outputs.version }}" ./scripts/build_linux.sh
+          VERSION="${{ needs.version.outputs.version }}" ./scripts/build_linux.sh
 
       - uses: actions/upload-artifact@v6
         with:
           name: release-linux-arm64
-          path: zapret_hub_*_linux_x64.tar.gz
+          path: zapret_hub_*_linux_arm64.tar.gz
           if-no-files-found: error
 
   publish:
     needs:
+      - version
       - build-linux-x64
       - build-linux-arm64
     runs-on: ubuntu-latest
@@ -158,22 +157,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
-
-      - name: Resolve release metadata
-        id: release_meta
-        run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
-            TAG="v3.0.0-linux"
-          fi
-          VERSION="${TAG#v}"
-          NAME="${{ inputs.release_name }}"
-          if [ -z "$NAME" ]; then
-            NAME="Zapret Hub $VERSION (Linux)"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts
         uses: actions/download-artifact@v6
@@ -184,26 +167,18 @@ jobs:
 
       - name: Stage release folder
         run: |
-          VERSION="${{ steps.release_meta.outputs.version }}"
-          TAG="${{ steps.release_meta.outputs.tag }}"
+          VERSION="${{ needs.version.outputs.version }}"
+          TAG="${{ needs.version.outputs.tag }}"
           RELEASE_DIR="release_${VERSION}"
           mkdir -p "$RELEASE_DIR"
 
           echo "Downloaded artifacts:"
           find .artifacts -type f
 
-          # Rename arm64 archive to avoid name collision
-          for f in .artifacts/zapret_hub_*_linux_x64.tar.gz; do
+          for f in .artifacts/zapret_hub_*.tar.gz; do
             [ -f "$f" ] || continue
-            BASENAME=$(basename "$f")
-            if echo "$f" | grep -q 'linux-arm64'; then
-              NEWNAME=$(echo "$BASENAME" | sed 's/x64/arm64/')
-              cp "$f" "$RELEASE_DIR/$NEWNAME"
-              echo "Staged $NEWNAME"
-            else
-              cp "$f" "$RELEASE_DIR/$BASENAME"
-              echo "Staged $BASENAME"
-            fi
+            cp "$f" "$RELEASE_DIR/"
+            echo "Staged $(basename "$f")"
           done
 
           echo "Release assets:"
@@ -212,8 +187,7 @@ jobs:
       - name: Read release notes
         id: release_notes
         run: |
-          VERSION="${{ steps.release_meta.outputs.version }}"
-          TAG="${{ steps.release_meta.outputs.tag }}"
+          VERSION="${{ needs.version.outputs.version }}"
           NOTES_PATH=".github/release-notes/${VERSION}.md"
           CHANGELOG="${{ inputs.changelog }}"
 
@@ -236,76 +210,38 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_meta.outputs.tag }}
-          name: ${{ steps.release_meta.outputs.name }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ inputs.release_name || format('Zapret Hub {0} (Linux)', needs.version.outputs.version) }}
           body: ${{ steps.release_notes.outputs.body }}
           files: |
-            release_${{ steps.release_meta.outputs.version }}/zapret_hub_*_linux_*.tar.gz
+            release_${{ needs.version.outputs.version }}/zapret_hub_*.tar.gz
 
-  sync-aur:
-    needs:
-      - publish
+  aur:
+    name: Update AUR package
+    needs: [version, publish]
     runs-on: ubuntu-latest
-    if: success()
     steps:
       - uses: actions/checkout@v5
 
-      - name: Resolve version
-        id: meta
+      - name: Prepare PKGBUILD
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
-            TAG="v3.0.0-linux"
-          fi
-          VERSION="${TAG#v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          VERSION="${{ needs.version.outputs.version }}"
+          TAG="${{ needs.version.outputs.tag }}"
 
-      - name: Setup SSH for AUR
-        env:
-          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          cat >> ~/.ssh/config <<EOF
-          Host aur.archlinux.org
-            IdentityFile ~/.ssh/aur
-            User git
-          EOF
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
+          sed -i "s|/download/v[0-9][0-9.]*[a-z]*\?/|/download/$TAG/|" aur/PKGBUILD
 
-      - name: Update PKGBUILD version
-        run: |
-          VERSION="${{ steps.meta.outputs.version }}"
-          PKG="$GITHUB_WORKSPACE/aur/PKGBUILD"
-          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" "$PKG"
-          sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKG"
+          echo "=== PKGBUILD ==="
+          cat aur/PKGBUILD
 
-      - name: Sync to AUR
-        run: |
-          VERSION="${{ steps.meta.outputs.version }}"
-          AUR_REPO="${{ secrets.AUR_PACKAGE_NAME }}"
-
-          if [ -z "$AUR_REPO" ]; then
-            echo "AUR_PACKAGE_NAME secret not set, skipping AUR sync"
-            exit 0
-          fi
-
-          git clone "ssh://aur.archlinux.org/${AUR_REPO}.git" /tmp/aur-repo
-          cp aur/PKGBUILD /tmp/aur-repo/
-
-          # Generate .SRCINFO via makepkg --printsrcinfo
-          cd /tmp/aur-repo
-          makepkg --printsrcinfo > .SRCINFO
-
-          git config user.name "GitHub Actions"
-          git config user.email "actions@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to push"
-          else
-            git commit -m "v${VERSION}"
-            git push origin master
-            echo "AUR package updated: https://aur.archlinux.org/packages/${AUR_REPO}"
-          fi
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.3
+        with:
+          pkgname: zapret-hub
+          pkgbuild: ./aur/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "zapret-hub ${{ needs.version.outputs.version }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519

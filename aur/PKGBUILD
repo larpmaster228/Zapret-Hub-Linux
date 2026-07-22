@@ -1,24 +1,16 @@
-# Maintainer: larpmaster228 <larpmaster228@users.noreply.github.com>
-pkgname=zapret-hub-bin
+# Maintainer: peachoff <peshoff@proton.me>
+pkgname=zapret-hub
 pkgver=3.0.0
 pkgrel=1
-pkgdesc='Desktop hub for managing zapret DPI bypass utilities'
+pkgdesc="Desktop hub for managing network bypass utilities (zapret, tg-ws-proxy, vpn)"
 arch=('x86_64' 'aarch64')
-url='https://github.com/larpmaster228/Zapret-Hub-Linux'
+url="https://github.com/larpmaster228/Zapret-Hub-Linux"
 license=('MIT')
-depends=(
-    'nftables'
-    'iproute2'
-)
-optdepends=(
-    'python: for TG WS Proxy support'
-    'qt6-base: for Qt GUI'
-    'qt6-wayland: for Wayland support'
-)
-provides=('zapret-hub')
-conflicts=('zapret-hub')
-source_x86_64=("${url}/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_x64.tar.gz")
-source_aarch64=("${url}/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_arm64.tar.gz")
+options=('!strip')
+depends=('glib2' 'libglvnd' 'nftables' 'iproute2')
+optdepends=('qt6-base: Qt GUI' 'qt6-wayland: Wayland support')
+source_x86_64=("$url/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_x64.tar.gz")
+source_aarch64=("$url/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_arm64.tar.gz")
 sha256sums_x86_64=('SKIP')
 sha256sums_aarch64=('SKIP')
 
@@ -31,8 +23,13 @@ package() {
     esac
 
     install -dm755 "${pkgdir}/opt/zapret-hub"
-    cp -r "zapret_hub_${pkgver}_linux_${_arch}/"* "${pkgdir}/opt/zapret-hub/"
+    cp -a "zapret_hub_${pkgver}_linux_${_arch}/"* "${pkgdir}/opt/zapret-hub/"
+
+    install -Dm644 "${pkgdir}/opt/zapret-hub/ui_assets/icons/app.png" \
+        "${pkgdir}/usr/share/icons/hicolor/256x256/apps/zapret-hub.png" 2>/dev/null || true
 
     install -dm755 "${pkgdir}/usr/bin"
-    ln -s /opt/zapret-hub/zapret_hub "${pkgdir}/usr/bin/zapret-hub"
+    printf '#!/bin/sh\nexec /opt/zapret-hub/zapret_hub "$@"\n' \
+        > "${pkgdir}/usr/bin/zapret-hub"
+    chmod 755 "${pkgdir}/usr/bin/zapret-hub"
 }
