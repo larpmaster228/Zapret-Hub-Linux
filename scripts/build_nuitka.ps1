@@ -133,21 +133,14 @@ if (Test-Path $runtimeTarget) {
 }
 Copy-Item $runtimeStage $runtimeTarget -Recurse -Force
 
-@(
-    '@echo off',
-    'set "ZAPRET_HUB_LEGACY_UI=1"',
-    'start "" "%~dp0Zapret_Hub.exe"'
-) | Set-Content -Path (Join-Path $distDir.FullName "run_legacy_ui.bat") -Encoding ASCII
-
 $uninstallerCandidates = @()
 if ($UninstallerSource) {
     $uninstallerCandidates += $UninstallerSource
 }
 $uninstallerCandidates += @(
+    (Join-Path $root "bundled_uninstaller\uninstall_zaprethub.exe"),
     (Join-Path $root "dist_installer_3.0.0\uninstall_zaprethub.exe"),
-    (Join-Path $root "dist_installer\uninstall_zaprethub.exe"),
-    (Join-Path $root "dist_installer_3.0.0\install_zaprethub_3.0.0_universal.exe"),
-    (Join-Path $root "dist_installer\install_zaprethub_3.0.0_universal.exe")
+    (Join-Path $root "dist_installer\uninstall_zaprethub.exe")
 )
 $uninstallerCopied = $false
 foreach ($candidate in $uninstallerCandidates) {

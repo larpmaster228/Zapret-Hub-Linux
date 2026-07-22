@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QThread, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QShowEvent
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
 )
 
 from installer.common import (
-    INSTALLER_VERSION,
     app_icon,
     apply_native_window_icons,
     bring_widget_to_front,

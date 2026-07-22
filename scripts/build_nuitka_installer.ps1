@@ -16,8 +16,8 @@ param(
     [string]$Compiler = "msvc"
 )
 
-# Slim installer: embeds uninstallers (+ UI assets) only.
-# It does NOT include installer_payload/*.zip — runtime download is from goshkow.ru.
+# Slim installer: embeds uninstallers (+ UI assets) only; compressed onefile.
+# It does NOT include installer_payload/*.zip - runtime download is from goshkow.ru.
 # Prefer exit-code checks over treating Nuitka stderr progress as terminating errors.
 $ErrorActionPreference = "Continue"
 if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
@@ -67,11 +67,9 @@ $modeArgs = @()
 if ($Standalone) {
   $modeArgs += "--standalone"
 } else {
-  $modeArgs += @(
-    "--onefile",
-    "--onefile-as-archive",
-    "--onefile-no-compression"
-  )
+  # Compressed onefile (same spirit as pre-3.0.0 local builds).
+  # --onefile-no-compression + QtWebEngine produced ~530MB with no app payload.
+  $modeArgs += "--onefile"
 }
 
 $bundledUninstallerDir = Join-Path $root "bundled_uninstaller"
@@ -133,6 +131,8 @@ if ($UninstallerOnly) {
   exit 0
 }
 
+$embedBundledUninstaller = $false
+
 if (-not $SkipUninstaller) {
   $uninstallerPath = Build-Uninstaller -OutDir $OutputDir
   $bundledTarget = Join-Path $bundledUninstallerDir "uninstall_zaprethub.exe"
@@ -140,6 +140,7 @@ if (-not $SkipUninstaller) {
   if (-not (Test-Path $bundledTarget) -or ((Get-Item $bundledTarget).Length -lt 1MB)) {
     throw "Failed to stage bundled_uninstaller\uninstall_zaprethub.exe"
   }
+  $embedBundledUninstaller = $true
   Write-Host "Uninstaller: $uninstallerPath ($([math]::Round((Get-Item $bundledTarget).Length/1MB,1)) MB)"
 } else {
   $bundledTarget = Join-Path $bundledUninstallerDir "uninstall_zaprethub.exe"
@@ -150,19 +151,17 @@ if (-not $SkipUninstaller) {
   if ($UninstallerArm64Source -and (Test-Path -LiteralPath $UninstallerArm64Source)) {
     Copy-Item -LiteralPath $UninstallerArm64Source -Destination (Join-Path $bundledUninstallerDir "uninstall_zaprethub_arm64.exe") -Force
   }
-  if (-not (Test-Path $bundledTarget)) {
-    throw "SkipUninstaller set but bundled_uninstaller\uninstall_zaprethub.exe is missing"
-  }
-  Write-Host "Skipping uninstaller build; using staged bundled_uninstaller binaries"
+  Write-Host "Slim installer: bundled uninstallers are not embedded. The downloaded portable payload provides the architecture-matching uninstaller."
 }
 
-$installerDataFiles = @(
-  "--include-data-files=bundled_uninstaller/uninstall_zaprethub.exe=bundled_uninstaller/uninstall_zaprethub.exe"
-)
-if (Test-Path (Join-Path $bundledUninstallerDir "uninstall_zaprethub_x64.exe")) {
+$installerDataFiles = @()
+if ($embedBundledUninstaller -and (Test-Path (Join-Path $bundledUninstallerDir "uninstall_zaprethub.exe"))) {
+  $installerDataFiles += "--include-data-files=bundled_uninstaller/uninstall_zaprethub.exe=bundled_uninstaller/uninstall_zaprethub.exe"
+}
+if ($embedBundledUninstaller -and (Test-Path (Join-Path $bundledUninstallerDir "uninstall_zaprethub_x64.exe"))) {
   $installerDataFiles += "--include-data-files=bundled_uninstaller/uninstall_zaprethub_x64.exe=bundled_uninstaller/uninstall_zaprethub_x64.exe"
 }
-if (Test-Path (Join-Path $bundledUninstallerDir "uninstall_zaprethub_arm64.exe")) {
+if ($embedBundledUninstaller -and (Test-Path (Join-Path $bundledUninstallerDir "uninstall_zaprethub_arm64.exe"))) {
   $installerDataFiles += "--include-data-files=bundled_uninstaller/uninstall_zaprethub_arm64.exe=bundled_uninstaller/uninstall_zaprethub_arm64.exe"
 }
 
@@ -195,7 +194,11 @@ $nuitkaArgs = @(
   "--remove-output",
   "installer\install_zaprethub.py"
 )
-Write-Host "Building installer (embeds standalone uninstaller)..."
+if ($embedBundledUninstaller) {
+  Write-Host "Building installer with bundled standalone uninstaller..."
+} else {
+  Write-Host "Building slim downloader installer without application or uninstaller payloads..."
+}
 & $Python @nuitkaArgs
 if ($LASTEXITCODE -ne 0) { throw "Nuitka installer build failed with exit code $LASTEXITCODE" }
 
@@ -205,12 +208,15 @@ if (-not $builtInstaller) {
     throw "Built installer not found in $OutputDir"
 }
 
-# Keep a copy of the standalone uninstaller next to the installer for portable packaging.
-# Prefer bundled copy — installer --remove-output may wipe OutputDir between builds.
+# Keep a sidecar only when this build intentionally embedded an uninstaller.
 $bundledExe = Join-Path $bundledUninstallerDir "uninstall_zaprethub.exe"
 $sidecarUninstaller = Join-Path $builtInstaller.DirectoryName "uninstall_zaprethub.exe"
-Copy-Item -LiteralPath $bundledExe -Destination $sidecarUninstaller -Force
-$uninstallerPath = $sidecarUninstaller
+if ($embedBundledUninstaller -and (Test-Path $bundledExe)) {
+  Copy-Item -LiteralPath $bundledExe -Destination $sidecarUninstaller -Force
+  $uninstallerPath = $sidecarUninstaller
+} else {
+  $uninstallerPath = ""
+}
 
 Write-Host "Installer: $($builtInstaller.FullName)"
 Write-Host "Uninstaller: $uninstallerPath"
@@ -220,7 +226,7 @@ if ($UninstallerX64Source -and (Test-Path -LiteralPath $UninstallerX64Source)) {
   $prepareUninstallerArgs += @("--uninstaller-x64", $UninstallerX64Source)
 } elseif (Test-Path (Join-Path $bundledUninstallerDir "uninstall_zaprethub_x64.exe")) {
   $prepareUninstallerArgs += @("--uninstaller-x64", (Join-Path $bundledUninstallerDir "uninstall_zaprethub_x64.exe"))
-} else {
+} elseif ($sidecarUninstaller -and (Test-Path $sidecarUninstaller)) {
   $prepareUninstallerArgs += @("--uninstaller-source", $sidecarUninstaller)
 }
 if ($UninstallerArm64Source -and (Test-Path -LiteralPath $UninstallerArm64Source)) {

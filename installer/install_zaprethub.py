@@ -31,26 +31,15 @@ from installer.common import (
     terminate_running_instances,
     write_uninstall_registry as _write_uninstall_registry_common,
 )
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, Property, QPropertyAnimation, QRectF, QSize, QThread, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QShowEvent
+from PySide6.QtCore import QObject, QRectF, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap, QShowEvent
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QDialog,
     QFileDialog,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
     QMainWindow,
-    QPushButton,
-    QProgressBar,
-    QStackedWidget,
-    QToolButton,
-    QVBoxLayout,
     QWidget,
 )
 
@@ -217,81 +206,6 @@ def app_icon() -> QIcon:
     return QIcon(pixmap)
 
 
-def app_pixmap(size: int) -> QPixmap:
-    embedded = _embedded_app_pixmap()
-    dpr = 1.0
-    app_instance = QApplication.instance()
-    try:
-        if app_instance is not None and app_instance.primaryScreen() is not None:
-            dpr = max(1.0, float(app_instance.primaryScreen().devicePixelRatio()))
-    except Exception:
-        dpr = 1.0
-    target_px = max(size, int(round(size * dpr)))
-    if not embedded.isNull():
-        scaled = embedded.scaled(target_px, target_px, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        scaled.setDevicePixelRatio(dpr)
-        return scaled
-    installer_png_path = resource_root() / "ui_assets" / "icons" / "installer_runtime_icon.png"
-    if installer_png_path.exists():
-        image = QImage(str(installer_png_path))
-        pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
-        if not pixmap.isNull():
-            scaled = pixmap.scaled(target_px, target_px, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            scaled.setDevicePixelRatio(dpr)
-            return scaled
-    icon_path = resource_root() / "ui_assets" / "icons" / "app.png"
-    if icon_path.exists():
-        image = QImage(str(icon_path))
-        pixmap = QPixmap.fromImage(image) if not image.isNull() else QPixmap()
-        if not pixmap.isNull():
-            scaled = pixmap.scaled(target_px, target_px, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            scaled.setDevicePixelRatio(dpr)
-            return scaled
-    ico_path = resource_root() / "ui_assets" / "icons" / "app.ico"
-    if ico_path.exists():
-        pixmap = QPixmap(str(ico_path))
-        if not pixmap.isNull():
-            scaled = pixmap.scaled(target_px, target_px, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            scaled.setDevicePixelRatio(dpr)
-            return scaled
-    return app_icon().pixmap(size, size)
-
-
-def close_icon() -> QIcon:
-    icon_path = resource_root() / "ui_assets" / "icons" / "window_close_dark.svg"
-    if icon_path.exists():
-        icon = QIcon(str(icon_path))
-        if not icon.isNull():
-            return icon
-    pixmap = QPixmap(24, 24)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    pen = QPen(QColor("#e7edf9"), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-    painter.setPen(pen)
-    painter.drawLine(7, 7, 17, 17)
-    painter.drawLine(17, 7, 7, 17)
-    painter.end()
-    return QIcon(pixmap)
-
-
-def close_pixmap(size: int) -> QPixmap:
-    icon = close_icon()
-    pixmap = icon.pixmap(size, size)
-    if not pixmap.isNull():
-        return pixmap
-    fallback = QPixmap(size, size)
-    fallback.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(fallback)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    pen = QPen(QColor("#e7edf9"), max(1.8, size / 10.0), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-    painter.setPen(pen)
-    inset = max(5, int(size * 0.28))
-    painter.drawLine(inset, inset, size - inset, size - inset)
-    painter.drawLine(size - inset, inset, inset, size - inset)
-    painter.end()
-    return fallback
-
 
 def apply_native_window_icons(widget: QWidget) -> None:
     if not sys.platform.startswith("win"):
@@ -305,14 +219,6 @@ def apply_native_window_icons(widget: QWidget) -> None:
     except Exception:
         pass
 
-
-def title_logo() -> QIcon:
-    png_path = resource_root() / "ui_assets" / "icons" / "app.png"
-    if png_path.exists():
-        icon = QIcon(str(png_path))
-        if not icon.isNull():
-            return icon
-    return app_icon()
 
 
 def default_install_dir() -> Path:
@@ -724,99 +630,6 @@ def relaunch_with_elevation(args: list[str]) -> bool:
     return int(result) > 32
 
 
-class ButtonInteractionOverlay(QWidget):
-    def __init__(self, parent: QWidget) -> None:
-        super().__init__(parent)
-        self._progress = 0.0
-        self._pressed = False
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.hide()
-
-    def _get_progress(self) -> float:
-        return self._progress
-
-    def _set_progress(self, value: float) -> None:
-        self._progress = max(0.0, min(1.0, float(value)))
-        self.setVisible(self._progress > 0.001)
-        self.update()
-
-    progress = Property(float, _get_progress, _set_progress)
-
-    def set_pressed(self, pressed: bool) -> None:
-        self._pressed = bool(pressed)
-        self.update()
-
-    def paintEvent(self, event: QEvent) -> None:
-        if self._progress <= 0.001:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        base = self.parentWidget().palette().button().color() if self.parentWidget() is not None else QColor('#1f2430')
-        if base.lightness() < 128:
-            overlay = QColor(255, 255, 255)
-            max_alpha = 28 if not self._pressed else 42
-        else:
-            overlay = QColor(31, 41, 55)
-            max_alpha = 14 if not self._pressed else 22
-        overlay.setAlpha(int(max_alpha * self._progress))
-        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        radius = min(18.0, max(8.0, min(rect.width(), rect.height()) / 2.0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(overlay)
-        painter.drawRoundedRect(rect, radius, radius)
-
-
-class ButtonInteractionFilter(QObject):
-    def __init__(self, widget: QWidget) -> None:
-        super().__init__(widget)
-        self._widget = widget
-        self._overlay = ButtonInteractionOverlay(widget)
-        self._overlay.setGeometry(widget.rect())
-        self._animation: QPropertyAnimation | None = None
-        widget.installEventFilter(self)
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self._widget:
-            if event.type() in {QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.Move}:
-                self._overlay.setGeometry(self._widget.rect())
-                self._overlay.raise_()
-            elif event.type() == QEvent.Type.Enter:
-                self._overlay.raise_()
-                self._overlay.set_pressed(False)
-                self._animate(1.0, 180)
-            elif event.type() == QEvent.Type.Leave:
-                self._overlay.set_pressed(False)
-                self._animate(0.0, 180)
-            elif event.type() == QEvent.Type.MouseButtonPress:
-                self._overlay.raise_()
-                self._overlay.set_pressed(True)
-                self._animate(1.0, 90)
-            elif event.type() == QEvent.Type.MouseButtonRelease:
-                self._overlay.set_pressed(False)
-                self._animate(1.0 if self._widget.underMouse() else 0.0, 150)
-        return super().eventFilter(watched, event)
-
-    def _animate(self, target: float, duration: int) -> None:
-        if self._animation is not None:
-            self._animation.stop()
-        animation = QPropertyAnimation(self._overlay, b"progress", self)
-        animation.setDuration(duration)
-        animation.setStartValue(self._overlay.progress)
-        animation.setEndValue(target)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        animation.start()
-        self._animation = animation
-
-
-def attach_button_animations(widget: QWidget) -> None:
-    if not isinstance(widget, (QPushButton, QToolButton)):
-        return
-    if widget.property("_interactionBound"):
-        return
-    widget.setProperty("_interactionBound", True)
-    ButtonInteractionFilter(widget)
-
 
 def set_windows_app_id() -> None:
     if not sys.platform.startswith("win"):
@@ -1122,23 +935,6 @@ def _remove_app_data(install_dir: Path | None = None) -> None:
             _quarantine_item(path)
 
 
-def _copy_running_installer_to(target_path: Path) -> bool:
-    """Legacy helper kept for compatibility; prefer bundled standalone uninstaller."""
-    installed = copy_bundled_uninstaller(target_path.parent)
-    return bool(installed and installed.exists())
-
-
-def _remove_uninstall_registry() -> None:
-    if not sys.platform.startswith("win"):
-        return
-    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-        try:
-            access = winreg.KEY_WRITE
-            if root == winreg.HKEY_LOCAL_MACHINE:
-                access |= winreg.KEY_WOW64_64KEY
-            winreg.DeleteKeyEx(root, UNINSTALL_KEY, access=access, reserved=0)
-        except Exception:
-            continue
 
 
 def _install_dir_from_registry() -> Path | None:
@@ -1159,167 +955,6 @@ def _install_dir_from_registry() -> Path | None:
     return None
 
 
-def _launch_folder_removal(install_dir: Path) -> None:
-    script_path = Path(tempfile.gettempdir()) / f"zapret_hub_uninstall_{int(time.time() * 1000)}.ps1"
-    target = str(install_dir).replace("'", "''")
-    script = (
-        "$target = '{target}'\n"
-        "for ($i = 0; $i -lt 40; $i++) {\n"
-        "  try {\n"
-        "    if (-not (Test-Path -LiteralPath $target)) { break }\n"
-        "    Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop\n"
-        "    if (-not (Test-Path -LiteralPath $target)) { break }\n"
-        "  } catch {}\n"
-        "  Start-Sleep -Milliseconds 800\n"
-        "}\n"
-        "Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue\n"
-    ).format(target=target)
-    script_path.write_text(script, encoding="utf-8")
-    startup = None
-    flags = 0
-    if sys.platform.startswith("win"):
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        startup = subprocess.STARTUPINFO()
-        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startup.wShowWindow = 0
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
-        creationflags=flags,
-        startupinfo=startup,
-    )
-
-
-class InstallerDialog(QDialog):
-    def __init__(
-        self,
-        title: str,
-        text: str,
-        with_yes_no: bool = False,
-        parent: QWidget | None = None,
-        yes_text: str | None = None,
-        no_text: str | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._drag_pos = None
-        self._result_yes = False
-        self._result_mode = "cancel"
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setModal(True)
-        self.setFixedSize(520, 230)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setWindowIcon(app_icon())
-
-        root = QWidget(self)
-        root.setObjectName("DlgRoot")
-        root.setGeometry(0, 0, 520, 230)
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        self.title_bar = QFrame()
-        self.title_bar.setObjectName("DlgTitle")
-        self.title_bar.setFixedHeight(46)
-        title_row = QHBoxLayout(self.title_bar)
-        title_row.setContentsMargins(12, 8, 12, 8)
-        title_row.setSpacing(8)
-        icon = QLabel()
-        icon.setFixedSize(20, 20)
-        icon.setPixmap(app_icon().pixmap(20, 20))
-        title_row.addWidget(icon)
-        title_row.addWidget(QLabel(title))
-        title_row.addStretch(1)
-        close_btn = QToolButton()
-        close_btn.setProperty("role", "close")
-        close_btn.setIcon(QIcon(close_pixmap(14)))
-        close_btn.setIconSize(QSize(14, 14))
-        close_btn.setFixedSize(26, 26)
-        close_btn.clicked.connect(self.reject)
-        attach_button_animations(close_btn)
-        title_row.addWidget(close_btn)
-        layout.addWidget(self.title_bar)
-
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(16, 16, 16, 16)
-        body_layout.setSpacing(14)
-        message = QLabel(text)
-        message.setWordWrap(True)
-        body_layout.addWidget(message, 1)
-
-        row = QHBoxLayout()
-        row.addStretch(1)
-        if with_yes_no:
-            no_btn = QPushButton(no_text or tr("Нет", "No"))
-            no_btn.clicked.connect(self._accept_no)
-            yes_btn = QPushButton(yes_text or tr("Да", "Yes"))
-            yes_btn.setObjectName("primary")
-            yes_btn.clicked.connect(self._accept_yes)
-            attach_button_animations(no_btn)
-            attach_button_animations(yes_btn)
-            row.addWidget(no_btn)
-            row.addWidget(yes_btn)
-        else:
-            ok_btn = QPushButton("OK")
-            ok_btn.setObjectName("primary")
-            ok_btn.clicked.connect(self.accept)
-            attach_button_animations(ok_btn)
-            row.addWidget(ok_btn)
-        body_layout.addLayout(row)
-        layout.addWidget(body, 1)
-
-        self.setStyleSheet(
-            """
-            #DlgRoot { background: #0b0910; color: #ece8f4; border: 1px solid rgba(180,154,241,0.28); border-radius: 8px; font-family: Segoe UI; font-size: 10pt; }
-            #DlgTitle { background: #0f0d16; border-bottom: 1px solid rgba(196,172,238,0.12); }
-            QLabel { background: transparent; color: #ece8f4; }
-            QPushButton { background: #14121c; border: 1px solid rgba(180,154,241,0.34); border-radius: 6px; padding: 8px 14px; min-width: 88px; color: #ece8f4; }
-            QPushButton#primary { background: #b49af1; border: 1px solid #c4acee; color: #120f1a; font-weight: 700; }
-            QToolButton { border: none; background: transparent; min-width: 26px; min-height: 26px; max-width: 26px; max-height: 26px; border-radius: 6px; padding: 0px; margin: 0px; }
-            QToolButton[role="close"]:hover { background: rgba(235, 164, 174, 0.28); border-radius: 6px; }
-            """
-        )
-
-    def showEvent(self, event: QShowEvent) -> None:
-        super().showEvent(event)
-        disable_native_window_rounding(int(self.winId()))
-        apply_native_window_icons(self)
-        bring_widget_to_front(self)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and event.position().y() <= self.title_bar.height():
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
-
-    def _accept_yes(self) -> None:
-        self._result_yes = True
-        self._result_mode = "yes"
-        self.accept()
-
-    def _accept_no(self) -> None:
-        self._result_yes = False
-        self._result_mode = "no"
-        self.accept()
-
-    @property
-    def result_yes(self) -> bool:
-        return self._result_yes
-
-    @property
-    def result_mode(self) -> str:
-        return self._result_mode
 
 
 class InstallerWorker(QThread):
@@ -1463,401 +1098,42 @@ class InstallerWorker(QThread):
             self.done.emit(False, friendly)
 
 
-class InstallerWindow(QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-        self._drag_pos = None
-        self.worker: InstallerWorker | None = None
-        self.install_path = default_install_dir()
-        self.preserve_existing_data = True
-        self.clean_target = False
-        self.install_mode_locked = False
-        self.setWindowTitle("Zapret Hub Installer")
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedSize(580, 380)
-        self.setWindowIcon(app_icon())
-        self._build_ui()
-        self._load_existing_install()
 
-    def _build_ui(self) -> None:
-        root = QWidget()
-        root.setObjectName("Root")
-        self.setCentralWidget(root)
-        shell = QVBoxLayout(root)
-        shell.setContentsMargins(0, 0, 0, 0)
-        shell.setSpacing(0)
+def _create_shortcut(target: Path, name: str, *, desktop: bool) -> None:
+    if desktop:
+        base = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
+    else:
+        base = Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs"
+    base.mkdir(parents=True, exist_ok=True)
+    link_path = base / f"{name}.lnk"
+    script = (
+        "$WScriptShell = New-Object -ComObject WScript.Shell; "
+        f"$Shortcut = $WScriptShell.CreateShortcut('{link_path}'); "
+        f"$Shortcut.TargetPath = '{target}'; "
+        f"$Shortcut.WorkingDirectory = '{target.parent}'; "
+        f"$Shortcut.IconLocation = '{target},0'; "
+        "$Shortcut.Save();"
+    )
+    _installer_log(
+        "shortcut_prepare",
+        shortcut_target=str(target),
+        shortcut_workdir=str(target.parent),
+        shortcut_path=str(link_path),
+        desktop=desktop,
+    )
+    _run_hidden(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
 
-        self.title_bar = QFrame()
-        self.title_bar.setObjectName("InstallerTitleBar")
-        self.title_bar.setFixedHeight(46)
-        title_row = QHBoxLayout(self.title_bar)
-        title_row.setContentsMargins(12, 8, 12, 8)
-        title_row.setSpacing(8)
 
-        icon = QLabel()
-        icon.setFixedSize(20, 20)
-        icon.setPixmap(app_pixmap(20))
-        title_row.addWidget(icon)
-        title_row.addWidget(QLabel("Zapret Hub"))
-        title_row.addStretch(1)
-        close_btn = QToolButton()
-        close_btn.setProperty("role", "close")
-        close_btn.setIcon(QIcon(close_pixmap(14)))
-        close_btn.setIconSize(QSize(14, 14))
-        close_btn.setFixedSize(26, 26)
-        close_btn.clicked.connect(self.close)
-        attach_button_animations(close_btn)
-        title_row.addWidget(close_btn)
-        shell.addWidget(self.title_bar)
-
-        self.stack = QStackedWidget()
-        shell.addWidget(self.stack, 1)
-
-        self.page_start = QWidget()
-        start_layout = QVBoxLayout(self.page_start)
-        start_layout.setContentsMargins(20, 20, 20, 20)
-        start_layout.setSpacing(12)
-        head = QLabel(tr("Добро пожаловать в установщик Zapret Hub", "Welcome to Zapret Hub Installer"))
-        head.setObjectName("title")
-        start_layout.addWidget(head)
-        desc = QLabel(
-            tr(
-                "Приложение устанавливает Zapret Hub и автоматически выбирает подходящую версию под вашу систему.",
-                "This installer deploys Zapret Hub and automatically picks the proper build for your system.",
-            )
-        )
-        desc.setWordWrap(True)
-        start_layout.addWidget(desc)
-        path_row = QHBoxLayout()
-        self.path_edit = QLineEdit(str(self.install_path))
-        browse_btn = QPushButton(tr("Обзор", "Browse"))
-        browse_btn.clicked.connect(self._choose_dir)
-        attach_button_animations(browse_btn)
-        path_row.addWidget(self.path_edit, 1)
-        path_row.addWidget(browse_btn)
-        start_layout.addLayout(path_row)
-        start_layout.addStretch(1)
-        install_btn = QPushButton(tr("Установить", "Install"))
-        install_btn.setObjectName("primary")
-        install_btn.setMinimumHeight(42)
-        install_btn.clicked.connect(self._start_install)
-        attach_button_animations(install_btn)
-        start_layout.addWidget(install_btn)
-        self.stack.addWidget(self.page_start)
-
-        self.page_progress = QWidget()
-        progress_layout = QVBoxLayout(self.page_progress)
-        progress_layout.setContentsMargins(20, 20, 20, 20)
-        progress_layout.setSpacing(12)
-        progress_layout.addWidget(QLabel(tr("Установка...", "Installing...")))
-        progress_layout.addStretch(1)
-        self.bar = QProgressBar()
-        self.bar.setRange(0, 100)
-        self.bar.setValue(0)
-        self.bar.setFixedHeight(24)
-        progress_layout.addWidget(self.bar)
-        progress_layout.addStretch(1)
-        self.stack.addWidget(self.page_progress)
-
-        self.page_done = QWidget()
-        done_layout = QVBoxLayout(self.page_done)
-        done_layout.setContentsMargins(20, 20, 20, 20)
-        done_layout.setSpacing(12)
-        done_layout.addWidget(QLabel(tr("Установка завершена", "Installation complete")))
-        self.desktop_cb = QCheckBox(tr("Создать ярлык на рабочем столе", "Create desktop shortcut"))
-        self.startmenu_cb = QCheckBox(tr("Создать ярлык в меню Пуск", "Create Start Menu shortcut"))
-        self.desktop_cb.setChecked(True)
-        self.startmenu_cb.setChecked(True)
-        done_layout.addWidget(self.desktop_cb)
-        done_layout.addWidget(self.startmenu_cb)
-        done_layout.addStretch(1)
-        finish_btn = QPushButton(tr("Готово", "Finish"))
-        finish_btn.setObjectName("primary")
-        finish_btn.setMinimumHeight(42)
-        finish_btn.clicked.connect(self._finish)
-        attach_button_animations(finish_btn)
-        done_layout.addWidget(finish_btn)
-        self.stack.addWidget(self.page_done)
-
-        check_icon = str((resource_root() / "ui_assets" / "icons" / "check.svg").resolve()).replace("\\", "/")
-        self.setStyleSheet(
-            f"""
-            QMainWindow {{ background: transparent; }}
-            QWidget#Root {{ background: #0b0910; color: #ece8f4; font-family: Segoe UI; font-size: 10pt; border: 1px solid rgba(180,154,241,0.28); border-radius: 8px; }}
-            #InstallerTitleBar {{ background: #0f0d16; border-bottom: 1px solid rgba(196,172,238,0.12); }}
-            QLabel#title {{ font-size: 18pt; font-weight: 800; color: #ffffff; }}
-            QLabel {{ background: transparent; }}
-            QLineEdit {{ background: #14121c; border: 1px solid rgba(180,154,241,0.28); border-radius: 6px; padding: 9px; font-size: 11pt; color: #ece8f4; selection-background-color: #9b7fd4; }}
-            QPushButton {{ background: #14121c; border: 1px solid rgba(180,154,241,0.34); border-radius: 6px; padding: 10px 14px; font-size: 11pt; color: #ece8f4; }}
-            QPushButton#primary {{ background: #b49af1; border: 1px solid #c4acee; color: #120f1a; font-weight: 800; }}
-            QToolButton {{ border: none; background: transparent; min-width: 26px; min-height: 26px; max-width: 26px; max-height: 26px; border-radius: 6px; padding: 0px; margin: 0px; }}
-            QToolButton[role="close"]:hover {{ background: rgba(235, 164, 174, 0.28); border-radius: 6px; }}
-            QProgressBar {{ background: #14121c; border: 1px solid rgba(180,154,241,0.28); border-radius: 6px; text-align: center; }}
-            QProgressBar::chunk {{ background: #b49af1; border-radius: 5px; }}
-            QCheckBox {{ color: #ece8f4; background: transparent; }}
-            QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1px solid rgba(180,154,241,0.34); background: transparent; }}
-            QCheckBox::indicator:checked {{ background: #b49af1; border: 1px solid #c4acee; image: url("{check_icon}"); }}
-            """
-        )
-
-    def showEvent(self, event: QShowEvent) -> None:
-        super().showEvent(event)
-        disable_native_window_rounding(int(self.winId()))
-        apply_native_window_icons(self)
-        bring_widget_to_front(self)
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and event.position().y() <= self.title_bar.height():
-            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._drag_pos is not None and event.buttons() & Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_pos)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        self._drag_pos = None
-        super().mouseReleaseEvent(event)
-
-    def closeEvent(self, event) -> None:  # type: ignore[override]
-        worker = self.worker
-        if worker is not None:
-            try:
-                worker.request_cancel()
-            except Exception:
-                pass
-            if worker.isRunning():
-                if not worker.wait(2500):
-                    worker.terminate()
-                    worker.wait(1500)
-            self.worker = None
-        super().closeEvent(event)
-
-    def _load_existing_install(self) -> None:
-        existing = _install_dir_from_registry()
-        if existing and _looks_like_zapret_hub_dir(existing):
-            self.path_edit.setText(str(existing))
-
-    def _choose_dir(self) -> None:
-        picked = QFileDialog.getExistingDirectory(self, tr("Выбор папки", "Choose install directory"), self.path_edit.text())
-        if picked:
-            self.path_edit.setText(picked)
-
-    def _start_install(self) -> None:
-        raw_path = self.path_edit.text().strip() or str(default_install_dir())
-        self.install_path = Path(raw_path).expanduser()
-        if not self.install_path.is_absolute():
-            self.install_path = (Path.cwd() / self.install_path).resolve()
-        _installer_log("ui_start_install", selected_path=raw_path, normalized_target=str(self.install_path))
-        if not self.install_mode_locked:
-            if _is_dangerous_install_dir(self.install_path):
-                choice = self._ask_unsafe_install_dir()
-                if choice != "folder":
-                    return
-                self.install_path = _suggest_safe_install_dir(self.install_path)
-                self.path_edit.setText(str(self.install_path))
-            try:
-                existing_items = [item for item in self.install_path.iterdir()] if self.install_path.exists() else []
-            except Exception as error:
-                InstallerDialog("Error", str(error), parent=self).exec()
-                return
-            if existing_items:
-                if _looks_like_zapret_hub_dir(self.install_path):
-                    choice = self._ask_existing_install_mode()
-                    if choice == "cancel":
-                        return
-                    self.preserve_existing_data = choice == "preserve"
-                    self.clean_target = choice == "clean"
-                else:
-                    choice = self._ask_foreign_install_dir()
-                    if choice == "cancel":
-                        return
-                    if choice == "folder":
-                        self.install_path = _suggest_empty_install_dir(self.install_path)
-                        self.path_edit.setText(str(self.install_path))
-                        self.preserve_existing_data = True
-                        self.clean_target = False
-                    else:
-                        self.preserve_existing_data = False
-                        self.clean_target = True
-            else:
-                self.preserve_existing_data = True
-                self.clean_target = False
-        else:
-            if _is_dangerous_install_dir(self.install_path):
-                InstallerDialog(
-                    "Error",
-                    tr(
-                        "Нельзя устанавливать Zapret Hub в корень диска или системную папку. Выберите пустую подпапку.",
-                        "Zapret Hub cannot be installed into a drive root or system folder. Please choose an empty subfolder.",
-                    ),
-                    parent=self,
-                ).exec()
-                return
-        if not self.install_path.exists():
-            self.preserve_existing_data = True
-            self.clean_target = False
-        if sys.platform.startswith("win") and getattr(sys, "frozen", False) and not is_admin():
-            args = [
-                "--elevated-install",
-                "--install-dir",
-                str(self.install_path),
-                "--preserve-data" if self.preserve_existing_data else "--clean-install",
-            ]
-            if self.clean_target:
-                args.append("--clean-target")
-            if relaunch_with_elevation(args):
-                self.close()
-                return
-            InstallerDialog("Error", tr("Не удалось запросить права администратора.", "Failed to request administrator privileges."), parent=self).exec()
-            return
-        self.stack.setCurrentWidget(self.page_progress)
-        self.worker = InstallerWorker(self.install_path, preserve_data=self.preserve_existing_data, clean_target=self.clean_target)
-        self.worker.progress.connect(lambda value, _status="": self.bar.setValue(value))
-        self.worker.done.connect(self._on_done)
-        self.worker.start()
-
-    def _ask_unsafe_install_dir(self) -> str:
-        dialog = InstallerDialog(
-            tr("Небезопасная папка установки", "Unsafe install folder"),
-            tr(
-                "Нельзя устанавливать Zapret Hub в корень диска или системную папку. Создайте отдельную пустую папку для приложения.",
-                "Zapret Hub cannot be installed into a drive root or system folder. Create a dedicated empty folder for the app.",
-            ),
-            with_yes_no=True,
-            parent=self,
-            yes_text=tr("Создать папку", "Create folder"),
-            no_text=tr("Отмена", "Cancel"),
-        )
-        dialog.exec()
-        if dialog.result_mode == "yes":
-            return "folder"
-        return "cancel"
-
-    def _ask_foreign_install_dir(self) -> str:
-        dialog = InstallerDialog(
-            tr("Папка не пуста", "Folder is not empty"),
-            tr(
-                "В выбранной папке нет zapret_hub.exe, поэтому она не похожа на старую папку приложения.\n\n"
-                "Если продолжить, папка будет очищена перед установкой. Чтобы ничего не удалить, создайте пустую папку и установите Zapret Hub в нее.",
-                "The selected folder does not contain zapret_hub.exe, so it does not look like an existing app folder.\n\n"
-                "If you continue, the folder will be cleaned before installation. To avoid deleting anything, create an empty folder and install Zapret Hub there.",
-            ),
-            with_yes_no=True,
-            parent=self,
-            yes_text=tr("Продолжить", "Continue"),
-            no_text=tr("Создать папку", "Create folder"),
-        )
-        dialog.exec()
-        if dialog.result_mode == "yes":
-            return "continue"
-        if dialog.result_mode == "no":
-            return "folder"
-        return "cancel"
-
-    def _ask_existing_install_mode(self) -> str:
-        dialog = InstallerDialog(
-            tr("Найдена предыдущая версия", "Existing installation found"),
-            tr(
-                "Хотите ли вы переустановить программу, удалив все данные, или обновить, сохранив все ваши пользовательские данные?",
-                "Do you want to reinstall the app and remove all data, or update it while keeping all of your user data?",
-            ),
-            with_yes_no=True,
-            parent=self,
-            yes_text=tr("Обновить", "Update"),
-            no_text=tr("Переустановить", "Reinstall"),
-        )
-        dialog.exec()
-        if dialog.result_mode == "yes":
-            return "preserve"
-        if dialog.result_mode == "no":
-            return "clean"
-        return "cancel"
-
-    def _on_done(self, ok: bool, error: str) -> None:
-        if not ok:
-            InstallerDialog("Error", error, parent=self).exec()
-            self.stack.setCurrentWidget(self.page_start)
-            return
-        self._register_uninstaller()
-        self.stack.setCurrentWidget(self.page_done)
-
-    def _register_uninstaller(self) -> None:
-        app_exe = self.install_path / "zapret_hub.exe"
-        try:
-            uninstaller_exe = copy_bundled_uninstaller(self.install_path)
-            if uninstaller_exe is not None:
-                _write_uninstall_registry(self.install_path, uninstaller_exe, app_exe)
-        except Exception:
-            pass
-
-    def _create_shortcut(self, target: Path, name: str, desktop: bool) -> None:
-        if desktop:
-            base = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
-        else:
-            base = Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs"
-        base.mkdir(parents=True, exist_ok=True)
-        lnk_path = base / f"{name}.lnk"
-        ps = (
-            "$WScriptShell = New-Object -ComObject WScript.Shell; "
-            f"$Shortcut = $WScriptShell.CreateShortcut('{str(lnk_path)}'); "
-            f"$Shortcut.TargetPath = '{str(target)}'; "
-            f"$Shortcut.WorkingDirectory = '{str(target.parent)}'; "
-            f"$Shortcut.IconLocation = '{str(target)},0'; "
-            "$Shortcut.Save();"
-        )
-        _installer_log(
-            "shortcut_prepare",
-            shortcut_target=str(target),
-            shortcut_workdir=str(target.parent),
-            shortcut_path=str(lnk_path),
-            desktop=bool(desktop),
-        )
-        startup = None
-        flags = 0
-        if sys.platform.startswith("win"):
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            startup = subprocess.STARTUPINFO()
-            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startup.wShowWindow = 0
-        subprocess.run(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-            capture_output=True,
-            check=False,
-            creationflags=flags,
-            startupinfo=startup,
-        )
-
-    def _launch_installed_app(self, exe: Path) -> None:
-        if not exe.exists():
-            return
-        _installer_log("launch_target", launch_target=str(exe), launch_workdir=str(exe.parent))
-        if sys.platform.startswith("win"):
-            startup = subprocess.STARTUPINFO()
-            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startup.wShowWindow = 1
-            subprocess.Popen([str(exe)], cwd=str(exe.parent), startupinfo=startup)
-            return
-        subprocess.Popen([str(exe)], cwd=str(exe.parent))
-
-    def _finish(self) -> None:
-        exe = self.install_path / "zapret_hub.exe"
-        if self.desktop_cb.isChecked():
-            self._create_shortcut(exe, "Zapret Hub", desktop=True)
-        if self.startmenu_cb.isChecked():
-            self._create_shortcut(exe, "Zapret Hub", desktop=False)
-        if exe.exists():
-            try:
-                self._launch_installed_app(exe)
-            except Exception:
-                pass
-        self.close()
+def _launch_installed_app(executable: Path) -> None:
+    if not executable.exists():
+        return
+    _installer_log("launch_target", launch_target=str(executable), launch_workdir=str(executable.parent))
+    startup = None
+    if sys.platform.startswith("win"):
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 1
+    subprocess.Popen([str(executable)], cwd=str(executable.parent), startupinfo=startup)
 
 
 class WebInstallerBridge(QObject):
@@ -2231,12 +1507,12 @@ class WebInstallerBridge(QObject):
     def _finish_install(self, *, desktop: bool, start_menu: bool, launch_after: bool = True) -> None:
         executable = self._installed_executable()
         if desktop:
-            InstallerWindow._create_shortcut(None, executable, "Zapret Hub", desktop=True)
+            _create_shortcut(executable, "Zapret Hub", desktop=True)
         if start_menu:
-            InstallerWindow._create_shortcut(None, executable, "Zapret Hub", desktop=False)
+            _create_shortcut(executable, "Zapret Hub", desktop=False)
         try:
             if launch_after:
-                InstallerWindow._launch_installed_app(None, executable)
+                _launch_installed_app(executable)
         finally:
             self.window.close()
 

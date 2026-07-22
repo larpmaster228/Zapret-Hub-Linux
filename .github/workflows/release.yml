@@ -1,9 +1,12 @@
 name: Release Build
 
-# Slim installer model (matches local build_nuitka_installer.ps1):
-# - Job A/B: portable x64 / arm64 zips for the goshkow.ru mirror (and GitHub assets).
-# - Job C: slim universal installer in parallel — embeds uninstallers only; downloads app at install time.
-# - Final job: attach artifacts to the GitHub Release (no rebuild, no fat installer_payload).
+# Mirrors local scripts:
+# - portable-*: scripts/build_nuitka.ps1 (+ UninstallerOnly) then prepare_nuitka_release.py
+# - installer: scripts/build_nuitka_installer.ps1 slim path (no -X64Source/-Arm64Source, no payload zips)
+# - publish: attach artifacts to the GitHub Release (no rebuild)
+#
+# Compiler: MSVC on GitHub-hosted runners (ilammy/msvc-dev-cmd). Local may use mingw;
+# MSVC is the more reliable default on Actions and matches ci.yml.
 
 on:
   push:
@@ -20,28 +23,22 @@ on:
         required: true
         default: "Zapret Hub 3.0.0"
       changelog:
-        description: "Release changelog"
+        description: "Release changelog (optional; otherwise .github/release-notes/$version.md)"
         required: false
         default: ""
 
 jobs:
-  build-portable-x64:
+  portable-x64:
     runs-on: windows-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Clean workspace
-        shell: pwsh
-        run: |
-          Remove-Item .\dist_nuitka, .\dist_installer, .\.nuitka_staging, .\installer_payload, .\release_* -Recurse -Force -ErrorAction SilentlyContinue
+      - uses: actions/checkout@v5
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python deps
         shell: pwsh
         env:
           PIP_PREFER_BINARY: "1"
@@ -64,15 +61,17 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
 
-      - name: Build Nuitka x64 portable
+      - name: Build portable app (local build_nuitka.ps1)
         shell: pwsh
-        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler msvc
+        run: |
+          .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler msvc
 
-      - name: Build x64 uninstaller
+      - name: Build uninstaller only
         shell: pwsh
-        run: .\scripts\build_nuitka_installer.ps1 -Python python -OutputDir dist_installer -UninstallerOnly -Compiler msvc
+        run: |
+          .\scripts\build_nuitka_installer.ps1 -Python python -OutputDir dist_installer -UninstallerOnly -Compiler msvc
 
-      - name: Package portable x64 zip
+      - name: Zip portable x64
         shell: pwsh
         run: |
           $version = "${{ steps.meta.outputs.version }}"
@@ -82,10 +81,10 @@ jobs:
             --release-dir ".\release_$version" `
             --version $version `
             --uninstaller-x64 .\dist_installer\uninstall_zaprethub.exe
-          Copy-Item .\dist_installer\uninstall_zaprethub.exe ".\release_$version\uninstall_zaprethub_${version}_win_x64.exe" -Force
+          Copy-Item .\dist_installer\uninstall_zaprethub.exe `
+            ".\release_$version\uninstall_zaprethub_${version}_win_x64.exe" -Force
 
-      - name: Upload portable x64 assets
-        uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v6
         with:
           name: release-portable-win-x64
           path: |
@@ -93,26 +92,17 @@ jobs:
             release_${{ steps.meta.outputs.version }}/uninstall_zaprethub_${{ steps.meta.outputs.version }}_win_x64.exe
           if-no-files-found: error
 
-  build-portable-arm64:
+  portable-arm64:
     runs-on: windows-11-arm
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Clean workspace
-        shell: pwsh
-        run: |
-          Remove-Item .\dist_nuitka, .\dist_installer, .\.nuitka_staging, .\installer_payload, .\release_* -Recurse -Force -ErrorAction SilentlyContinue
+      - uses: actions/checkout@v5
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - name: Install Rust fallback
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
+      - name: Install Python deps
         shell: pwsh
         env:
           PIP_PREFER_BINARY: "1"
@@ -135,15 +125,17 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
 
-      - name: Build Nuitka arm64 portable
+      - name: Build portable app (local build_nuitka.ps1)
         shell: pwsh
-        run: .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler msvc
+        run: |
+          .\scripts\build_nuitka.ps1 -Python python -OutputDir dist_nuitka -Compiler msvc
 
-      - name: Build arm64 uninstaller
+      - name: Build uninstaller only
         shell: pwsh
-        run: .\scripts\build_nuitka_installer.ps1 -Python python -OutputDir dist_installer -UninstallerOnly -Compiler msvc
+        run: |
+          .\scripts\build_nuitka_installer.ps1 -Python python -OutputDir dist_installer -UninstallerOnly -Compiler msvc
 
-      - name: Package portable arm64 zip
+      - name: Zip portable arm64
         shell: pwsh
         run: |
           $version = "${{ steps.meta.outputs.version }}"
@@ -153,10 +145,10 @@ jobs:
             --release-dir ".\release_$version" `
             --version $version `
             --uninstaller-arm64 .\dist_installer\uninstall_zaprethub.exe
-          Copy-Item .\dist_installer\uninstall_zaprethub.exe ".\release_$version\uninstall_zaprethub_${version}_win_arm64.exe" -Force
+          Copy-Item .\dist_installer\uninstall_zaprethub.exe `
+            ".\release_$version\uninstall_zaprethub_${version}_win_arm64.exe" -Force
 
-      - name: Upload portable arm64 assets
-        uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v6
         with:
           name: release-portable-win-arm64
           path: |
@@ -164,23 +156,22 @@ jobs:
             release_${{ steps.meta.outputs.version }}/uninstall_zaprethub_${{ steps.meta.outputs.version }}_win_arm64.exe
           if-no-files-found: error
 
-  build-slim-installer:
+  installer:
     runs-on: windows-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Clean workspace
+      - name: Clean leftover payload dirs
         shell: pwsh
         run: |
-          Remove-Item .\dist_nuitka, .\dist_installer, .\.nuitka_staging, .\installer_payload, .\bundled_uninstaller, .\release_* -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item .\installer_payload, .\bundled_uninstaller, .\dist_installer -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python deps
         shell: pwsh
         env:
           PIP_PREFER_BINARY: "1"
@@ -203,37 +194,49 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "version=$version" >> $env:GITHUB_OUTPUT
 
-      - name: Build slim installer (local parity)
+      # Identical to local slim: no -X64Source / -Arm64Source, no installer_payload zips.
+      # Runtime and architecture-matching uninstaller are downloaded from goshkow.ru.
+      - name: Build slim installer (local build_nuitka_installer.ps1)
         shell: pwsh
         run: |
-          # Same as local: no -X64Source/-Arm64Source, no installer_payload app zips.
-          # Runtime download is from goshkow.ru; CI must not embed portable builds.
           $version = "${{ steps.meta.outputs.version }}"
           .\scripts\build_nuitka_installer.ps1 `
             -Python python `
             -OutputDir dist_installer `
             -Version $version `
             -Compiler msvc `
+            -SkipUninstaller `
             -SkipPrepareRelease
 
-      - name: Upload slim installer
-        uses: actions/upload-artifact@v6
+      - name: Sanity-check installer size
+        shell: pwsh
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          $installer = Get-Item ".\dist_installer\install_zaprethub_${version}_universal.exe"
+          $mb = [math]::Round($installer.Length / 1MB, 1)
+          Write-Host "Slim installer size: $mb MB (QtWebEngine UI + optional bundled uninstaller; no portable app zips)"
+          # Compressed WebEngine installer is expected ~150-350MB.
+          # >450MB usually means an embedded portable payload mistake.
+          if ($installer.Length -gt (450MB)) {
+            throw "Installer too large ($mb MB > 450 MB). Likely embedded app payload; slim build expected."
+          }
+
+      - uses: actions/upload-artifact@v6
         with:
           name: release-slim-installer
           path: dist_installer/install_zaprethub_${{ steps.meta.outputs.version }}_universal.exe
           if-no-files-found: error
 
-  publish-release:
+  publish:
     needs:
-      - build-portable-x64
-      - build-portable-arm64
-      - build-slim-installer
+      - portable-x64
+      - portable-arm64
+      - installer
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
       - name: Resolve release metadata
         id: release_meta
@@ -261,24 +264,35 @@ jobs:
           $version = "${{ steps.release_meta.outputs.version }}"
           $releaseDir = ".\release_$version"
           New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-          $needed = @(
+          Write-Host "Downloaded artifacts:"
+          Get-ChildItem .\.artifacts -Recurse -File | ForEach-Object {
+            Write-Host " - $($_.FullName.Substring((Resolve-Path .\.artifacts).Path.Length + 1))"
+          }
+
+          $required = @(
             "zapret_hub_${version}_portable_win_x64.zip",
             "zapret_hub_${version}_portable_win_arm64.zip",
-            "install_zaprethub_${version}_universal.exe",
-            "uninstall_zaprethub_${version}_win_x64.exe",
-            "uninstall_zaprethub_${version}_win_arm64.exe"
+            "install_zaprethub_${version}_universal.exe"
           )
-          foreach ($name in $needed) {
+          foreach ($name in $required) {
             $found = Get-ChildItem .\.artifacts -Recurse -File -Filter $name | Select-Object -First 1
-            if (-not $found) { throw "Missing release asset: $name" }
+            if (-not $found) { throw "Missing required release asset: $name" }
             Copy-Item $found.FullName (Join-Path $releaseDir $name) -Force
             Write-Host "Staged $name ($([math]::Round($found.Length/1MB,1)) MB)"
           }
-          # Guard: slim installer must not be a fat payload blob
-          $installer = Get-Item (Join-Path $releaseDir "install_zaprethub_${version}_universal.exe")
-          $maxMb = 120
-          if ($installer.Length -gt ($maxMb * 1MB)) {
-            throw "Installer looks fat ($([math]::Round($installer.Length/1MB,1)) MB > $maxMb MB). Slim build expected."
+
+          $optional = @(
+            "uninstall_zaprethub_${version}_win_x64.exe",
+            "uninstall_zaprethub_${version}_win_arm64.exe"
+          )
+          foreach ($name in $optional) {
+            $found = Get-ChildItem .\.artifacts -Recurse -File -Filter $name | Select-Object -First 1
+            if ($found) {
+              Copy-Item $found.FullName (Join-Path $releaseDir $name) -Force
+              Write-Host "Staged optional $name ($([math]::Round($found.Length/1MB,1)) MB)"
+            } else {
+              Write-Warning "Optional standalone uninstaller is absent: $name"
+            }
           }
 
       - name: Optional Authenticode signing
@@ -293,14 +307,19 @@ jobs:
             Write-Warning "WINDOWS_SIGNING_PFX_BASE64 is not configured; publishing unsigned Windows binaries."
             exit 0
           }
+          if (-not (Test-Path .\scripts\sign_windows_artifacts.ps1)) {
+            Write-Warning "sign_windows_artifacts.ps1 missing; skipping signing."
+            exit 0
+          }
           $certificatePath = Join-Path $env:RUNNER_TEMP "zapret-hub-signing.pfx"
           [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
           $env:WINDOWS_SIGNING_PFX_PATH = $certificatePath
-          $targets = @(
-            (Join-Path $releaseDir "install_zaprethub_${version}_universal.exe"),
+          $targets = @((Join-Path $releaseDir "install_zaprethub_${version}_universal.exe"))
+          $optionalTargets = @(
             (Join-Path $releaseDir "uninstall_zaprethub_${version}_win_x64.exe"),
             (Join-Path $releaseDir "uninstall_zaprethub_${version}_win_arm64.exe")
           )
+          $targets += $optionalTargets | Where-Object { Test-Path -LiteralPath $_ }
           .\scripts\sign_windows_artifacts.ps1 -Files $targets -RequireSignature
 
       - name: Read release notes
@@ -319,9 +338,9 @@ jobs:
           } else {
             $body = @(
               "## Assets",
-              "- ``install_zaprethub_${version}_universal.exe`` — slim installer (downloads app from goshkow.ru)",
-              "- ``zapret_hub_${version}_portable_win_x64.zip`` / ``_win_arm64.zip`` — portable builds for the mirror",
-              "- ``uninstall_zaprethub_${version}_win_x64.exe`` / ``_win_arm64.exe`` — standalone uninstallers"
+              "- ``install_zaprethub_${version}_universal.exe`` - slim installer (downloads app from goshkow.ru)",
+              "- ``zapret_hub_${version}_portable_win_x64.zip`` / ``_win_arm64.zip`` - portable builds",
+              "- ``uninstall_zaprethub_${version}_win_x64.exe`` / ``_win_arm64.exe`` - standalone uninstallers"
             ) -join "`n"
           }
           "body<<__ZAPRET_HUB_NOTES__" >> $env:GITHUB_OUTPUT
@@ -338,5 +357,4 @@ jobs:
             release_${{ steps.release_meta.outputs.version }}/install_zaprethub_${{ steps.release_meta.outputs.version }}_universal.exe
             release_${{ steps.release_meta.outputs.version }}/zapret_hub_${{ steps.release_meta.outputs.version }}_portable_win_x64.zip
             release_${{ steps.release_meta.outputs.version }}/zapret_hub_${{ steps.release_meta.outputs.version }}_portable_win_arm64.zip
-            release_${{ steps.release_meta.outputs.version }}/uninstall_zaprethub_${{ steps.release_meta.outputs.version }}_win_x64.exe
-            release_${{ steps.release_meta.outputs.version }}/uninstall_zaprethub_${{ steps.release_meta.outputs.version }}_win_arm64.exe
+            release_${{ steps.release_meta.outputs.version }}/uninstall_zaprethub_${{ steps.release_meta.outputs.version }}_win_*.exe
