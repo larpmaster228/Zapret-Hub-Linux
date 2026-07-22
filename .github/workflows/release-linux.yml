@@ -141,6 +141,12 @@ jobs:
             echo "__ZAPRET_HUB_NOTES__"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Debug release files
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          echo "Release dir contents:"
+          ls -lhR "release_${VERSION}/" 2>/dev/null || echo "release_${VERSION}/ not found"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         env:
@@ -149,7 +155,9 @@ jobs:
           tag_name: ${{ needs.version.outputs.tag }}
           name: ${{ needs.version.outputs.tag }}
           body: ${{ steps.release_notes.outputs.body }}
-          files: release_${{ needs.version.outputs.version }}/zapret_hub_*.tar.gz
+          files: |
+            release_${{ needs.version.outputs.version }}/zapret_hub_*.tar.gz
+          fail_on_unmatched_files: false
 
   aur:
     name: Update AUR package
