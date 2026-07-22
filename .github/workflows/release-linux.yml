@@ -53,15 +53,17 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgl1-mesa-glx \
+            libgl1 \
+            libegl1 \
             libglib2.0-0 \
             libxkbcommon0 \
+            libxkbcommon-x11-0 \
             libxcb-cursor0 \
             libxcb-icccm4 \
             libxcb-image0 \
@@ -72,7 +74,6 @@ jobs:
             libxcb-xinerama0 \
             libxcb-xfixes0 \
             libxcb-xkb1 \
-            libxkbcommon-x11-0 \
             rsync
 
       - name: Install Python dependencies
@@ -107,15 +108,17 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libgl1-mesa-glx \
+            libgl1 \
+            libegl1 \
             libglib2.0-0 \
             libxkbcommon0 \
+            libxkbcommon-x11-0 \
             libxcb-cursor0 \
             libxcb-icccm4 \
             libxcb-image0 \
@@ -126,7 +129,6 @@ jobs:
             libxcb-xinerama0 \
             libxcb-xfixes0 \
             libxcb-xkb1 \
-            libxkbcommon-x11-0 \
             rsync
 
       - name: Install Python dependencies
