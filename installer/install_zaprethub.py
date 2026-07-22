@@ -504,7 +504,7 @@ def _download_payload_from_mirror(
     progress_cb=None,
     *,
     cancel_event: threading.Event | None = None,
-) -> tuple[Path, Path, str]:
+) -> tuple[Path, Path, str, dict[str, str]]:
     def report(percent: int, status: str, *, downloaded: int = 0, total: int = 0) -> None:
         _check_cancel(cancel_event)
         if progress_cb is None:
@@ -602,7 +602,12 @@ def _download_payload_from_mirror(
             raise ValueError(tr("контрольная сумма SHA-256 не совпала", "SHA-256 checksum mismatch"))
         _installer_log("download_complete", bytes=downloaded, remote_version=remote_version, elapsed_sec=round(time.monotonic() - download_started, 2))
         report(46, tr("Проверка сборки…", "Verifying build…"))
-        return archive_path, temp_root, remote_version
+        release_identity = {
+            "version": remote_version,
+            "digest": expected_digest or digest.hexdigest().lower(),
+            "updated_at": str(asset.get("updated_at") or release.get("binary_updated_at") or ""),
+        }
+        return archive_path, temp_root, remote_version, release_identity
     except Exception as error:
         _installer_log("download_failed", error=str(error))
         shutil.rmtree(temp_root, ignore_errors=True)
@@ -1017,9 +1022,10 @@ class InstallerWorker(QThread):
                     local_payload = direct_payload_zip
             payload_zip: Path | None = None
             remote_version = ""
+            release_identity: dict[str, str] = {}
             self._emit(1, tr("Запуск загрузки с goshkow.ru…", "Starting download from goshkow.ru…"))
             try:
-                payload_zip, downloaded_payload_root, remote_version = _download_payload_from_mirror(
+                payload_zip, downloaded_payload_root, remote_version, release_identity = _download_payload_from_mirror(
                     self._emit,
                     cancel_event=self.cancel_event,
                 )
@@ -1080,6 +1086,14 @@ class InstallerWorker(QThread):
             self._emit(84, tr("Установка файлов…", "Installing files…"))
             _overlay_tree(source_root, self.target_dir, self.target_dir, preserved_names, remove_extra=self.clean_target)
             _installer_log("overlay_done", target_dir=str(self.target_dir))
+            if release_identity:
+                identity_dir = self.target_dir / "data"
+                identity_dir.mkdir(parents=True, exist_ok=True)
+                (identity_dir / "app_release_identity.json").write_text(
+                    json.dumps(release_identity, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                _installer_log("release_identity_saved", digest=release_identity.get("digest", ""))
 
             self._cleanup_temps()
             self._emit(100, tr("Готово", "Done"))
