@@ -1,0 +1,243 @@
+name: Release Build (Linux)
+
+on:
+  push:
+    tags:
+      - "v*-linux"
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag or release version (for example v3.0.0-linux)"
+        required: true
+        default: "v3.0.0-linux"
+      release_name:
+        description: "Release title"
+        required: true
+        default: "Zapret Hub 3.0.0 (Linux)"
+      changelog:
+        description: "Release changelog (optional)"
+        required: false
+        default: ""
+
+jobs:
+  build-linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-glx \
+            libglib2.0-0 \
+            libxkbcommon0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xinerama0 \
+            libxcb-xfixes0 \
+            libxcb-xkb1 \
+            libxkbcommon-x11-0 \
+            rsync
+
+      - name: Install Python dependencies
+        env:
+          PIP_PREFER_BINARY: "1"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+          python -m pip install pyinstaller
+
+      - name: Resolve version
+        id: meta
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
+            TAG="v3.0.0-linux"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build Linux x64 portable
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}" ./scripts/build_linux.sh
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-linux-x64
+          path: zapret_hub_*_linux_x64.tar.gz
+          if-no-files-found: error
+
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-glx \
+            libglib2.0-0 \
+            libxkbcommon0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xinerama0 \
+            libxcb-xfixes0 \
+            libxcb-xkb1 \
+            libxkbcommon-x11-0 \
+            rsync
+
+      - name: Install Python dependencies
+        env:
+          PIP_PREFER_BINARY: "1"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+          python -m pip install pyinstaller
+
+      - name: Resolve version
+        id: meta
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
+            TAG="v3.0.0-linux"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build Linux arm64 portable
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}" ./scripts/build_linux.sh
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: release-linux-arm64
+          path: zapret_hub_*_linux_x64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - build-linux-x64
+      - build-linux-arm64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve release metadata
+        id: release_meta
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
+            TAG="v3.0.0-linux"
+          fi
+          VERSION="${TAG#v}"
+          NAME="${{ inputs.release_name }}"
+          if [ -z "$NAME" ]; then
+            NAME="Zapret Hub $VERSION (Linux)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: .artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Stage release folder
+        run: |
+          VERSION="${{ steps.release_meta.outputs.version }}"
+          TAG="${{ steps.release_meta.outputs.tag }}"
+          RELEASE_DIR="release_${VERSION}"
+          mkdir -p "$RELEASE_DIR"
+
+          echo "Downloaded artifacts:"
+          find .artifacts -type f
+
+          # Rename arm64 archive to avoid name collision
+          for f in .artifacts/zapret_hub_*_linux_x64.tar.gz; do
+            [ -f "$f" ] || continue
+            BASENAME=$(basename "$f")
+            if echo "$f" | grep -q 'linux-arm64'; then
+              NEWNAME=$(echo "$BASENAME" | sed 's/x64/arm64/')
+              cp "$f" "$RELEASE_DIR/$NEWNAME"
+              echo "Staged $NEWNAME"
+            else
+              cp "$f" "$RELEASE_DIR/$BASENAME"
+              echo "Staged $BASENAME"
+            fi
+          done
+
+          echo "Release assets:"
+          ls -lh "$RELEASE_DIR/"
+
+      - name: Read release notes
+        id: release_notes
+        run: |
+          VERSION="${{ steps.release_meta.outputs.version }}"
+          TAG="${{ steps.release_meta.outputs.tag }}"
+          NOTES_PATH=".github/release-notes/${VERSION}.md"
+          CHANGELOG="${{ inputs.changelog }}"
+
+          if [ -f "$NOTES_PATH" ]; then
+            BODY=$(cat "$NOTES_PATH")
+          elif [ -n "$CHANGELOG" ]; then
+            BODY="$CHANGELOG"
+          else
+            BODY="## Assets
+- \`zapret_hub_${VERSION}_linux_x64.tar.gz\` - portable build for x86_64
+- \`zapret_hub_${VERSION}_linux_arm64.tar.gz\` - portable build for ARM64"
+          fi
+
+          {
+            echo "body<<__ZAPRET_HUB_NOTES__"
+            echo "$BODY"
+            echo "__ZAPRET_HUB_NOTES__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          name: ${{ steps.release_meta.outputs.name }}
+          body: ${{ steps.release_notes.outputs.body }}
+          files: |
+            release_${{ steps.release_meta.outputs.version }}/zapret_hub_*_linux_*.tar.gz
