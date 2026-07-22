@@ -9,7 +9,7 @@ license=('MIT')
 options=('!strip')
 depends=('glib2' 'libglvnd' 'nftables' 'iproute2')
 optdepends=('qt6-base: Qt GUI' 'qt6-wayland: Wayland support')
-source=("$url/releases/download/v${pkgver}-linux/zapret_hub_${pkgver}_linux_x64.tar.gz")
+source=("$url/releases/download/v${pkgver}/zapret_hub_${pkgver}_linux_x64.tar.gz")
 sha256sums=('SKIP')
 
 package() {
