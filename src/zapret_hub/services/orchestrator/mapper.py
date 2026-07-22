@@ -47,6 +47,15 @@ PROCESS_SERVICE_MAP: dict[str, str] = {
     "back4blood": "gaming",
     "figma": "figma",
     "netflix": "netflix",
+
+    # Linux process names (/proc/pid/comm — case-sensitive)
+    "nfqws": "zapret",
+    "zapret": "zapret",
+    "EpicGamesLauncher": "epic-games",
+    "UbisoftConnect": "ubisoft",
+    "Battle.net": "battle-net",
+    "RiotClientServices": "riot-games",
+    "LeagueClient": "league-of-legends",
 }
 
 

@@ -35,7 +35,7 @@ class StorageManager:
                 "description": "Основной модуль обхода блокировок для сайтов и сервисов.",
                 "version": zapret_version,
                 "source": "https://github.com/Flowseal/zapret-discord-youtube",
-                "command": ["cmd.exe", "/c", "general.bat"],
+                "command": ["./service.sh", "run", "--config", "conf.env"] if is_linux() else ["cmd.exe", "/c", "general.bat"],
                 "enabled": True,
                 "autostart": False,
             },
@@ -65,7 +65,7 @@ class StorageManager:
                 "description": "Прокси для Telegram через локальный порт.",
                 "version": tg_version,
                 "source": "https://github.com/Flowseal/tg-ws-proxy",
-                "command": ["TgWsProxy_windows.exe"],
+                "command": ["python3", "-m", "proxy.tg_ws_proxy"] if is_linux() else ["TgWsProxy_windows.exe"],
                 "enabled": True,
                 "autostart": False,
             },
@@ -138,7 +138,7 @@ class StorageManager:
         self._ensure_icon_assets()
 
     def _detect_zapret_version(self) -> str:
-        service_bat = self.paths.runtime_dir / "zapret-discord-youtube" / "service.bat"
+        service_bat = self.paths.runtime_dir / "zapret-discord-youtube" / ("service.sh" if is_linux() else "service.bat")
         if not service_bat.exists():
             return "unknown"
         try:
@@ -291,7 +291,7 @@ class StorageManager:
         source_candidates = [
             sample_root,
             self.paths.runtime_dir / "zapret-discord-youtube",
-            Path(r"C:\zapret-discord-youtube-1.9.7"),
+            Path("/opt/zapret-discord-youtube-1.9.7") if is_linux() else Path(r"C:\zapret-discord-youtube-1.9.7"),
         ]
         source_root = next((path for path in source_candidates if self._looks_like_zapret_bundle(path)), None)
         if source_root is None:

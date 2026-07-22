@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
+import re
 import socket
 import ssl
+import sys
 import time
 import urllib.request
-from urllib.error import HTTPError
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -73,13 +75,11 @@ def probe_required_ok(results: list[ProbeResult], *, required_hosts: list[str] |
     return True
 
 
-def _windows_no_window_kwargs() -> dict[str, Any]:
-    """Ensure console helpers (netstat and similar) never flash a window."""
-    import subprocess
-    import sys
-
+def _subprocess_kwargs() -> dict[str, Any]:
+    """Platform-aware subprocess kwargs. On Windows, suppress console windows."""
     if not sys.platform.startswith("win"):
         return {}
+    import subprocess
     kwargs: dict[str, Any] = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
     try:
         startup = subprocess.STARTUPINFO()
@@ -94,6 +94,8 @@ def _windows_no_window_kwargs() -> dict[str, Any]:
 class SignalCollector:
     def __init__(self) -> None:
         self._pid_cache: dict[int, str] = {}
+        self._procfs_cache: dict[int, str] = {}
+        self._procfs_at = 0.0
         self._toolhelp_cache: dict[int, str] = {}
         self._toolhelp_at = 0.0
 
@@ -119,26 +121,6 @@ class SignalCollector:
                 latency_ms=(time.perf_counter() - started) * 1000.0,
                 kind="http",
                 cls="ok",
-            )
-        except HTTPError as error:
-            # A 4xx response proves DNS, TCP and TLS connectivity. Many service
-            # gateways intentionally reject a generic orchestrator GET request.
-            if 400 <= int(error.code) < 500:
-                return ProbeResult(
-                    ok=True,
-                    target=url,
-                    latency_ms=(time.perf_counter() - started) * 1000.0,
-                    kind="http",
-                    cls="ok",
-                )
-            cls = _classify_error(str(error), kind="http")
-            return ProbeResult(
-                ok=False,
-                target=url,
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-                error=str(error),
-                kind="http",
-                cls=cls,
             )
         except Exception as error:
             cls = _classify_error(str(error), kind="http")
@@ -249,11 +231,20 @@ class SignalCollector:
         try:
             import psutil  # type: ignore
         except Exception:
-            samples = self._snapshot_windows_netstat(limit=limit)
+            if sys.platform.startswith("win"):
+                samples = self._snapshot_windows_netstat(limit=limit)
+            else:
+                samples = self._snapshot_ss(limit=limit)
         else:
             samples = self._snapshot_psutil(psutil, limit=limit)
             if not samples:
-                samples = self._snapshot_windows_netstat(limit=limit)
+                if sys.platform.startswith("win"):
+                    samples = self._snapshot_windows_netstat(limit=limit)
+                else:
+                    samples = self._snapshot_ss(limit=limit)
+        # Normalize Linux ss states (SYN-SENT → SYN_SENT) for cross-platform consistency.
+        for s in samples:
+            s.state = str(s.state or "").replace("-", "_").upper()
         # Prefer failing / interesting states first.
         samples.sort(key=lambda s: (0 if (s.state or "").upper() in {"SYN_SENT", "SYN_RECEIVED"} else 1, s.proto != "udp"))
         if resolve_dns:
@@ -310,16 +301,43 @@ class SignalCollector:
             except Exception:
                 name = ""
         if not name:
-            # Prefer silent Toolhelp snapshot over spawning console process helpers.
-            name = self._toolhelp_pid_names().get(pid, "")
+            if sys.platform.startswith("win"):
+                name = self._toolhelp_pid_names().get(pid, "")
+            else:
+                name = self._procfs_pid_names().get(pid, "")
         self._pid_cache[pid] = name
         if len(self._pid_cache) > 400:
             for key in list(self._pid_cache.keys())[:200]:
                 self._pid_cache.pop(key, None)
         return name
 
+    def _procfs_pid_names(self) -> dict[int, str]:
+        """Linux: read process names from /proc/pid/comm."""
+        now = time.monotonic()
+        if self._procfs_cache and (now - self._procfs_at) < 2.0:
+            return self._procfs_cache
+        mapping: dict[int, str] = {}
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/comm", "r") as fh:
+                        name = fh.read().strip()
+                    if name:
+                        mapping[int(entry)] = name
+                except (FileNotFoundError, PermissionError):
+                    continue
+        except Exception:
+            return self._procfs_cache
+        self._procfs_cache = mapping
+        self._procfs_at = now
+        if len(self._procfs_cache) > 500:
+            self._procfs_cache = dict(list(mapping.items())[:300])
+        return mapping
+
     def _toolhelp_pid_names(self) -> dict[int, str]:
-        import sys
+        """Windows: Toolhelp32 snapshot for process name resolution."""
         import time as time_mod
 
         if not sys.platform.startswith("win"):
@@ -369,12 +387,103 @@ class SignalCollector:
         self._toolhelp_at = now
         return mapping
 
+    def _snapshot_ss(self, *, limit: int = 80) -> list[ConnSample]:
+        """Linux: parse 'ss -tunap' output for connection samples."""
+        import subprocess
+
+        samples: list[ConnSample] = []
+        pid_names = self._procfs_pid_names()
+        try:
+            completed = subprocess.run(
+                ["ss", "-tunap"],
+                capture_output=True,
+                text=True,
+                timeout=2.5,
+                check=False,
+            )
+        except Exception:
+            return []
+        _pid_re = re.compile(r"pid=(\d+)")
+        _proc_re = re.compile(r'\("([^"]+)"')
+        for line in completed.stdout.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            if parts[0] in ("Netid",):
+                continue
+            netid = parts[0].lower() if len(parts) >= 6 else ""
+            if netid in ("tcp", "tcp6", "udp", "udp6"):
+                if len(parts) < 6:
+                    continue
+                state = parts[1]
+                peer_addr = parts[4]
+                process_info = " ".join(parts[5:])
+            else:
+                if len(parts) < 5:
+                    continue
+                state = parts[0]
+                peer_addr = parts[3]
+                process_info = " ".join(parts[4:])
+                netid = "tcp" if "tcp" in (state or "").lower() or state.upper() in {
+                    "ESTAB", "SYN-SENT", "SYN-RECEIVED", "CLOSE-WAIT", "TIME-WAIT", "FIN-WAIT",
+                    "LISTEN", "CLOSING", "LAST-ACK",
+                } else "udp"
+
+            proto = "tcp" if netid.startswith("tcp") else "udp"
+
+            if proto == "tcp" and state.upper().replace("-", "_") not in {
+                "SYN_SENT", "SYN_RECEIVED", "ESTAB", "CLOSE_WAIT",
+                "SYN-SENT", "SYN-RECEIVED", "ESTABLISHED",
+            }:
+                continue
+
+            if ":" not in peer_addr:
+                continue
+            if peer_addr.startswith("["):
+                bracket_end = peer_addr.index("]")
+                host = peer_addr[1:bracket_end]
+                port_s = peer_addr[bracket_end + 2:] if len(peer_addr) > bracket_end + 1 else ""
+            else:
+                host, _, port_s = peer_addr.rpartition(":")
+            host = host.strip("[]")
+            if host in {"127.0.0.1", "0.0.0.0", "::", "*", "::1"}:
+                continue
+            try:
+                port = int(port_s)
+            except ValueError:
+                continue
+
+            pid = 0
+            process = ""
+            pid_match = _pid_re.search(process_info)
+            if pid_match:
+                pid = int(pid_match.group(1))
+                process = pid_names.get(pid, "")
+            if not process:
+                proc_match = _proc_re.search(process_info)
+                if proc_match:
+                    process = proc_match.group(1)
+
+            samples.append(
+                ConnSample(
+                    remote_ip=host,
+                    remote_port=port,
+                    proto=proto,
+                    state=state,
+                    pid=pid,
+                    process=process,
+                )
+            )
+            if len(samples) >= limit:
+                return samples
+        return samples
+
     def _enrich_domains(self, samples: list[ConnSample], *, max_lookups: int = 8) -> None:
         lookups = 0
         for sample in samples:
             if sample.domain or lookups >= max_lookups:
                 continue
-            state = (sample.state or "").upper()
+            state = (sample.state or "").upper().replace("-", "_")
             if state not in {"SYN_SENT", "SYN_RECEIVED"} and sample.remote_port not in {443, 80, 5222, 3478}:
                 continue
             try:
@@ -387,12 +496,11 @@ class SignalCollector:
 
     def _snapshot_windows_netstat(self, *, limit: int = 80) -> list[ConnSample]:
         import subprocess
-        import sys
 
         if not sys.platform.startswith("win"):
             return []
         samples: list[ConnSample] = []
-        quiet = _windows_no_window_kwargs()
+        quiet = _subprocess_kwargs()
         pid_names = self._toolhelp_pid_names()
         for proto_flag, proto_name in (("tcp", "tcp"), ("udp", "udp")):
             try:
@@ -465,7 +573,7 @@ def _classify_error(error: str, *, kind: str) -> str:
         return "tls_fail"
     if kind == "http" or "http" in err or "403" in err or "451" in err or "redirect" in err:
         return "http_block"
-    if "reset" in err or "connection refused" in err or "10054" in err:
+    if "reset" in err or "connection refused" in err or "10054" in err or "errno 104" in err:
         return "tcp_timeout"
     return "tcp_timeout"
 

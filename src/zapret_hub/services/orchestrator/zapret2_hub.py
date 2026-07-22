@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 import shutil
 
@@ -92,7 +93,7 @@ function hub_tls(ctx, desync)
   local s = _strategy()
   if s == "fake_heavy" then
     arg.blob = arg.blob or "fake_default_tls"
-    arg.tcp_md5 = ""
+    arg.tcp_md5 = true
     arg.repeats = arg.repeats or 11
     arg.tls_mod = arg.tls_mod or "rnd,dupsid,rndsni"
     return fake(ctx, desync)
@@ -103,7 +104,7 @@ function hub_tls(ctx, desync)
     return multisplit(ctx, desync)
   end
   arg.blob = arg.blob or "fake_default_tls"
-  arg.tcp_md5 = ""
+  arg.tcp_md5 = true
   arg.tls_mod = arg.tls_mod or "rnd,rndsni,dupsid"
   return fake(ctx, desync)
 end
@@ -116,7 +117,7 @@ function hub_tls_b(ctx, desync)
     return multidisorder(ctx, desync)
   elseif s == "multisplit" then
     arg.blob = arg.blob or "fake_default_tls"
-    arg.tcp_md5 = ""
+    arg.tcp_md5 = true
     arg.tls_mod = arg.tls_mod or "rnd,dupsid"
     return fake(ctx, desync)
   end
@@ -131,7 +132,7 @@ function hub_http(ctx, desync)
   local s = _strategy()
   if s == "fake_heavy" then
     arg.blob = arg.blob or "fake_default_http"
-    arg.tcp_md5 = ""
+    arg.tcp_md5 = true
     arg.repeats = arg.repeats or 6
     return fake(ctx, desync)
   elseif s == "multisplit" then
@@ -139,18 +140,18 @@ function hub_http(ctx, desync)
     return multisplit(ctx, desync)
   end
   arg.blob = arg.blob or "fake_default_http"
-  arg.tcp_md5 = ""
+  arg.tcp_md5 = true
   return fake(ctx, desync)
 end
 
 function hub_http_b(ctx, desync)
   local arg = _ensure_arg(desync)
   if _strategy() == "fake_heavy" then
-    arg.tcp_md5 = ""
+    arg.tcp_md5 = true
     return fakedsplit(ctx, desync)
   end
   arg.blob = arg.blob or "fake_default_http"
-  arg.tcp_md5 = ""
+  arg.tcp_md5 = true
   return fake(ctx, desync)
 end
 
@@ -422,13 +423,22 @@ def harvest_service_ips(service_ids: list[str]) -> list[str]:
     return out
 
 
-def bundle_winws_root(winws2_path: Path) -> Path:
-    return Path(winws2_path).resolve().parent
+def bundle_nfqws_root(nfqws_path: Path) -> Path:
+    return Path(nfqws_path).resolve().parent
+
+
+# Backward-compatible alias for Windows callers.
+bundle_winws_root = bundle_nfqws_root
 
 
 def _filter_file(bundle_root: Path, name: str) -> Path | None:
-    candidate = bundle_root / "windivert.filter" / name
-    return candidate if candidate.is_file() else None
+    if sys.platform.startswith("win"):
+        candidate = bundle_root / "windivert.filter" / name
+        return candidate if candidate.is_file() else None
+    candidate = bundle_root / "nfqueue.filter" / name
+    if candidate.is_file():
+        return candidate
+    return None
 
 
 def find_bundle_lua(bundle_root: Path, filename: str) -> Path | None:
@@ -445,8 +455,7 @@ def build_default_profile_args(
     tcp_ports: str,
     strategy_id: str = "balanced",
 ) -> list[str]:
-    """Filter/desync profiles; lua-init files must already be on the command line."""
-    _ = strategy_id
+    """Build nfqws v1 multi-strategy profiles using --dpi-desync (no Lua)."""
     hub = str(lists["hub"])
     auto = str(lists["auto"])
     exclude = str(lists["exclude"])
@@ -461,49 +470,74 @@ def build_default_profile_args(
         "--hostlist-auto-fail-threshold=2",
         "--hostlist-auto-fail-time=60",
     ]
+    base = [*hostlist_args, *auto_args]
+
+    sid = strategy_id if strategy_id in STRATEGY_IDS else "balanced"
+
+    if sid == "fake_heavy":
+        fake_repeats = "--dpi-desync-repeats=6"
+        fake_ttl = "--dpi-desync-ttl=2"
+    elif sid == "multisplit":
+        fake_repeats = "--dpi-desync-repeats=2"
+        fake_ttl = "--dpi-desync-ttl=1"
+    else:
+        fake_repeats = "--dpi-desync-repeats=2"
+        fake_ttl = "--dpi-desync-ttl=1"
 
     args: list[str] = []
-    for name in (
-        "windivert_part.discord_media.txt",
-        "windivert_part.stun.txt",
-        "windivert_part.quic_initial_ietf.txt",
-    ):
-        path = _filter_file(bundle_root, name)
-        if path is not None:
-            args.append(f"--wf-raw-part=@{path}")
 
-    args.extend(
-        [
-            "--filter-tcp=80",
-            "--filter-l7=http",
-            *hostlist_args,
-            *auto_args,
-            "--payload=http_req",
-            "--lua-desync=hub_http",
-            "--lua-desync=hub_http_b",
-            "--new",
-            f"--filter-tcp={tcp_ports}",
-            "--filter-l7=tls",
-            *hostlist_args,
-            *auto_args,
-            "--payload=tls_client_hello",
-            "--lua-desync=hub_tls",
-            "--lua-desync=hub_tls_b",
-            "--new",
-            "--filter-udp=443",
-            "--filter-l7=quic",
-            *hostlist_args,
-            *auto_args,
-            "--payload=quic_initial",
-            "--lua-desync=hub_quic",
-            "--new",
-            "--filter-l7=wireguard,stun,discord",
-            "--payload=wireguard_initiation,wireguard_cookie,stun,discord_ip_discovery",
-            "--lua-desync=hub_discord",
-        ]
-    )
+    # Profile 1: HTTP
+    args.extend([
+        "--filter-tcp=80",
+        "--filter-l7=http",
+        *base,
+    ])
+    if sid == "multisplit":
+        args.extend(["--dpi-desync=fakedsplit", fake_ttl, fake_repeats])
+    else:
+        args.extend(["--dpi-desync=fake,disorder2", fake_ttl, fake_repeats])
+
+    # Profile 2: TLS
+    args.extend([
+        "--new",
+        f"--filter-tcp={tcp_ports}",
+        "--filter-l7=tls",
+        *base,
+    ])
+    if sid == "fake_heavy":
+        args.extend([
+            "--dpi-desync=fake", fake_ttl, fake_repeats,
+            "--dpi-desync-fake-tls=rnd,sni,padencap",
+        ])
+    elif sid == "multisplit":
+        args.extend([
+            "--dpi-desync=split", fake_ttl, fake_repeats,
+            "--dpi-desync-split-pos=1",
+        ])
+    else:
+        args.extend([
+            "--dpi-desync=fake,disorder2", fake_ttl, fake_repeats,
+            "--dpi-desync-fake-tls=rnd,sni",
+        ])
+
+    # Profile 3: QUIC
+    args.extend([
+        "--new",
+        "--filter-udp=443",
+        "--filter-l7=quic",
+        *base,
+        "--dpi-desync=fake", fake_ttl, fake_repeats,
+    ])
+
+    # Profile 4: Discord / WireGuard / STUN
+    args.extend([
+        "--new",
+        "--filter-l7=wireguard,stun,discord",
+        *base,
+        "--dpi-desync=fake", fake_ttl, fake_repeats,
+    ])
+
     return args
-
 
 def next_strategy_id(current: str) -> str:
     current = (current or "balanced").strip() or "balanced"

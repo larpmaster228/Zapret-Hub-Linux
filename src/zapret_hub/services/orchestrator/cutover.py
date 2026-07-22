@@ -599,6 +599,10 @@ class CutoverManager:
             return "lists"
         if step.kind == "enable_mod":
             if backend == "zapret2":
+                from zapret_hub.os_detection import is_linux
+                if is_linux():
+                    self._log("info", "Skipping enable_mod on zapret2 backend (nfqws)", mod_id=step.value)
+                    return "mods"
                 self._apply_enable_mod2(step.value)
                 return "mods"
             self._apply_enable_mod(step.value)

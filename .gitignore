@@ -9,6 +9,7 @@ __pycache__/
 # venv / deps
 .venv/
 web_ui/node_modules/
+web_ui/dist/
 installer_web/node_modules/
 uninstaller_web/node_modules/
 
@@ -55,3 +56,4 @@ README.md
 # ide
 .idea/
 .vscode/
+
