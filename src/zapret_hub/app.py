@@ -239,6 +239,9 @@ def run(argv: list[str] | None = None) -> int:
             return elevate_result
 
     _set_windows_app_id()
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+        os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
     _startup_trace("run: before QApplication")
     app = QApplication(sys.argv)
     _startup_trace("run: QApplication created")
