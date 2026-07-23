@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from zapret_hub.domain import AppPaths
+from zapret_hub.os_detection import is_linux
 
 
 class StorageManager:

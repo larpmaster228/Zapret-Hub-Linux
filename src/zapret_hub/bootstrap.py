@@ -71,13 +71,28 @@ def bootstrap_application() -> ApplicationContext:
         ui_assets_dir=ui_assets_dir,
         sample_data_dir=sample_data_dir,
     )
+    if not ui_assets_dir.exists():
+        fallback = resource_root / "ui_assets"
+        if fallback.exists():
+            ui_assets_dir = fallback
+    if not sample_data_dir.exists():
+        fallback = resource_root / "sample_data"
+        if fallback.exists():
+            sample_data_dir = fallback
+
+    if not sys.platform.startswith("win"):
+        core_dir = work_root / "core"
+        default_packs_dir = work_root / "default_packs"
+    else:
+        core_dir = install_root / "core"
+        default_packs_dir = install_root / "default_packs"
 
     paths = AppPaths(
         install_root=install_root,
-        core_dir=install_root / "core",
+        core_dir=core_dir,
         runtime_dir=runtime_dir,
         configs_dir=work_root / "configs",
-        default_packs_dir=install_root / "default_packs",
+        default_packs_dir=default_packs_dir,
         mods_dir=work_root / "mods",
         mods_zapret2_dir=work_root / "mods_zapret2",
         merged_runtime_dir=work_root / "merged_runtime",
@@ -218,10 +233,16 @@ def _hydrate_bundled_assets(
             shutil.copytree(source, destination, dirs_exist_ok=True)
 
     if bundled_ui_assets.exists() and not ui_assets_dir.exists():
-        shutil.copytree(bundled_ui_assets, ui_assets_dir, dirs_exist_ok=True)
+        try:
+            shutil.copytree(bundled_ui_assets, ui_assets_dir, dirs_exist_ok=True)
+        except OSError:
+            pass
 
     if bundled_sample_data.exists() and not sample_data_dir.exists():
-        shutil.copytree(bundled_sample_data, sample_data_dir, dirs_exist_ok=True)
+        try:
+            shutil.copytree(bundled_sample_data, sample_data_dir, dirs_exist_ok=True)
+        except OSError:
+            pass
 
 
 def _ensure_windows_apps_registration(install_root: Path) -> None:
@@ -292,6 +313,24 @@ def _resolve_work_root(install_root: Path) -> Path:
         return install_root / "user_data"
     if not is_packaged_runtime():
         return install_root
+    if sys.platform.startswith("linux"):
+        xdg_data = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+        target = Path(xdg_data) / "zapret_hub"
+        if not target.exists():
+            for legacy_name in ("Zapret Hub", "ZapretHub", "Zapret_Hub"):
+                legacy = Path(xdg_data) / legacy_name
+                if not legacy.exists() or not legacy.is_dir():
+                    continue
+                try:
+                    legacy.rename(target)
+                    break
+                except Exception:
+                    try:
+                        shutil.copytree(legacy, target, dirs_exist_ok=True)
+                        break
+                    except Exception:
+                        continue
+        return target
     local_app_data = os.environ.get("LOCALAPPDATA")
     base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
     target = base / "Zapret_Hub"

@@ -63,6 +63,11 @@ rm -rf "$DIST_DIR/web_ui"
 mkdir -p "$DIST_DIR/web_ui"
 cp -r "$WEB_UI_DIST_STAGE" "$DIST_DIR/web_ui/dist"
 
+# Copy top-level assets expected by bootstrap on Linux
+cp -r "$ROOT/ui_assets" "$DIST_DIR/ui_assets"
+cp -r "$ROOT/sample_data" "$DIST_DIR/sample_data"
+cp "$ROOT/version.py" "$DIST_DIR/version.py"
+
 # 5. Cleanup staging
 rm -rf "$STAGING_ROOT"
 
