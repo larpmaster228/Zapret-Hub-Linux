@@ -66,10 +66,12 @@ cp -r "$WEB_UI_DIST_STAGE" "$DIST_DIR/web_ui/dist"
 # 5. Cleanup staging
 rm -rf "$STAGING_ROOT"
 
-# 6. Package as tar.gz
+# 6. Rename to match PKGBUILD naming and package as tar.gz
+FINAL_DIR="$OUTPUT_DIR/zapret_hub_${VERSION}_linux_x64"
+mv "$DIST_DIR" "$FINAL_DIR"
 ARCHIVE_NAME="zapret_hub_${VERSION}_linux_x64.tar.gz"
 echo "--- Creating $ARCHIVE_NAME ---"
-tar -czf "$ROOT/$ARCHIVE_NAME" -C "$OUTPUT_DIR" "$(basename "$DIST_DIR")"
+tar -czf "$ROOT/$ARCHIVE_NAME" -C "$OUTPUT_DIR" "zapret_hub_${VERSION}_linux_x64"
 
 ARCHIVE_PATH="$ROOT/$ARCHIVE_NAME"
 ARCHIVE_SIZE=$(du -h "$ARCHIVE_PATH" | cut -f1)
