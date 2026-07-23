@@ -18,6 +18,13 @@ package() {
     install -dm755 "${pkgdir}/opt/zapret-hub"
     cp -a "zapret_hub_${pkgver}_linux_x64/"* "${pkgdir}/opt/zapret-hub/"
 
+    # Ensure version.py exists (older builds may not include it)
+    if [ ! -f "${pkgdir}/opt/zapret-hub/version.py" ] && \
+       [ ! -f "${pkgdir}/opt/zapret-hub/_internal/version.py" ]; then
+        printf '__version__ = "%s"\nAUR_VERSION = "%s"\n' \
+            "${pkgver}" "${pkgver}" > "${pkgdir}/opt/zapret-hub/version.py"
+    fi
+
     install -Dm644 "${pkgdir}/opt/zapret-hub/ui_assets/icons/app.png" \
         "${pkgdir}/usr/share/icons/hicolor/256x256/apps/zapret-hub.png" 2>/dev/null || true
 
