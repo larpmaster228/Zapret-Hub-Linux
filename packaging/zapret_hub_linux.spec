@@ -3,7 +3,12 @@
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
+import sys
+
 project_root = Path(SPECPATH).resolve().parent
+
+# Ensure src/ is on sys.path so collect_submodules can find zapret_hub
+sys.path.insert(0, str(project_root / "src"))
 
 datas = [
     (str(project_root / "version.py"), "."),
@@ -12,8 +17,17 @@ datas = [
     (str(project_root / "ui_assets"), "ui_assets"),
 ]
 crypto_hiddenimports = collect_submodules("cryptography")
-hub_hiddenimports = collect_submodules("zapret_hub")
 certifi_datas = collect_data_files("certifi")
+
+# Collect zapret_hub submodules by walking the source tree, since
+# collect_submodules fails when lazy imports pull in heavy deps (PySide6 WebEngine).
+hub_subpackages = []
+for py_file in sorted((project_root / "src" / "zapret_hub").rglob("*.py")):
+    rel = py_file.relative_to(project_root / "src")
+    module = str(rel.with_suffix("")).replace("/", ".")
+    if module.endswith(".__init__"):
+        module = module[:-9]
+    hub_subpackages.append(module)
 
 a = Analysis(
     [str(project_root / "src" / "zapret_hub" / "main.py")],
@@ -54,7 +68,7 @@ a = Analysis(
         "typing",
         "urllib",
         "urllib.request",
-    ] + crypto_hiddenimports + hub_hiddenimports,
+    ] + crypto_hiddenimports + hub_subpackages,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -416,7 +416,7 @@ class WebBridge(QObject):
                 if status == "done":
                     self._schedule_on_gui(
                         lambda: self._emit_toast(
-                            f"Модификация «{slug}» установлена." if self._ru() else f"Mod "{slug}" installed.",
+                            f"Модификация «{slug}» установлена." if self._ru() else f"Mod «{slug}» installed.",
                             kind="success",
                             toast_id=f"mp-dl-{slug}",
                         )
