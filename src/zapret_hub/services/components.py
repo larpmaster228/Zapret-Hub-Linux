@@ -609,7 +609,7 @@ class ProcessManager:
                     self._run_quiet(["taskkill", "/PID", str(process.pid), "/F"])
                 self._kill_image("TgWsProxy_windows.exe")
             else:
-                subprocess.run(["pkill", "-f", "tg_ws_proxy"], capture_output=True, check=False)
+                subprocess.run(["pkill", "-f", "tg-ws-proxy"], capture_output=True, check=False)
                 subprocess.run(["pkill", "-f", "zapret_hub.worker_entry"], capture_output=True, check=False)
             self._processes.pop(component_id, None)
             self._close_source_log_stream("tg-ws-proxy")
@@ -653,6 +653,8 @@ class ProcessManager:
             self._close_source_log_stream("zapret2")
             subprocess.run(["sudo", "-n", "pkill", "-f", "nfqws"], capture_output=True, check=False)
             time.sleep(0.5)
+            if is_linux():
+                self._cleanup_zapret2_nftables()
             state.status = "stopped" if not self._is_image_running("nfqws") else "running"
             state.pid = None
             if state.status != "stopped":
@@ -1773,12 +1775,22 @@ foreach ($adapter in @($payload.adapters)) {
             self.logging.log("info", "Stopping existing nfqws copies before zapret2 start")
             subprocess.run(["sudo", "-n", "pkill", "-f", "nfqws"], capture_output=True, check=False)
         self.stop_component(component_id)
+        if is_linux():
+            self._ensure_linux_sudo_permissions()
+            self._setup_zapret2_nftables()
         try:
             runtime_root = self._ensure_zapret2_runtime()
             nfqws_path = runtime_root / "nfqws"
             if not nfqws_path.exists():
                 raise FileNotFoundError("nfqws binary not found in the Zapret2 runtime.")
             command = self._build_zapret2_command(nfqws_path, runtime_root)
+            if is_linux():
+                configs_dir = Path(self.storage.paths.configs_dir) / "zapret2"
+                if configs_dir.exists():
+                    subprocess.run(
+                        ["chmod", "-R", "a+r", str(configs_dir)],
+                        capture_output=True, check=False, timeout=5,
+                    )
             process = subprocess.Popen(
                 command,
                 cwd=str(nfqws_path.parent),
@@ -1815,6 +1827,52 @@ foreach ($adapter in @($payload.adapters)) {
         self._states[component_id] = state
         self._invalidate_state_cache()
         return state
+
+    def _setup_zapret2_nftables(self) -> None:
+        settings = self.settings.get()
+        queue_num = getattr(settings, "zapret2_queue_number", 200)
+        tcp_ports = self._normalize_zapret2_ports(settings.zapret2_tcp_ports, "80,443")
+        nft_path = shutil.which("nft") or "/usr/bin/nft"
+        table = "zapret2"
+        chain = "output"
+        try:
+            subprocess.run(
+                ["sudo", "-n", nft_path, "delete", "table", "inet", "zapret2"],
+                capture_output=True, check=False, timeout=5,
+            )
+        except Exception:
+            pass
+        rules = (
+            f"add table inet {table};\n"
+            f"add chain inet {table} {chain} {{ type route hook output priority mfilter; policy accept; }};\n"
+            f"add rule inet {table} {chain} meta l4proto tcp tcp dport {{{tcp_ports}}} queue to num {queue_num};\n"
+            f"add rule inet {table} {chain} meta l4proto udp udp dport 443 queue to num {queue_num};\n"
+        )
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "nft", "-f", "-"],
+                input=rules.encode("utf-8"),
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                self.logging.log("info", "Zapret2 nftables rules applied", queue=queue_num, ports=tcp_ports)
+            else:
+                stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+                self.logging.log("warning", "Zapret2 nftables setup failed", code=result.returncode, stderr=stderr[:300])
+        except Exception as error:
+            self.logging.log("warning", "Zapret2 nftables setup error", error=str(error))
+
+    def _cleanup_zapret2_nftables(self) -> None:
+        nft_path = shutil.which("nft") or "/usr/bin/nft"
+        try:
+            subprocess.run(
+                ["sudo", "-n", nft_path, "delete", "table", "inet", "zapret2"],
+                capture_output=True, check=False, timeout=5,
+            )
+        except Exception:
+            pass
 
     def _ensure_zapret2_runtime(self) -> Path:
         runtime_root = self.storage.paths.runtime_dir / "zapret2"
@@ -1907,6 +1965,76 @@ foreach ($adapter in @($payload.adapters)) {
                     return str(candidate)
         return str(Path("lua") / filename)
 
+    def _prepare_linux_mod_overlays(self, linux_runtime: Path) -> None:
+        bundles = self._get_zapret_bundles(enabled_only=True)
+
+        custom_dir = linux_runtime / "custom-strategies"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+
+        marker_path = custom_dir / ".mod_overlay_files"
+        if marker_path.exists():
+            try:
+                for line in marker_path.read_text(encoding="utf-8").splitlines():
+                    old_file = custom_dir / line.strip()
+                    if old_file.exists() and old_file.name != ".mod_overlay_files":
+                        old_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        if not bundles:
+            if marker_path.exists():
+                marker_path.unlink(missing_ok=True)
+            return
+
+        overlay_files: list[str] = []
+        for bundle in bundles:
+            bundle_root = Path(bundle["path"])
+            for bat in bundle_root.glob("*.bat"):
+                if not bat.name.lower().startswith("service"):
+                    shutil.copy2(bat, custom_dir / bat.name)
+                    overlay_files.append(bat.name)
+
+        marker_path.write_text("\n".join(overlay_files) + "\n", encoding="utf-8")
+
+        lists_target = linux_runtime / "zapret-latest" / "lists"
+        lists_target.mkdir(parents=True, exist_ok=True)
+        for bundle in bundles:
+            lists_source = Path(bundle["path"]) / "lists"
+            if lists_source.exists():
+                self._merge_lists_into_target(lists_target, lists_source)
+
+        self._apply_user_collection_overrides(lists_target)
+        self._ensure_zapret_user_lists(lists_target)
+
+        bin_target = linux_runtime / "zapret-latest" / "bin"
+        bin_target.mkdir(parents=True, exist_ok=True)
+        for bundle in bundles:
+            bundle_root = Path(bundle["path"])
+            bin_source = bundle_root / "bin"
+            if not bin_source.exists() or not bin_source.is_dir():
+                continue
+            for source in bin_source.glob("*.bin"):
+                if source.is_file():
+                    target_file = bin_target / source.name
+                    if not target_file.exists() or target_file.stat().st_size != source.stat().st_size:
+                        shutil.copy2(source, target_file)
+
+        utils_target = linux_runtime / "zapret-latest" / "utils"
+        utils_target.mkdir(parents=True, exist_ok=True)
+        for bundle in bundles:
+            utils_source = Path(bundle["path"]) / "utils"
+            if utils_source.exists():
+                for source in utils_source.glob("*"):
+                    if source.is_file():
+                        shutil.copy2(source, utils_target / source.name)
+
+        self.logging.log(
+            "info",
+            "Linux mod overlays applied",
+            bundles=len(bundles),
+            custom_strategies=len(overlay_files),
+        )
+
     def _ensure_linux_sudo_permissions(self) -> None:
         if not is_linux():
             return
@@ -1928,6 +2056,9 @@ foreach ($adapter in @($payload.adapters)) {
             pass
         pkexec = shutil.which("pkexec")
         if not pkexec:
+            pkexec = self._find_askpass_helper()
+        if not pkexec:
+            self.logging.log("warning", "Neither pkexec nor askpass helper found; cannot create sudoers entry")
             return
         import getpass
         user = getpass.getuser()
@@ -1937,12 +2068,17 @@ foreach ($adapter in @($payload.adapters)) {
         singbox_path = self._goshkow_vpn_runtime_root()
         resolvectl_path = shutil.which("resolvectl") or "/usr/bin/resolvectl"
         tee_path = shutil.which("tee") or "/usr/bin/tee"
+        zapret2_nfqws = self.storage.paths.runtime_dir / "zapret2" / "nfqws"
         content = (
             f"# Zapret Hub - NOPASSWD rules for {user}\n"
             f"{user} ALL=(root) NOPASSWD: {nft_path} *\n"
             f"{user} ALL=(root) NOPASSWD: {iptables_path} *\n"
             f"{user} ALL=(root) NOPASSWD: {ip6tables_path} *\n"
             f"{user} ALL=(root) NOPASSWD: {nfqws_path} *\n"
+        )
+        if zapret2_nfqws.exists():
+            content += f"{user} ALL=(root) NOPASSWD: {zapret2_nfqws} *\n"
+        content += (
             f"{user} ALL=(root) NOPASSWD: {pkill_path} -f nfqws\n"
             f"{user} ALL=(root) NOPASSWD: {pkill_path} -f sing-box\n"
             f"{user} ALL=(root) NOPASSWD: {resolvectl_path} dns *\n"
@@ -1958,15 +2094,50 @@ foreach ($adapter in @($payload.adapters)) {
             f"ZAPRET_SUDOERS_EOF\n"
             f"chmod 440 /etc/sudoers.d/zapret"
         )
-        try:
-            subprocess.run(
-                [pkexec, "bash", "-c", script],
-                capture_output=False,
-                check=False,
-                timeout=60,
-            )
-        except Exception:
-            pass
+        pkexec = shutil.which("pkexec")
+        if pkexec:
+            try:
+                subprocess.run(
+                    [pkexec, "bash", "-c", script],
+                    capture_output=False,
+                    check=False,
+                    timeout=60,
+                )
+                return
+            except Exception:
+                pass
+        askpass = self._find_askpass_helper()
+        if askpass:
+            env = os.environ.copy()
+            env["SUDO_ASKPASS"] = askpass
+            try:
+                subprocess.run(
+                    ["sudo", "-A", "bash", "-c", script],
+                    env=env,
+                    capture_output=False,
+                    check=False,
+                    timeout=60,
+                )
+            except Exception:
+                pass
+
+    @staticmethod
+    def _find_askpass_helper() -> str | None:
+        import tempfile
+        for name, args in (("zenity", ["--entry", "--title=Zapret Hub", "--text=Password:", "--hide-text"]),
+                           ("kdialog", ["--password", "Password:"]),
+                           ("yad", ["--entry", "--title=Zapret Hub", "--text=Password:", "--hide-text"])):
+            path = shutil.which(name)
+            if path:
+                try:
+                    fd, script_path = tempfile.mkstemp(suffix=".sh", prefix="zapret_askpass_")
+                    with os.fdopen(fd, "w") as f:
+                        f.write(f"#!/bin/sh\nexec {path} {' '.join(args)}\n")
+                    os.chmod(script_path, 0o700)
+                    return script_path
+                except Exception:
+                    pass
+        return None
 
     def _zapret_log_indicates_capture_started(self, text: str | None) -> bool:
         normalized = str(text or "").lower()

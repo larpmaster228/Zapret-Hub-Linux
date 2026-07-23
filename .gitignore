@@ -48,6 +48,7 @@ runtime/**/.service/
 # local tools / temp
 *.zip
 *.7z
+*.tar.gz
 *.log
 *.tmp
 web_ui/qa-*.png

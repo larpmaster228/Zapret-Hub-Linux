@@ -507,7 +507,7 @@ def build_default_profile_args(
     if sid == "fake_heavy":
         args.extend([
             "--dpi-desync=fake", fake_ttl, fake_repeats,
-            "--dpi-desync-fake-tls=rnd,sni,padencap",
+            "--dpi-desync-fake-tls-mod=rnd,rndsni,padencap",
         ])
     elif sid == "multisplit":
         args.extend([
@@ -517,7 +517,7 @@ def build_default_profile_args(
     else:
         args.extend([
             "--dpi-desync=fake,disorder2", fake_ttl, fake_repeats,
-            "--dpi-desync-fake-tls=rnd,sni",
+            "--dpi-desync-fake-tls-mod=rnd,rndsni",
         ])
 
     # Profile 3: QUIC
