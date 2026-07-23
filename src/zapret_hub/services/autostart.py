@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import winreg
 from pathlib import Path
 from subprocess import CompletedProcess
+
+if sys.platform.startswith("win"):
+    import winreg  # type: ignore[import-not-found]
+else:
+    winreg = None  # type: ignore[assignment]
 
 from zapret_hub.services.logging_service import LoggingManager
 
@@ -19,6 +23,8 @@ class AutostartManager:
         self.logging = logging
 
     def is_enabled(self) -> bool:
+        if not sys.platform.startswith("win"):
+            return False
         return self._task_exists() or self._run_entry_exists()
 
     def set_enabled(self, enabled: bool) -> bool:
@@ -47,6 +53,8 @@ class AutostartManager:
         return proc.returncode == 0
 
     def _run_entry_exists(self) -> bool:
+        if winreg is None:
+            return False
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.RUN_KEY, 0, winreg.KEY_READ) as key:
                 for name in (self.APP_NAME, *self.LEGACY_APP_NAMES):
@@ -112,6 +120,8 @@ class AutostartManager:
         return output.decode("utf-8", errors="replace")
 
     def _set_run_entry(self, command: str) -> bool:
+        if winreg is None:
+            return False
         try:
             with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
                 winreg.SetValueEx(key, self.APP_NAME, 0, winreg.REG_SZ, command)
@@ -121,6 +131,8 @@ class AutostartManager:
             return False
 
     def _remove_legacy_run_entries(self) -> None:
+        if winreg is None:
+            return
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
                 for name in (self.APP_NAME, *self.LEGACY_APP_NAMES):

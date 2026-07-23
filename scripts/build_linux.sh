@@ -36,7 +36,7 @@ rm -rf "$RUNTIME_STAGE/v2rayN/goshkow-vpn" 2>/dev/null || true
 rm -f  "$RUNTIME_STAGE/v2rayN/goshkow-vpn-subscription.txt" 2>/dev/null || true
 
 # Freeze web_ui/dist
-cp -r "$WEB_UI_ROOT/dist" "$WEB_UI_DIST_STAGE"
+cp -r "$WEB_UI_ROOT/dist/." "$WEB_UI_DIST_STAGE/"
 
 # 3. Build with PyInstaller
 echo "--- Building with PyInstaller ---"
