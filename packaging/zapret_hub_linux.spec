@@ -12,6 +12,7 @@ datas = [
     (str(project_root / "ui_assets"), "ui_assets"),
 ]
 crypto_hiddenimports = collect_submodules("cryptography")
+hub_hiddenimports = collect_submodules("zapret_hub")
 certifi_datas = collect_data_files("certifi")
 
 a = Analysis(
@@ -53,7 +54,7 @@ a = Analysis(
         "typing",
         "urllib",
         "urllib.request",
-    ] + crypto_hiddenimports,
+    ] + crypto_hiddenimports + hub_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
