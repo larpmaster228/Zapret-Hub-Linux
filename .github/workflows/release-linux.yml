@@ -3,14 +3,13 @@ name: Release Build (Linux)
 on:
   push:
     tags:
-      - "v*-linux"
       - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Git tag or release version (for example v3.0.1-linux)"
+        description: "Git tag or release version (for example v3.0.1)"
         required: true
-        default: "v3.0.1-linux"
+        default: "v3.0.1"
       release_name:
         description: "Release title"
         required: true
@@ -33,7 +32,7 @@ jobs:
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
           if [ -z "$TAG" ] || ! echo "$TAG" | grep -qP '^v?\d'; then
-            TAG="v3.0.1-linux"
+            TAG="v3.0.1"
           fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
