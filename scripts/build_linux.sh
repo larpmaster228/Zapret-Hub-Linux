@@ -6,7 +6,7 @@ cd "$ROOT"
 
 PYTHON="${PYTHON:-python3}"
 OUTPUT_DIR="${OUTPUT_DIR:-dist_pyinstaller}"
-VERSION="${VERSION:-3.0.1}"
+VERSION="${VERSION:-$($PYTHON -c "exec(open('version.py').read()); print(__version__)")}"
 
 echo "=== Building Zapret Hub $VERSION for Linux ==="
 

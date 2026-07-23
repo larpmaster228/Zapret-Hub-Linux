@@ -12,10 +12,15 @@ from PyInstaller.utils.win32.versioninfo import (
 )
 
 project_root = Path(SPECPATH).resolve().parent
+
+_ver_ns: dict = {}
+exec((project_root / "version.py").read_text(), _ver_ns)
+_ver_parts = tuple(int(x) for x in _ver_ns["__version__"].split(".")) + (0,) * (4 - len(_ver_ns["__version__"].split(".")))
+
 version_info = VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 4, 2, 0),
-        prodvers=(1, 4, 2, 0),
+        filevers=_ver_parts,
+        prodvers=_ver_parts,
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -31,11 +36,11 @@ version_info = VSVersionInfo(
                     [
                         StringStruct("CompanyName", "goshkow"),
                         StringStruct("FileDescription", "Zapret Hub Installer"),
-                        StringStruct("FileVersion", "1.4.2"),
+                        StringStruct("FileVersion", _ver_ns["__version__"]),
                         StringStruct("InternalName", "install_zaprethub"),
                         StringStruct("OriginalFilename", "install_zaprethub.exe"),
                         StringStruct("ProductName", "Zapret Hub"),
-                        StringStruct("ProductVersion", "1.4.2"),
+                        StringStruct("ProductVersion", _ver_ns["__version__"]),
                         StringStruct("Publisher", "goshkow"),
                     ],
                 )

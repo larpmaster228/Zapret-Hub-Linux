@@ -84,8 +84,22 @@ jobs:
           python -m pip install -e .[dev]
           python -m pip install pyinstaller
 
+      - name: Write version to version.py
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          python3 -c "
+          content = '__version__ = \"${VERSION}\"\nAUR_VERSION = \"${VERSION}\"\n'
+          with open('version.py', 'w') as f:
+              f.write(content)
+          "
+          echo "=== version.py ==="
+          cat version.py
+
+      - name: Sync version to JS files and package.json
+        run: python scripts/sync_version.py
+
       - name: Build Linux x64 portable
-        run: VERSION="${{ needs.version.outputs.version }}" ./scripts/build_linux.sh
+        run: ./scripts/build_linux.sh
 
       - uses: actions/upload-artifact@v6
         with:

@@ -11,6 +11,9 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $PythonExe = $Python
+$versionNs = & $PythonExe -c "exec(open('version.py').read()); print(__version__)"
+$fileVersion = "$versionNs.0"
+$productVersion = "$versionNs.0"
 $srcRoot = Join-Path $root "src"
 $previousPythonPath = $env:PYTHONPATH
 $env:PYTHONPATH = if ([string]::IsNullOrWhiteSpace($previousPythonPath)) { $srcRoot } else { "$srcRoot;$previousPythonPath" }
@@ -85,8 +88,8 @@ $nuitkaArgs = @(
   "--windows-icon-from-ico=ui_assets\icons\app_shell.ico",
   '--company-name=goshkow',
   '--product-name=Zapret Hub',
-  '--file-version=3.0.1.0',
-  '--product-version=3.0.1.0',
+  "--file-version=$fileVersion",
+  "--product-version=$productVersion",
   '--file-description=Zapret Hub',
   '--copyright=goshkow',
   "--output-dir=$OutputDir",
@@ -139,7 +142,7 @@ if ($UninstallerSource) {
 }
 $uninstallerCandidates += @(
     (Join-Path $root "bundled_uninstaller\uninstall_zaprethub.exe"),
-    (Join-Path $root "dist_installer_3.0.1\uninstall_zaprethub.exe"),
+    (Join-Path $root "dist_installer_$versionNs\uninstall_zaprethub.exe"),
     (Join-Path $root "dist_installer\uninstall_zaprethub.exe")
 )
 $uninstallerCopied = $false

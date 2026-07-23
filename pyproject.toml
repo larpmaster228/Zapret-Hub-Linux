@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zapret-hub"
-version = "3.0.0"
+dynamic = ["version"]
 description = "Windows desktop hub for managing external network utilities and configuration packs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,6 +28,9 @@ zapret-hub = "zapret_hub.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "zapret_hub.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -6,7 +6,9 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "3.0.1"
+_ns: dict[str, str] = {}
+exec((Path(__file__).resolve().parents[1] / "version.py").read_text(), _ns)
+VERSION: str = _ns["__version__"]
 
 
 def _should_skip_path(path: Path, source_dir: Path) -> bool:

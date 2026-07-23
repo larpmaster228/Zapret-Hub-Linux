@@ -7,8 +7,13 @@ from scripts.prepare_nuitka_release import main as prepare_nuitka_release_main
 
 
 ROOT = Path(__file__).resolve().parent
-INSTALLER_SRC = ROOT / "dist_installer" / "install_zaprethub_1.4.2_universal.exe"
-RELEASE_DIR = ROOT / "release_1.4.2"
+
+_ns: dict[str, str] = {}
+exec((ROOT / "version.py").read_text(), _ns)
+_version: str = _ns["__version__"]
+
+INSTALLER_SRC = ROOT / "dist_installer" / f"install_zaprethub_{_version}_universal.exe"
+RELEASE_DIR = ROOT / f"release_{_version}"
 
 
 def main() -> None:
