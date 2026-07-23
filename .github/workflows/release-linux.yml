@@ -14,6 +14,10 @@ on:
         description: "Release title"
         required: true
         default: "Zapret Hub 3.0.1 (Linux)"
+      pkgrel:
+        description: "AUR package release number (pkgrel)"
+        required: false
+        default: "1"
       changelog:
         description: "Release changelog (optional)"
         required: false
@@ -26,6 +30,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
+      pkgrel: ${{ steps.v.outputs.pkgrel }}
     steps:
       - uses: actions/checkout@v5
       - id: v
@@ -35,8 +40,10 @@ jobs:
             TAG="v3.0.1"
           fi
           VERSION="${TAG#v}"
+          PKGREL="${{ inputs.pkgrel || '1' }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "pkgrel=$PKGREL" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version
@@ -183,8 +190,9 @@ jobs:
         run: |
           VERSION="${{ needs.version.outputs.version }}"
           TAG="${{ needs.version.outputs.tag }}"
+          PKGREL="${{ needs.version.outputs.pkgrel }}"
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" aur/PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=$PKGREL/" aur/PKGBUILD
           sed -i "s|/download/v.*\.tar\.gz|/download/$TAG/zapret_hub_${VERSION}_linux_x64.tar.gz|" aur/PKGBUILD
           echo "=== PKGBUILD ==="
           cat aur/PKGBUILD

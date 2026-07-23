@@ -94,6 +94,7 @@ $nuitkaArgs = @(
   '--copyright=goshkow',
   "--output-dir=$OutputDir",
   "--output-filename=Zapret_Hub.exe",
+  "--include-data-files=version.py=version.py",
   "--include-data-dir=sample_data=sample_data",
   "--include-data-files=sample_data\default_services\gaming\bin\*.bin=sample_data\default_services\gaming\bin\",
   "--include-data-dir=ui_assets=ui_assets",

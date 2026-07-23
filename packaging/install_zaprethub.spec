@@ -51,6 +51,7 @@ version_info = VSVersionInfo(
 )
 
 datas = [
+    (str(project_root / "version.py"), "."),
     (str(project_root / "installer_payload"), "installer_payload"),
     (str(project_root / "ui_assets"), "ui_assets"),
 ]

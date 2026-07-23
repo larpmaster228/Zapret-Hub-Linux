@@ -33,8 +33,18 @@ def _is_ru() -> bool:
 RU = _is_ru()
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ZapretHub"
 _ns: dict[str, str] = {}
-exec((Path(__file__).resolve().parents[1] / "version.py").read_text(), _ns)
-INSTALLER_VERSION: str = _ns["__version__"]
+_ver_candidates = [
+    Path(__file__).resolve().parents[1] / "version.py",
+]
+if getattr(sys, "frozen", False):
+    _ver_candidates.append(Path(sys.executable).parent / "version.py")
+if hasattr(sys, "_MEIPASS"):
+    _ver_candidates.append(Path(sys._MEIPASS) / "version.py")
+for _vp in _ver_candidates:
+    if _vp.is_file():
+        exec(_vp.read_text(), _ns)
+        break
+INSTALLER_VERSION: str = _ns.get("__version__", "0.0.0")
 INSTALLER_LOG_PATH = Path(tempfile.gettempdir()) / "zapret_hub_installer.log"
 UNINSTALLER_LOG_PATH = Path(tempfile.gettempdir()) / "zapret_hub_uninstaller.log"
 
